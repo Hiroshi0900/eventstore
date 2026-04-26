@@ -10,6 +10,8 @@ import (
 )
 
 // Store is an in-memory EventStore implementation for testing.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 type Store struct {
 	mu        sync.RWMutex
 	events    map[string][]es.Event       // aggregateId -> events
@@ -18,6 +20,8 @@ type Store struct {
 }
 
 // New creates a new in-memory event store.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func New() *Store {
 	return &Store{
 		events:    make(map[string][]es.Event),
@@ -27,6 +31,8 @@ func New() *Store {
 }
 
 // GetLatestSnapshotByID retrieves the latest snapshot for the given aggregate ID.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (s *Store) GetLatestSnapshotByID(_ context.Context, id es.AggregateID) (*es.SnapshotData, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -40,6 +46,8 @@ func (s *Store) GetLatestSnapshotByID(_ context.Context, id es.AggregateID) (*es
 }
 
 // GetEventsByIDSinceSeqNr retrieves all events since the given sequence number.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (s *Store) GetEventsByIDSinceSeqNr(_ context.Context, id es.AggregateID, seqNr uint64) ([]es.Event, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -67,6 +75,8 @@ func (s *Store) GetEventsByIDSinceSeqNr(_ context.Context, id es.AggregateID, se
 }
 
 // PersistEvent persists a single event without a snapshot.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (s *Store) PersistEvent(_ context.Context, event es.Event, expectedVersion uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -94,6 +104,8 @@ func (s *Store) PersistEvent(_ context.Context, event es.Event, expectedVersion 
 }
 
 // PersistEventAndSnapshot atomically persists an event and a snapshot.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (s *Store) PersistEventAndSnapshot(_ context.Context, event es.Event, aggregate es.Aggregate) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -126,6 +138,8 @@ func (s *Store) PersistEventAndSnapshot(_ context.Context, event es.Event, aggre
 }
 
 // Clear removes all data from the store. Useful for test cleanup.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (s *Store) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -136,6 +150,8 @@ func (s *Store) Clear() {
 }
 
 // GetEventCount returns the total number of events for an aggregate.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (s *Store) GetEventCount(id es.AggregateID) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -144,6 +160,8 @@ func (s *Store) GetEventCount(id es.AggregateID) int {
 }
 
 // GetAllEvents returns all events in the store (for debugging/testing).
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (s *Store) GetAllEvents() map[string][]es.Event {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -158,6 +176,8 @@ func (s *Store) GetAllEvents() map[string][]es.Event {
 }
 
 // SetSnapshot directly sets a snapshot (for testing).
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (s *Store) SetSnapshot(id es.AggregateID, snapshot *es.SnapshotData) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

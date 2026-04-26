@@ -5,6 +5,8 @@ import (
 )
 
 // EventStore provides operations for persisting and retrieving events and snapshots.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 type EventStore interface {
 	// GetLatestSnapshotByID retrieves the latest snapshot for the given aggregate ID.
 	// Returns nil if no snapshot exists.
@@ -24,6 +26,8 @@ type EventStore interface {
 }
 
 // EventStoreConfig holds the configuration for the event store.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 type EventStoreConfig struct {
 	// SnapshotInterval determines the number of events between snapshots.
 	// Default is 5 (one snapshot every 5 events).
@@ -44,6 +48,8 @@ type EventStoreConfig struct {
 }
 
 // DefaultEventStoreConfig returns the default configuration.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func DefaultEventStoreConfig() EventStoreConfig {
 	return EventStoreConfig{
 		SnapshotInterval:  5,
@@ -55,6 +61,8 @@ func DefaultEventStoreConfig() EventStoreConfig {
 }
 
 // ShouldSnapshot determines whether a snapshot should be created based on the sequence number.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (c EventStoreConfig) ShouldSnapshot(seqNr uint64) bool {
 	if c.SnapshotInterval == 0 {
 		return false
@@ -63,6 +71,8 @@ func (c EventStoreConfig) ShouldSnapshot(seqNr uint64) bool {
 }
 
 // Repository provides a high-level abstraction over EventStore for aggregate operations.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 type Repository[T Aggregate] interface {
 	// FindByID loads an aggregate by ID.
 	// Returns ErrAggregateNotFound if the aggregate does not exist.
@@ -73,6 +83,8 @@ type Repository[T Aggregate] interface {
 }
 
 // AggregateFactory creates aggregates from events.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 type AggregateFactory[T Aggregate] interface {
 	// Create creates a new empty aggregate with the given ID.
 	Create(id AggregateID) T
@@ -88,6 +100,8 @@ type AggregateFactory[T Aggregate] interface {
 }
 
 // DefaultRepository is a generic repository implementation.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 type DefaultRepository[T Aggregate] struct {
 	store      EventStore
 	factory    AggregateFactory[T]
@@ -96,6 +110,8 @@ type DefaultRepository[T Aggregate] struct {
 }
 
 // NewRepository creates a new DefaultRepository.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func NewRepository[T Aggregate](
 	store EventStore,
 	factory AggregateFactory[T],
@@ -110,6 +126,9 @@ func NewRepository[T Aggregate](
 	}
 }
 
+// FindByID loads an aggregate by ID.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (r *DefaultRepository[T]) FindByID(ctx context.Context, id AggregateID) (T, error) {
 	var zero T
 
@@ -157,6 +176,9 @@ func (r *DefaultRepository[T]) FindByID(ctx context.Context, id AggregateID) (T,
 	return aggregate, nil
 }
 
+// Save persists the aggregate and its uncommitted events.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (r *DefaultRepository[T]) Save(ctx context.Context, aggregate T, events []Event) error {
 	if len(events) == 0 {
 		return nil
