@@ -97,10 +97,9 @@ func (r *Repository[T]) Store(ctx context.Context, cmd Command, agg T) (T, error
 		}
 		nextAgg = nextAgg.WithVersion(nextVersion).(T)
 	} else {
-		if err := r.store.PersistEvent(ctx, ev, agg.Version()); err != nil {
+		if err := r.store.PersistEvent(ctx, ev, agg.SeqNr()); err != nil {
 			return zero, err
 		}
-		nextAgg = nextAgg.WithVersion(agg.Version() + 1).(T)
 	}
 
 	return nextAgg, nil

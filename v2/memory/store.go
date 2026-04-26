@@ -77,18 +77,22 @@ func (s *Store) PersistEvent(_ context.Context, event es.Event, expectedVersion 
 }
 
 // PersistEventAndSnapshot はイベントとスナップショットをアトミックに保存します。
-// 既存スナップショットの version + 1 が snapshot.Version と一致しない場合 ErrOptimisticLock。
+// snapshot.Version は「現在のスナップショット Version + 1」でなければなりません。
+// 現在スナップショットがない場合は snapshot.Version == 1 を期待します。
 func (s *Store) PersistEventAndSnapshot(_ context.Context, event es.Event, snapshot es.SnapshotData) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	key := event.AggregateID().AsString()
-	current := s.versions[key]
 
-	// snapshot.Version は「保存後に集約が持つべき version」想定 (current + 1)
-	expected := current + 1
-	if snapshot.Version != expected {
-		return es.NewOptimisticLockError(key, expected, snapshot.Version)
+	// 楽観ロック: 現在のスナップショット Version に基づくチェック
+	var currentSnapVersion uint64
+	if existing, ok := s.snapshots[key]; ok {
+		currentSnapVersion = existing.Version
+	}
+	expectedVersion := currentSnapVersion + 1
+	if snapshot.Version != expectedVersion {
+		return es.NewOptimisticLockError(key, expectedVersion, snapshot.Version)
 	}
 
 	s.events[key] = append(s.events[key], event)

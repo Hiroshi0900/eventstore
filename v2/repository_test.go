@@ -166,3 +166,45 @@ func TestRepository_LoadAfterStore(t *testing.T) {
 		t.Errorf("loaded.SeqNr = %d, want %d", got, want)
 	}
 }
+
+func TestRepository_Store_TakesSnapshot(t *testing.T) {
+	store := memory.New()
+	r := es.NewRepository[counter](
+		store,
+		func(id es.AggregateID) counter { return newCounter(id) },
+		counterSerializer{},
+		es.Config{SnapshotInterval: 3},
+	)
+	id := es.NewAggregateID("Counter", "c1")
+	c := newCounter(id)
+
+	for i := 0; i < 3; i++ {
+		var err error
+		c, err = r.Store(context.Background(), incrementCmd{id: id}, c)
+		if err != nil {
+			t.Fatalf("Store err at i=%d: %v", i, err)
+		}
+	}
+
+	snap, err := store.GetLatestSnapshotByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetLatestSnapshotByID err: %v", err)
+	}
+	if snap == nil {
+		t.Fatal("expected snapshot to be saved at seqNr=3")
+	}
+	if snap.SeqNr != 3 {
+		t.Errorf("snap.SeqNr = %d, want 3", snap.SeqNr)
+	}
+	if snap.Version != 1 {
+		t.Errorf("snap.Version = %d, want 1", snap.Version)
+	}
+
+	loaded, err := r.Load(context.Background(), id)
+	if err != nil {
+		t.Fatalf("Load err: %v", err)
+	}
+	if loaded.value != 3 {
+		t.Errorf("loaded.value = %d, want 3", loaded.value)
+	}
+}
