@@ -14,7 +14,6 @@ type Store struct {
 	mu        sync.RWMutex
 	events    map[string][]es.Event       // aggregateID -> events
 	snapshots map[string]*es.SnapshotData // aggregateID -> latest snapshot
-	versions  map[string]uint64           // aggregateID -> current version
 }
 
 // New は空の Store を生成します。
@@ -22,7 +21,6 @@ func New() *Store {
 	return &Store{
 		events:    map[string][]es.Event{},
 		snapshots: map[string]*es.SnapshotData{},
-		versions:  map[string]uint64{},
 	}
 }
 
@@ -54,50 +52,59 @@ func (s *Store) GetEventsByIDSinceSeqNr(_ context.Context, id es.AggregateID, se
 	return out, nil
 }
 
-// PersistEvent はイベントを保存します。expectedVersion は楽観ロック用の現在 version。
-// 初回イベント (expectedVersion == 0) で既存があれば ErrDuplicateAggregate。
-// それ以外で version 不一致なら ErrOptimisticLock。
-func (s *Store) PersistEvent(_ context.Context, event es.Event, expectedVersion uint64) error {
+// PersistEvent はイベントを保存します。
+// 同じ SeqNr のイベントが既に存在する場合は ErrDuplicateAggregate（v1 DynamoDB の
+// `attribute_not_exists(#pk)` 条件と同等）。これにより新規集約の二重作成も SeqNr=1 衝突として検出される。
+//
+// version 引数は EventStore interface 互換のため受け取るが使用しない。
+// 楽観的ロックは PersistEventAndSnapshot の snapshot.Version で一本化。
+func (s *Store) PersistEvent(_ context.Context, event es.Event, _ uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	key := event.AggregateID().AsString()
 
-	if expectedVersion == 0 && len(s.events[key]) > 0 {
-		return es.NewDuplicateAggregateError(key)
-	}
-	current := s.versions[key]
-	if expectedVersion > 0 && current != expectedVersion {
-		return es.NewOptimisticLockError(key, expectedVersion, current)
+	// 同 SeqNr 衝突チェック (初回作成の二重実行もこれで検出)
+	for _, existing := range s.events[key] {
+		if existing.SeqNr() == event.SeqNr() {
+			return es.NewDuplicateAggregateError(key)
+		}
 	}
 
 	s.events[key] = append(s.events[key], event)
-	s.versions[key] = current + 1
 	return nil
 }
 
 // PersistEventAndSnapshot はイベントとスナップショットをアトミックに保存します。
-// snapshot.Version は「現在のスナップショット Version + 1」でなければなりません。
-// 現在スナップショットがない場合は snapshot.Version == 1 を期待します。
+// 楽観的ロック: 既存 snapshot の Version + 1 が snapshot.Version と一致しない場合 ErrOptimisticLock。
+// snapshot がない場合は snapshot.Version == 1 を期待。
+// 同じ SeqNr のイベントが既に存在する場合も ErrOptimisticLock (並行更新による競合)。
+// これは v1 DynamoDB の TransactWriteItems が ConditionalCheckFailed を一律 ErrOptimisticLock として扱うのと整合。
 func (s *Store) PersistEventAndSnapshot(_ context.Context, event es.Event, snapshot es.SnapshotData) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	key := event.AggregateID().AsString()
 
-	// 楽観ロック: 現在のスナップショット Version に基づくチェック
+	// snapshot 世代ベースの楽観ロック (先に判定)
 	var currentSnapVersion uint64
 	if existing, ok := s.snapshots[key]; ok {
 		currentSnapVersion = existing.Version
 	}
-	expectedVersion := currentSnapVersion + 1
-	if snapshot.Version != expectedVersion {
-		return es.NewOptimisticLockError(key, expectedVersion, snapshot.Version)
+	expected := currentSnapVersion + 1
+	if snapshot.Version != expected {
+		return es.NewOptimisticLockError(key, expected, snapshot.Version)
+	}
+
+	// 同 SeqNr 衝突は並行更新による競合 → ErrOptimisticLock
+	for _, existing := range s.events[key] {
+		if existing.SeqNr() == event.SeqNr() {
+			return es.NewOptimisticLockError(key, expected, snapshot.Version)
+		}
 	}
 
 	s.events[key] = append(s.events[key], event)
 	s.snapshots[key] = &snapshot
-	s.versions[key] = snapshot.Version
 	return nil
 }
 
@@ -107,5 +114,4 @@ func (s *Store) Clear() {
 	defer s.mu.Unlock()
 	s.events = map[string][]es.Event{}
 	s.snapshots = map[string]*es.SnapshotData{}
-	s.versions = map[string]uint64{}
 }

@@ -235,3 +235,37 @@ func TestRepository_Store_OptimisticLockOnSnapshot(t *testing.T) {
 		t.Errorf("expected ErrOptimisticLock, got %v", err)
 	}
 }
+
+// リグレッションテスト: SnapshotInterval=5 で 6 回以上 Store した時、
+// snapshot 取得後の PersistEvent でバージョン管理が壊れないこと。
+// versions マップを「PersistEvent でインクリメント、PersistEventAndSnapshot で上書き」していた
+// 以前のバグを catch するためのテスト。
+func TestRepository_Store_BeyondSnapshotInterval(t *testing.T) {
+	r := newTestRepo() // SnapshotInterval=5 (DefaultConfig)
+	id := es.NewAggregateID("Counter", "c1")
+	c := newCounter(id)
+
+	// 6 回 Store: 5 回目で snapshot、6 回目は通常の PersistEvent
+	for i := 0; i < 6; i++ {
+		var err error
+		c, err = r.Store(context.Background(), incrementCmd{id: id}, c)
+		if err != nil {
+			t.Fatalf("Store err at i=%d: %v", i, err)
+		}
+	}
+
+	if got, want := c.value, 6; got != want {
+		t.Errorf("counter.value = %d, want %d", got, want)
+	}
+	if got, want := c.SeqNr(), uint64(6); got != want {
+		t.Errorf("counter.SeqNr = %d, want %d", got, want)
+	}
+
+	loaded, err := r.Load(context.Background(), id)
+	if err != nil {
+		t.Fatalf("Load err: %v", err)
+	}
+	if loaded.value != 6 {
+		t.Errorf("loaded.value = %d, want 6", loaded.value)
+	}
+}

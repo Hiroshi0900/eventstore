@@ -97,7 +97,9 @@ func (r *Repository[T]) Store(ctx context.Context, cmd Command, agg T) (T, error
 		}
 		nextAgg = nextAgg.WithVersion(nextVersion).(T)
 	} else {
-		if err := r.store.PersistEvent(ctx, ev, agg.SeqNr()); err != nil {
+		// PersistEvent への version 引数は「初回作成識別」のみ。
+		// 楽観ロックは PersistEventAndSnapshot に集約。
+		if err := r.store.PersistEvent(ctx, ev, agg.Version()); err != nil {
 			return zero, err
 		}
 	}

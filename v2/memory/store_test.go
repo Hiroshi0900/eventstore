@@ -65,18 +65,19 @@ func TestStore_PersistEvent_DuplicateOnCreate(t *testing.T) {
 	}
 }
 
-func TestStore_PersistEvent_OptimisticLock(t *testing.T) {
+func TestStore_PersistEvent_DuplicateSeqNr(t *testing.T) {
 	s := New()
 	id := es.NewAggregateID("Visit", "v1")
 	ev1 := es.NewEvent("evt-1", "VisitScheduled", id, nil, es.WithSeqNr(1))
-	ev2 := es.NewEvent("evt-2", "VisitCompleted", id, nil, es.WithSeqNr(2))
+	ev2 := es.NewEvent("evt-2", "VisitCompleted", id, nil, es.WithSeqNr(1)) // 同じ SeqNr
 
 	if err := s.PersistEvent(context.Background(), ev1, 0); err != nil {
 		t.Fatalf("ev1 err: %v", err)
 	}
-	err := s.PersistEvent(context.Background(), ev2, 99)
-	if !errors.Is(err, es.ErrOptimisticLock) {
-		t.Errorf("expected ErrOptimisticLock, got %v", err)
+	// 同じ SeqNr のイベントを書き込もうとすると ErrDuplicateAggregate
+	err := s.PersistEvent(context.Background(), ev2, 1)
+	if !errors.Is(err, es.ErrDuplicateAggregate) {
+		t.Errorf("expected ErrDuplicateAggregate, got %v", err)
 	}
 }
 
