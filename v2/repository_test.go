@@ -12,6 +12,14 @@ import (
 // --- テスト用ミニ集約: 単純なカウンタ ---
 // BaseAggregate を埋め込むパターンで、AggregateID/SeqNr/Version の boilerplate を省略。
 
+// counterID は Counter ドメインの typed AggregateID。
+// AggregateID interface はドメイン側で typed に実装するのが推奨パターン。
+type counterID string
+
+func (c counterID) TypeName() string { return "Counter" }
+func (c counterID) Value() string    { return string(c) }
+func (c counterID) AsString() string { return "Counter-" + string(c) }
+
 type counter struct {
 	es.BaseAggregate
 	value int
@@ -76,7 +84,7 @@ func TestRepository_Construct(t *testing.T) {
 
 func TestRepository_Load_NotFound(t *testing.T) {
 	r := newTestRepo()
-	id := es.NewAggregateID("Counter", "c1")
+	id := counterID("c1")
 
 	_, err := r.Load(context.Background(), id)
 	if !errors.Is(err, es.ErrAggregateNotFound) {
@@ -86,7 +94,7 @@ func TestRepository_Load_NotFound(t *testing.T) {
 
 func TestRepository_Store_FirstCommand(t *testing.T) {
 	r := newTestRepo()
-	id := es.NewAggregateID("Counter", "c1")
+	id := counterID("c1")
 	c := newCounter(id)
 
 	updated, err := r.Store(context.Background(), incrementCmd{id: id}, c)
@@ -103,8 +111,8 @@ func TestRepository_Store_FirstCommand(t *testing.T) {
 
 func TestRepository_Store_MismatchedAggregateID(t *testing.T) {
 	r := newTestRepo()
-	idA := es.NewAggregateID("Counter", "a")
-	idB := es.NewAggregateID("Counter", "b")
+	idA := counterID("a")
+	idB := counterID("b")
 	c := newCounter(idA)
 
 	_, err := r.Store(context.Background(), incrementCmd{id: idB}, c)
@@ -115,7 +123,7 @@ func TestRepository_Store_MismatchedAggregateID(t *testing.T) {
 
 func TestRepository_LoadAfterStore(t *testing.T) {
 	r := newTestRepo()
-	id := es.NewAggregateID("Counter", "c1")
+	id := counterID("c1")
 	c := newCounter(id)
 
 	for i := 0; i < 3; i++ {
@@ -145,7 +153,7 @@ func TestRepository_Store_TakesSnapshot(t *testing.T) {
 		func(id es.AggregateID) counter { return newCounter(id) },
 		es.Config{SnapshotInterval: 3},
 	)
-	id := es.NewAggregateID("Counter", "c1")
+	id := counterID("c1")
 	c := newCounter(id)
 
 	for i := 0; i < 3; i++ {
@@ -186,7 +194,7 @@ func TestRepository_Store_OptimisticLockOnSnapshot(t *testing.T) {
 		func(id es.AggregateID) counter { return newCounter(id) },
 		es.Config{SnapshotInterval: 1},
 	)
-	id := es.NewAggregateID("Counter", "c1")
+	id := counterID("c1")
 	c := newCounter(id)
 
 	c, err := r.Store(context.Background(), incrementCmd{id: id}, c)
@@ -209,7 +217,7 @@ func TestRepository_Store_OptimisticLockOnSnapshot(t *testing.T) {
 // snapshot 取得後の PersistEvent でバージョン管理が壊れないこと。
 func TestRepository_Store_BeyondSnapshotInterval(t *testing.T) {
 	r := newTestRepo() // SnapshotInterval=5 (DefaultConfig)
-	id := es.NewAggregateID("Counter", "c1")
+	id := counterID("c1")
 	c := newCounter(id)
 
 	// 6 回 Store: 5 回目で snapshot、6 回目は通常の PersistEvent

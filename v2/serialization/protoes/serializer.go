@@ -7,6 +7,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	es "github.com/Hiroshi0900/eventstore/v2"
+	"github.com/Hiroshi0900/eventstore/v2/internal/aggregateid"
 )
 
 // ProtoEventSerializer は EventEnvelope (proto3) を使う EventSerializer 実装です。
@@ -40,7 +41,7 @@ func (s *ProtoEventSerializer) Deserialize(data []byte) (es.Event, error) {
 	if err := proto.Unmarshal(data, &env); err != nil {
 		return nil, es.NewDeserializationError("event", err)
 	}
-	aggID := es.NewAggregateID(env.GetIdTypeName(), env.GetIdValue())
+	aggID := aggregateid.New(env.GetIdTypeName(), env.GetIdValue())
 	return es.NewEvent(
 		env.GetEventId(),
 		env.GetEventTypeName(),

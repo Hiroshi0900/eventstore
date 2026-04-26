@@ -6,12 +6,13 @@ import (
 	"time"
 
 	es "github.com/Hiroshi0900/eventstore/v2"
+	"github.com/Hiroshi0900/eventstore/v2/internal/aggregateid"
 	"github.com/Hiroshi0900/eventstore/v2/serialization/protoes"
 )
 
 func TestProtoEventSerializer_RoundTrip(t *testing.T) {
 	s := protoes.New()
-	id := es.NewAggregateID("Visit", "abc-123")
+	id := aggregateid.New("Visit", "abc-123")
 	ts := time.Date(2026, 4, 27, 12, 34, 56, 0, time.UTC)
 	src := es.NewEvent(
 		"evt-1",

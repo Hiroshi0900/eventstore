@@ -9,6 +9,13 @@ import (
 	"github.com/Hiroshi0900/eventstore/v2/memory"
 )
 
+// visitID は Visit ドメインの typed AggregateID 実装 (テスト用)。
+type visitID string
+
+func (v visitID) TypeName() string { return "Visit" }
+func (v visitID) Value() string    { return string(v) }
+func (v visitID) AsString() string { return "Visit-" + string(v) }
+
 // stubAgg は memory.Store のテスト用最小 Aggregate 実装。
 type stubAgg struct {
 	id      es.AggregateID
@@ -33,7 +40,7 @@ func TestNew_Empty(t *testing.T) {
 		t.Fatal("New() returned nil")
 	}
 
-	id := es.NewAggregateID("Visit", "v1")
+	id := visitID("v1")
 	_, found, err := s.GetLatestSnapshotByID(context.Background(), id)
 	if err != nil {
 		t.Fatalf("GetLatestSnapshotByID err: %v", err)
@@ -53,7 +60,7 @@ func TestNew_Empty(t *testing.T) {
 
 func TestStore_PersistEvent_FirstEvent(t *testing.T) {
 	s := memory.New[stubAgg]()
-	id := es.NewAggregateID("Visit", "v1")
+	id := visitID("v1")
 	ev := es.NewEvent("evt-1", "VisitScheduled", id, []byte("p"),
 		es.WithSeqNr(1), es.WithIsCreated(true))
 
@@ -72,7 +79,7 @@ func TestStore_PersistEvent_FirstEvent(t *testing.T) {
 
 func TestStore_PersistEvent_DuplicateOnCreate(t *testing.T) {
 	s := memory.New[stubAgg]()
-	id := es.NewAggregateID("Visit", "v1")
+	id := visitID("v1")
 	ev := es.NewEvent("evt-1", "VisitScheduled", id, nil, es.WithSeqNr(1))
 
 	if err := s.PersistEvent(context.Background(), ev, 0); err != nil {
@@ -86,7 +93,7 @@ func TestStore_PersistEvent_DuplicateOnCreate(t *testing.T) {
 
 func TestStore_PersistEvent_DuplicateSeqNr(t *testing.T) {
 	s := memory.New[stubAgg]()
-	id := es.NewAggregateID("Visit", "v1")
+	id := visitID("v1")
 	ev1 := es.NewEvent("evt-1", "VisitScheduled", id, nil, es.WithSeqNr(1))
 	ev2 := es.NewEvent("evt-2", "VisitCompleted", id, nil, es.WithSeqNr(1)) // 同じ SeqNr
 
@@ -101,7 +108,7 @@ func TestStore_PersistEvent_DuplicateSeqNr(t *testing.T) {
 
 func TestStore_PersistEventAndSnapshot_First(t *testing.T) {
 	s := memory.New[stubAgg]()
-	id := es.NewAggregateID("Visit", "v1")
+	id := visitID("v1")
 	ev := es.NewEvent("evt-1", "VisitScheduled", id, nil,
 		es.WithSeqNr(1), es.WithIsCreated(true))
 	agg := stubAgg{id: id, seqNr: 1, version: 1}
@@ -129,7 +136,7 @@ func TestStore_PersistEventAndSnapshot_First(t *testing.T) {
 
 func TestStore_PersistEventAndSnapshot_OptimisticLock(t *testing.T) {
 	s := memory.New[stubAgg]()
-	id := es.NewAggregateID("Visit", "v1")
+	id := visitID("v1")
 	ev1 := es.NewEvent("evt-1", "VisitScheduled", id, nil, es.WithSeqNr(1))
 	agg1 := stubAgg{id: id, seqNr: 1, version: 1}
 	if err := s.PersistEventAndSnapshot(context.Background(), ev1, agg1); err != nil {

@@ -3,10 +3,12 @@ package eventstore
 import (
 	"testing"
 	"time"
+
+	"github.com/Hiroshi0900/eventstore/v2/internal/aggregateid"
 )
 
 func TestNewEvent_Defaults(t *testing.T) {
-	id := NewAggregateID("Visit", "v1")
+	id := aggregateid.New("Visit", "v1")
 	ev := NewEvent("evt-1", "VisitScheduled", id, []byte("payload"))
 
 	if got, want := ev.EventID(), "evt-1"; got != want {
@@ -33,7 +35,7 @@ func TestNewEvent_Defaults(t *testing.T) {
 }
 
 func TestNewEvent_WithOptions(t *testing.T) {
-	id := NewAggregateID("Visit", "v1")
+	id := aggregateid.New("Visit", "v1")
 	ts := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	ev := NewEvent("evt-1", "VisitScheduled", id, nil,
 		WithSeqNr(42),
@@ -53,7 +55,7 @@ func TestNewEvent_WithOptions(t *testing.T) {
 }
 
 func TestBaseEvent_WithSeqNr(t *testing.T) {
-	id := NewAggregateID("Visit", "v1")
+	id := aggregateid.New("Visit", "v1")
 	ev := NewEvent("evt-1", "VisitScheduled", id, nil, WithSeqNr(1))
 
 	updated := ev.WithSeqNr(5)

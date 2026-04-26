@@ -3,6 +3,8 @@ package eventstore
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/Hiroshi0900/eventstore/v2/internal/aggregateid"
 )
 
 // EventSerializer は Event 全体（メタデータ + payload）の (de)serialization を担います。
@@ -54,7 +56,7 @@ func (s *JSONEventSerializer) Deserialize(data []byte) (Event, error) {
 	if err := json.Unmarshal(data, &env); err != nil {
 		return nil, NewDeserializationError("event", err)
 	}
-	aggID := NewAggregateID(env.IDTypeName, env.IDValue)
+	aggID := aggregateid.New(env.IDTypeName, env.IDValue)
 	ev := NewEvent(
 		env.EventID,
 		env.EventTypeName,

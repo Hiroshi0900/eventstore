@@ -5,7 +5,11 @@ import (
 	"testing"
 
 	es "github.com/Hiroshi0900/eventstore/v2"
+	"github.com/Hiroshi0900/eventstore/v2/internal/aggregateid"
 )
+
+// keep es import alive for AggregateID type usage in resolver methods (interface checks).
+var _ es.AggregateID = aggregateid.ID{}
 
 func TestDefaultKeyResolver(t *testing.T) {
 	t.Run("NewDefault creates resolver with default config", func(t *testing.T) {
@@ -37,7 +41,7 @@ func TestDefaultKeyResolver(t *testing.T) {
 	t.Run("ResolvePartitionKey without sharding", func(t *testing.T) {
 		// given
 		sut := NewDefault()
-		id := es.NewAggregateID("MemorialSetting", "abc123")
+		id := aggregateid.New("MemorialSetting", "abc123")
 
 		// when
 		pkey := sut.ResolvePartitionKey(id)
@@ -52,7 +56,7 @@ func TestDefaultKeyResolver(t *testing.T) {
 	t.Run("ResolvePartitionKey with sharding", func(t *testing.T) {
 		// given
 		sut := New(Config{ShardCount: 4})
-		id := es.NewAggregateID("MemorialSetting", "abc123")
+		id := aggregateid.New("MemorialSetting", "abc123")
 
 		// when
 		pkey := sut.ResolvePartitionKey(id)
@@ -70,7 +74,7 @@ func TestDefaultKeyResolver(t *testing.T) {
 	t.Run("ResolveSortKeyForEvent includes zero-padded sequence number", func(t *testing.T) {
 		// given
 		sut := NewDefault()
-		id := es.NewAggregateID("MemorialSetting", "abc123")
+		id := aggregateid.New("MemorialSetting", "abc123")
 
 		// when
 		skey := sut.ResolveSortKeyForEvent(id, 42)
@@ -85,7 +89,7 @@ func TestDefaultKeyResolver(t *testing.T) {
 	t.Run("ResolveSortKeyForEvent handles large sequence numbers", func(t *testing.T) {
 		// given
 		sut := NewDefault()
-		id := es.NewAggregateID("Test", "1")
+		id := aggregateid.New("Test", "1")
 
 		// when
 		skey := sut.ResolveSortKeyForEvent(id, 12345678901234567890)
@@ -99,7 +103,7 @@ func TestDefaultKeyResolver(t *testing.T) {
 	t.Run("ResolveSortKeyForSnapshot uses 0 as suffix", func(t *testing.T) {
 		// given
 		sut := NewDefault()
-		id := es.NewAggregateID("MemorialSetting", "abc123")
+		id := aggregateid.New("MemorialSetting", "abc123")
 
 		// when
 		skey := sut.ResolveSortKeyForSnapshot(id)
@@ -114,7 +118,7 @@ func TestDefaultKeyResolver(t *testing.T) {
 	t.Run("ResolveAggregateIDKey returns AsString format", func(t *testing.T) {
 		// given
 		sut := NewDefault()
-		id := es.NewAggregateID("MemorialSetting", "abc123")
+		id := aggregateid.New("MemorialSetting", "abc123")
 
 		// when
 		aidKey := sut.ResolveAggregateIDKey(id)
@@ -129,7 +133,7 @@ func TestDefaultKeyResolver(t *testing.T) {
 	t.Run("ResolveEventKeys returns all components", func(t *testing.T) {
 		// given
 		sut := NewDefault()
-		id := es.NewAggregateID("MemorialSetting", "abc123")
+		id := aggregateid.New("MemorialSetting", "abc123")
 
 		// when
 		keys := sut.ResolveEventKeys(id, 5)
@@ -149,7 +153,7 @@ func TestDefaultKeyResolver(t *testing.T) {
 	t.Run("ResolveSnapshotKeys returns all components", func(t *testing.T) {
 		// given
 		sut := NewDefault()
-		id := es.NewAggregateID("MemorialSetting", "abc123")
+		id := aggregateid.New("MemorialSetting", "abc123")
 
 		// when
 		keys := sut.ResolveSnapshotKeys(id)
@@ -176,7 +180,7 @@ func TestShardDistribution(t *testing.T) {
 		// when
 		shardCounts := make(map[string]int)
 		for _, idValue := range ids {
-			id := es.NewAggregateID("Test", idValue)
+			id := aggregateid.New("Test", idValue)
 			pkey := sut.ResolvePartitionKey(id)
 			shardCounts[pkey]++
 		}
@@ -190,7 +194,7 @@ func TestShardDistribution(t *testing.T) {
 	t.Run("Same ID always maps to same shard", func(t *testing.T) {
 		// given
 		sut := New(Config{ShardCount: 4})
-		id := es.NewAggregateID("Test", "consistent-id")
+		id := aggregateid.New("Test", "consistent-id")
 
 		// when
 		pkey1 := sut.ResolvePartitionKey(id)
@@ -219,7 +223,7 @@ func TestComputeShardID_Boundary(t *testing.T) {
 
 		// then
 		for _, v := range testIDs {
-			id := es.NewAggregateID("Test", v)
+			id := aggregateid.New("Test", v)
 			pkey := sut.ResolvePartitionKey(id)
 			// with ShardCount=1, computeShardID must return 0
 			expected := "Test-0"
@@ -238,7 +242,7 @@ func TestComputeShardID_Boundary(t *testing.T) {
 		// try many IDs until we find one that hashes to shard 1
 		foundShard1 := false
 		for i := 0; i < 100; i++ {
-			id := es.NewAggregateID("Test", string(rune('a'+i%26))+string(rune('a'+(i/26)%26)))
+			id := aggregateid.New("Test", string(rune('a'+i%26))+string(rune('a'+(i/26)%26)))
 			pkey := sut.ResolvePartitionKey(id)
 			if pkey == "Test-1" {
 				foundShard1 = true

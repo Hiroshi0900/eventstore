@@ -4,11 +4,13 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/Hiroshi0900/eventstore/v2/internal/aggregateid"
 )
 
 func TestJSONEventSerializer_RoundTrip(t *testing.T) {
 	s := NewJSONEventSerializer()
-	id := NewAggregateID("Visit", "abc-123")
+	id := aggregateid.New("Visit", "abc-123")
 	ts := time.Date(2026, 4, 27, 12, 34, 56, 0, time.UTC)
 	src := NewEvent(
 		"evt-1",

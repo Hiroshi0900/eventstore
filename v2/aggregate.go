@@ -1,24 +1,5 @@
 package eventstore
 
-import "fmt"
-
-// DefaultAggregateID は AggregateID のデフォルト実装です。
-type DefaultAggregateID struct {
-	typeName string
-	value    string
-}
-
-// NewAggregateID は DefaultAggregateID を生成します。
-func NewAggregateID(typeName, value string) DefaultAggregateID {
-	return DefaultAggregateID{typeName: typeName, value: value}
-}
-
-func (id DefaultAggregateID) TypeName() string { return id.typeName }
-func (id DefaultAggregateID) Value() string    { return id.value }
-func (id DefaultAggregateID) AsString() string {
-	return fmt.Sprintf("%s-%s", id.typeName, id.value)
-}
-
 // BaseAggregate は Aggregate 共通フィールド (AggregateID / SeqNr / Version) を
 // 提供する埋め込み用 struct です。これを embed することで、ユーザは AggregateID() /
 // SeqNr() / Version() の boilerplate を省略できます。
@@ -47,6 +28,9 @@ func (id DefaultAggregateID) AsString() string {
 //
 //	func (c Counter) ApplyCommand(cmd es.Command) (es.Event, error) { ... }
 //	func (c Counter) ApplyEvent(ev es.Event) es.Aggregate { ... }
+//
+// AggregateID 自体はドメイン側で typed な実装を定義してください
+// (例: type CounterID struct{ value string } で AggregateID interface を満たす)。
 type BaseAggregate struct {
 	aggregateID AggregateID
 	seqNr       uint64

@@ -47,6 +47,14 @@ import (
     es "github.com/Hiroshi0900/eventstore/v2"
 )
 
+// --- AggregateID (typed per domain) ---
+
+type CounterID string
+
+func (id CounterID) TypeName() string { return "Counter" }
+func (id CounterID) Value() string    { return string(id) }
+func (id CounterID) AsString() string { return "Counter-" + string(id) }
+
 // --- Command ---
 
 type IncrementCmd struct{ ID es.AggregateID }
@@ -111,7 +119,7 @@ import (
 store := esmem.New[Counter]()
 repo := es.NewRepository[Counter](store, NewCounter, es.DefaultConfig())
 
-id := es.NewAggregateID("Counter", "c1")
+id := CounterID("c1")
 c := NewCounter(id)
 
 // Apply a command and persist the resulting event.

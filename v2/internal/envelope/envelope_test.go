@@ -5,12 +5,13 @@ import (
 	"time"
 
 	es "github.com/Hiroshi0900/eventstore/v2"
+	"github.com/Hiroshi0900/eventstore/v2/internal/aggregateid"
 )
 
 func TestFromEvent(t *testing.T) {
 	t.Run("FromEvent converts Event to EventEnvelope", func(t *testing.T) {
 		// given
-		aggregateID := es.NewAggregateID("MemorialSetting", "abc123")
+		aggregateID := aggregateid.New("MemorialSetting", "abc123")
 		payload := []byte(`{"key":"value"}`)
 		unixMilli := int64(1705315800000)
 		event := es.NewEvent("event-1", "SettingCreated", aggregateID, payload,
