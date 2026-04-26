@@ -208,3 +208,30 @@ func TestRepository_Store_TakesSnapshot(t *testing.T) {
 		t.Errorf("loaded.value = %d, want 3", loaded.value)
 	}
 }
+
+func TestRepository_Store_OptimisticLockOnSnapshot(t *testing.T) {
+	store := memory.New()
+	r := es.NewRepository[counter](
+		store,
+		func(id es.AggregateID) counter { return newCounter(id) },
+		counterSerializer{},
+		es.Config{SnapshotInterval: 1},
+	)
+	id := es.NewAggregateID("Counter", "c1")
+	c := newCounter(id)
+
+	c, err := r.Store(context.Background(), incrementCmd{id: id}, c)
+	if err != nil {
+		t.Fatalf("first Store err: %v", err)
+	}
+
+	stale := c
+	c, err = r.Store(context.Background(), incrementCmd{id: id}, c)
+	if err != nil {
+		t.Fatalf("second Store err: %v", err)
+	}
+	_, err = r.Store(context.Background(), incrementCmd{id: id}, stale)
+	if !errors.Is(err, es.ErrOptimisticLock) {
+		t.Errorf("expected ErrOptimisticLock, got %v", err)
+	}
+}
