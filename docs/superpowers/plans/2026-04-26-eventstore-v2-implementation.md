@@ -915,7 +915,6 @@ type Store struct {
 	mu        sync.RWMutex
 	events    map[string][]es.Event       // aggregateID -> events
 	snapshots map[string]*es.SnapshotData // aggregateID -> latest snapshot
-	versions  map[string]uint64           // aggregateID -> current version
 }
 
 // New は空の Store を生成します。
@@ -923,7 +922,6 @@ func New() *Store {
 	return &Store{
 		events:    map[string][]es.Event{},
 		snapshots: map[string]*es.SnapshotData{},
-		versions:  map[string]uint64{},
 	}
 }
 
@@ -961,7 +959,6 @@ func (s *Store) Clear() {
 	defer s.mu.Unlock()
 	s.events = map[string][]es.Event{}
 	s.snapshots = map[string]*es.SnapshotData{}
-	s.versions = map[string]uint64{}
 }
 ```
 
@@ -1022,24 +1019,26 @@ func TestStore_PersistEvent_DuplicateOnCreate(t *testing.T) {
 	}
 }
 
-func TestStore_PersistEvent_OptimisticLock(t *testing.T) {
+func TestStore_PersistEvent_DuplicateSeqNr(t *testing.T) {
 	s := New()
 	id := es.NewAggregateID("Visit", "v1")
 	ev1 := es.NewEvent("evt-1", "VisitScheduled", id, nil, es.WithSeqNr(1))
-	ev2 := es.NewEvent("evt-2", "VisitCompleted", id, nil, es.WithSeqNr(2))
+	ev2 := es.NewEvent("evt-2", "VisitCompleted", id, nil, es.WithSeqNr(1)) // 同じ SeqNr
 
 	if err := s.PersistEvent(context.Background(), ev1, 0); err != nil {
 		t.Fatalf("ev1 err: %v", err)
 	}
-	// expectedVersion を不正な値で指定
-	err := s.PersistEvent(context.Background(), ev2, 99)
-	if !errors.Is(err, es.ErrOptimisticLock) {
-		t.Errorf("expected ErrOptimisticLock, got %v", err)
+	// 同じ SeqNr のイベントを書き込もうとすると ErrDuplicateAggregate
+	err := s.PersistEvent(context.Background(), ev2, 1)
+	if !errors.Is(err, es.ErrDuplicateAggregate) {
+		t.Errorf("expected ErrDuplicateAggregate, got %v", err)
 	}
 }
 ```
 
 `v2/memory/store_test.go` の import に `"errors"` を追加。
+
+> **設計メモ**: `PersistEvent` の `version` 引数は **「初回作成識別」専用**として扱う（version==0 で既存ありなら Duplicate、それ以外は無視）。楽観的ロックは `PersistEventAndSnapshot` 経由の snapshot.Version でのみ行う。これは v1 DynamoDB の挙動と整合する。
 
 - [ ] **Step 2: テスト失敗を確認**
 
@@ -1050,28 +1049,35 @@ Expected: コンパイルエラー（`PersistEvent undefined`）
 
 `v2/memory/store.go` に追記:
 ```go
-// PersistEvent はイベントを保存します。expectedVersion は楽観ロック用の現在 version。
-// 初回イベント (expectedVersion == 0) で既存があれば ErrDuplicateAggregate。
-// それ以外で version 不一致なら ErrOptimisticLock。
-func (s *Store) PersistEvent(_ context.Context, event es.Event, expectedVersion uint64) error {
+// PersistEvent はイベントを保存します。
+// 初回イベント (version == 0) で既存があれば ErrDuplicateAggregate。
+// 同じ SeqNr のイベントが既に存在する場合も ErrDuplicateAggregate。
+// version 引数は初回識別以外には使用しない（v1 DynamoDB と意味論を揃えるため）。
+// 楽観的ロックは PersistEventAndSnapshot の snapshot.Version で行う。
+func (s *Store) PersistEvent(_ context.Context, event es.Event, version uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	key := event.AggregateID().AsString()
 
-	if expectedVersion == 0 && len(s.events[key]) > 0 {
+	// 初回作成の整合性チェック
+	if version == 0 && len(s.events[key]) > 0 {
 		return es.NewDuplicateAggregateError(key)
 	}
-	current := s.versions[key]
-	if expectedVersion > 0 && current != expectedVersion {
-		return es.NewOptimisticLockError(key, expectedVersion, current)
+
+	// 同 SeqNr 衝突チェック
+	for _, existing := range s.events[key] {
+		if existing.SeqNr() == event.SeqNr() {
+			return es.NewDuplicateAggregateError(key)
+		}
 	}
 
 	s.events[key] = append(s.events[key], event)
-	s.versions[key] = current + 1
 	return nil
 }
 ```
+
+> versions マップは PersistEvent では更新しない。snapshot.Version の管理は PersistEventAndSnapshot に集約。
 
 - [ ] **Step 4: テスト成功を確認**
 
@@ -1153,26 +1159,38 @@ Expected: コンパイルエラー（`PersistEventAndSnapshot undefined`）
 `v2/memory/store.go` に追記:
 ```go
 // PersistEventAndSnapshot はイベントとスナップショットをアトミックに保存します。
-// 既存スナップショットの version + 1 が snapshot.Version と一致しない場合 ErrOptimisticLock。
+// 楽観的ロック: 既存 snapshot の Version + 1 が snapshot.Version と一致しない場合 ErrOptimisticLock。
+// snapshot がない場合は snapshot.Version == 1 を期待。
 func (s *Store) PersistEventAndSnapshot(_ context.Context, event es.Event, snapshot es.SnapshotData) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	key := event.AggregateID().AsString()
-	current := s.versions[key]
 
-	// snapshot.Version は「保存後に集約が持つべき version」想定 (current + 1)
-	expected := current + 1
+	// 同 SeqNr 衝突チェック (PersistEvent と同じ整合性)
+	for _, existing := range s.events[key] {
+		if existing.SeqNr() == event.SeqNr() {
+			return es.NewDuplicateAggregateError(key)
+		}
+	}
+
+	// snapshot 世代ベースの楽観ロック
+	var currentSnapVersion uint64
+	if existing, ok := s.snapshots[key]; ok {
+		currentSnapVersion = existing.Version
+	}
+	expected := currentSnapVersion + 1
 	if snapshot.Version != expected {
 		return es.NewOptimisticLockError(key, expected, snapshot.Version)
 	}
 
 	s.events[key] = append(s.events[key], event)
 	s.snapshots[key] = &snapshot
-	s.versions[key] = snapshot.Version
 	return nil
 }
 ```
+
+> Store struct から `versions` マップを削除する。snapshot version は `snapshots[key].Version` から取得する（情報の二重管理を避ける）。
 
 - [ ] **Step 4: テスト成功を確認**
 

@@ -244,6 +244,21 @@ type SnapshotData struct {
     SeqNr   uint64
     Version uint64
 }
+
+#### 楽観的ロックの方針
+
+楽観的ロックは **`PersistEventAndSnapshot` の `snapshot.Version` 一本**で行う。`PersistEvent` は楽観的ロックを行わず、以下のチェックのみ：
+
+- 既に同じ `(AggregateID, SeqNr)` のイベントが存在しないこと（DynamoDB では `attribute_not_exists(#pk)` の Condition、memory では既存イベントの SeqNr 衝突チェック）
+- 初回イベント（`version == 0` で渡された場合）は、その集約のイベントが他に存在しないこと（`ErrDuplicateAggregate`）
+
+`PersistEvent` の `version` 引数は **「初回作成かどうかの識別」専用**であり、それ以外の値での楽観的ロック判定には使わない。これにより v1 DynamoDB（`version` 引数を実質無視していた）と意味論を揃える。
+
+#### Snapshot Interval 中の並行更新
+
+`SnapshotInterval` の間は楽観的ロックが発生しないため、極めて短いウィンドウで並行更新が起きる可能性がある。これは **イベントの SeqNr 衝突チェックで防がれる**：同じ SeqNr のイベントを 2 つ書き込もうとすると、後続が `ErrDuplicateAggregate`（または同等のエラー）で失敗する。
+
+
 ```
 
 #### 設計のポイント
@@ -271,11 +286,14 @@ type Config struct {
 
 ### 5.8 楽観的ロック
 
-v1 から **変更なし**。
+v1 から方針を整理：
 
-- 集約の `Version()` を保持
-- スナップショット書き込み時に ConditionExpression `version = :expected_version`
+- 集約の `Version()` は「**スナップショット世代カウンタ**」として位置づける
+- `PersistEventAndSnapshot` 時に snapshot table の ConditionExpression `version = :expected_version` で楽観的ロック
+- `PersistEvent` 単体では楽観的ロックを行わない（イベント SeqNr 衝突チェックのみ）
 - 失敗時は `OptimisticLockError`
+
+> **v1 との差**：v1 memory store は `PersistEvent` 内でも `versions` を更新していたが、v2 では「Version = snapshot 世代」の意味論に統一し、`PersistEvent` では更新しない。
 
 ### 5.9 エラー型
 
