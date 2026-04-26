@@ -54,6 +54,28 @@ func (s *Store) GetEventsByIDSinceSeqNr(_ context.Context, id es.AggregateID, se
 	return out, nil
 }
 
+// PersistEvent はイベントを保存します。expectedVersion は楽観ロック用の現在 version。
+// 初回イベント (expectedVersion == 0) で既存があれば ErrDuplicateAggregate。
+// それ以外で version 不一致なら ErrOptimisticLock。
+func (s *Store) PersistEvent(_ context.Context, event es.Event, expectedVersion uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := event.AggregateID().AsString()
+
+	if expectedVersion == 0 && len(s.events[key]) > 0 {
+		return es.NewDuplicateAggregateError(key)
+	}
+	current := s.versions[key]
+	if expectedVersion > 0 && current != expectedVersion {
+		return es.NewOptimisticLockError(key, expectedVersion, current)
+	}
+
+	s.events[key] = append(s.events[key], event)
+	s.versions[key] = current + 1
+	return nil
+}
+
 // Clear はストア内のすべてのデータを消去します（テスト用途）。
 func (s *Store) Clear() {
 	s.mu.Lock()
