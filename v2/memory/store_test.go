@@ -79,3 +79,48 @@ func TestStore_PersistEvent_OptimisticLock(t *testing.T) {
 		t.Errorf("expected ErrOptimisticLock, got %v", err)
 	}
 }
+
+func TestStore_PersistEventAndSnapshot_First(t *testing.T) {
+	s := New()
+	id := es.NewAggregateID("Visit", "v1")
+	ev := es.NewEvent("evt-1", "VisitScheduled", id, nil,
+		es.WithSeqNr(1), es.WithIsCreated(true))
+	snap := es.SnapshotData{Payload: []byte("snap-1"), SeqNr: 1, Version: 1}
+
+	if err := s.PersistEventAndSnapshot(context.Background(), ev, snap); err != nil {
+		t.Fatalf("PersistEventAndSnapshot err: %v", err)
+	}
+
+	got, err := s.GetLatestSnapshotByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetLatestSnapshotByID err: %v", err)
+	}
+	if got == nil {
+		t.Fatal("snapshot is nil")
+	}
+	if string(got.Payload) != "snap-1" || got.SeqNr != 1 || got.Version != 1 {
+		t.Errorf("snapshot mismatch: %+v", got)
+	}
+
+	events, _ := s.GetEventsByIDSinceSeqNr(context.Background(), id, 0)
+	if len(events) != 1 {
+		t.Errorf("expected 1 event, got %d", len(events))
+	}
+}
+
+func TestStore_PersistEventAndSnapshot_OptimisticLock(t *testing.T) {
+	s := New()
+	id := es.NewAggregateID("Visit", "v1")
+	ev1 := es.NewEvent("evt-1", "VisitScheduled", id, nil, es.WithSeqNr(1))
+	snap1 := es.SnapshotData{Payload: []byte("v1"), SeqNr: 1, Version: 1}
+	if err := s.PersistEventAndSnapshot(context.Background(), ev1, snap1); err != nil {
+		t.Fatalf("first err: %v", err)
+	}
+
+	ev2 := es.NewEvent("evt-2", "VisitCompleted", id, nil, es.WithSeqNr(2))
+	snap2 := es.SnapshotData{Payload: []byte("v2"), SeqNr: 2, Version: 99}
+	err := s.PersistEventAndSnapshot(context.Background(), ev2, snap2)
+	if !errors.Is(err, es.ErrOptimisticLock) {
+		t.Errorf("expected ErrOptimisticLock, got %v", err)
+	}
+}
