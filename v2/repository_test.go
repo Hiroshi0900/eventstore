@@ -102,3 +102,13 @@ func TestRepository_Construct(t *testing.T) {
 	_ = context.Background
 	_ = errors.Is
 }
+
+func TestRepository_Load_NotFound(t *testing.T) {
+	r := newTestRepo()
+	id := es.NewAggregateID("Counter", "c1")
+
+	_, err := r.Load(context.Background(), id)
+	if !errors.Is(err, es.ErrAggregateNotFound) {
+		t.Errorf("expected ErrAggregateNotFound, got %v", err)
+	}
+}
