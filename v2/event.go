@@ -2,18 +2,6 @@ package eventstore
 
 import "time"
 
-// Event は過去に発生した不変のドメインイベントを表します。
-type Event interface {
-	EventID() string
-	EventTypeName() string
-	AggregateID() AggregateID
-	SeqNr() uint64
-	IsCreated() bool
-	OccurredAt() time.Time
-	Payload() []byte
-	WithSeqNr(uint64) Event
-}
-
 // EventOption は Event の関数オプションです。
 type EventOption func(*DefaultEvent)
 
