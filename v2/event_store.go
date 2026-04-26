@@ -2,13 +2,6 @@ package eventstore
 
 import "context"
 
-// SnapshotData はスナップショットの永続化データを表します。
-type SnapshotData struct {
-	Payload []byte // serialized aggregate state
-	SeqNr   uint64
-	Version uint64
-}
-
 // Config は EventStore / Repository の設定を保持します。
 type Config struct {
 	// SnapshotInterval はスナップショットを取る seqNr の間隔です。
@@ -45,15 +38,32 @@ func (c Config) ShouldSnapshot(seqNr uint64) bool {
 	return seqNr%c.SnapshotInterval == 0
 }
 
-// EventStore はイベント・スナップショットの永続化抽象です。
-type EventStore interface {
-	GetLatestSnapshotByID(ctx context.Context, id AggregateID) (*SnapshotData, error)
+// EventStore[T] は集約 T の永続化抽象です。
+//
+// snapshot は Aggregate (T) を直接やり取りします。バイト列 payload との
+// (de)serialize は実装が責務として持ちます (memory は in-memory のため不要、
+// dynamodb は AggregateSerializer[T] をコンストラクタで受け取る)。
+type EventStore[T Aggregate] interface {
+	// GetLatestSnapshotByID は最新スナップショットを返します。
+	// 第 2 戻り値 found=false なら snapshot 未存在 (エラーではない)。
+	GetLatestSnapshotByID(ctx context.Context, id AggregateID) (T, bool, error)
+
+	// GetEventsByIDSinceSeqNr は seqNr より大きい seqNr のイベントを昇順で返します。
 	GetEventsByIDSinceSeqNr(ctx context.Context, id AggregateID, seqNr uint64) ([]Event, error)
+
+	// PersistEvent はイベント単独を保存します (snapshot interval 外のケース)。
+	// version 引数は呼び出し側の context 共有用で実装は無視して構いません。
+	// 楽観ロックは PersistEventAndSnapshot に集約。
 	PersistEvent(ctx context.Context, event Event, version uint64) error
-	PersistEventAndSnapshot(ctx context.Context, event Event, snapshot SnapshotData) error
+
+	// PersistEventAndSnapshot はイベントと snapshot をアトミックに保存します。
+	// 楽観ロックは aggregate.Version() を起点とし、期待 version は aggregate.Version() - 1。
+	// aggregate.Version() == 1 の場合は初回作成扱い。
+	PersistEventAndSnapshot(ctx context.Context, event Event, aggregate T) error
 }
 
 // AggregateSerializer は集約 T のスナップショット用シリアライザです。
+// dynamodb など永続化実装で snapshot payload を組み立てる際に使います。
 type AggregateSerializer[T Aggregate] interface {
 	Serialize(T) ([]byte, error)
 	Deserialize([]byte) (T, error)

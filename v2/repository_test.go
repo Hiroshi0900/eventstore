@@ -2,7 +2,6 @@ package eventstore_test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"testing"
 
@@ -51,45 +50,12 @@ type incrementCmd struct{ id es.AggregateID }
 func (c incrementCmd) CommandTypeName() string     { return "Increment" }
 func (c incrementCmd) AggregateID() es.AggregateID { return c.id }
 
-// --- AggregateSerializer ---
-
-type counterSnapshot struct {
-	Value   int    `json:"value"`
-	SeqNr   uint64 `json:"seq_nr"`
-	Version uint64 `json:"version"`
-	IDType  string `json:"id_type"`
-	IDValue string `json:"id_value"`
-}
-
-type counterSerializer struct{}
-
-func (counterSerializer) Serialize(c counter) ([]byte, error) {
-	return json.Marshal(counterSnapshot{
-		Value: c.value, SeqNr: c.seqNr, Version: c.version,
-		IDType: c.id.TypeName(), IDValue: c.id.Value(),
-	})
-}
-
-func (counterSerializer) Deserialize(data []byte) (counter, error) {
-	var s counterSnapshot
-	if err := json.Unmarshal(data, &s); err != nil {
-		return counter{}, err
-	}
-	return counter{
-		id:      es.NewAggregateID(s.IDType, s.IDValue),
-		value:   s.Value,
-		seqNr:   s.SeqNr,
-		version: s.Version,
-	}, nil
-}
-
 // --- 共通ヘルパ ---
 
 func newTestRepo() *es.Repository[counter] {
 	return es.NewRepository[counter](
-		memory.New(),
+		memory.New[counter](),
 		func(id es.AggregateID) counter { return newCounter(id) },
-		counterSerializer{},
 		es.DefaultConfig(),
 	)
 }
@@ -168,11 +134,10 @@ func TestRepository_LoadAfterStore(t *testing.T) {
 }
 
 func TestRepository_Store_TakesSnapshot(t *testing.T) {
-	store := memory.New()
+	store := memory.New[counter]()
 	r := es.NewRepository[counter](
 		store,
 		func(id es.AggregateID) counter { return newCounter(id) },
-		counterSerializer{},
 		es.Config{SnapshotInterval: 3},
 	)
 	id := es.NewAggregateID("Counter", "c1")
@@ -186,18 +151,18 @@ func TestRepository_Store_TakesSnapshot(t *testing.T) {
 		}
 	}
 
-	snap, err := store.GetLatestSnapshotByID(context.Background(), id)
+	snap, found, err := store.GetLatestSnapshotByID(context.Background(), id)
 	if err != nil {
 		t.Fatalf("GetLatestSnapshotByID err: %v", err)
 	}
-	if snap == nil {
+	if !found {
 		t.Fatal("expected snapshot to be saved at seqNr=3")
 	}
-	if snap.SeqNr != 3 {
-		t.Errorf("snap.SeqNr = %d, want 3", snap.SeqNr)
+	if snap.SeqNr() != 3 {
+		t.Errorf("snap.SeqNr() = %d, want 3", snap.SeqNr())
 	}
-	if snap.Version != 1 {
-		t.Errorf("snap.Version = %d, want 1", snap.Version)
+	if snap.Version() != 1 {
+		t.Errorf("snap.Version() = %d, want 1", snap.Version())
 	}
 
 	loaded, err := r.Load(context.Background(), id)
@@ -210,11 +175,10 @@ func TestRepository_Store_TakesSnapshot(t *testing.T) {
 }
 
 func TestRepository_Store_OptimisticLockOnSnapshot(t *testing.T) {
-	store := memory.New()
+	store := memory.New[counter]()
 	r := es.NewRepository[counter](
 		store,
 		func(id es.AggregateID) counter { return newCounter(id) },
-		counterSerializer{},
 		es.Config{SnapshotInterval: 1},
 	)
 	id := es.NewAggregateID("Counter", "c1")
@@ -238,8 +202,6 @@ func TestRepository_Store_OptimisticLockOnSnapshot(t *testing.T) {
 
 // リグレッションテスト: SnapshotInterval=5 で 6 回以上 Store した時、
 // snapshot 取得後の PersistEvent でバージョン管理が壊れないこと。
-// versions マップを「PersistEvent でインクリメント、PersistEventAndSnapshot で上書き」していた
-// 以前のバグを catch するためのテスト。
 func TestRepository_Store_BeyondSnapshotInterval(t *testing.T) {
 	r := newTestRepo() // SnapshotInterval=5 (DefaultConfig)
 	id := es.NewAggregateID("Counter", "c1")

@@ -6,6 +6,7 @@ import (
 
 	awsdynamo "github.com/aws/aws-sdk-go-v2/service/dynamodb"
 
+	es "github.com/Hiroshi0900/eventstore/v2"
 	v2dynamo "github.com/Hiroshi0900/eventstore/v2/dynamodb"
 )
 
@@ -37,8 +38,28 @@ func (fakeClient) DescribeTable(ctx context.Context, params *awsdynamo.DescribeT
 	return &awsdynamo.DescribeTableOutput{}, nil
 }
 
+// stubAgg は generic Store[T] 構築テスト用の最小 Aggregate 実装。
+type stubAgg struct {
+	id      es.AggregateID
+	seqNr   uint64
+	version uint64
+}
+
+func (a stubAgg) AggregateID() es.AggregateID                  { return a.id }
+func (a stubAgg) SeqNr() uint64                                { return a.seqNr }
+func (a stubAgg) Version() uint64                              { return a.version }
+func (a stubAgg) WithSeqNr(s uint64) es.Aggregate              { a.seqNr = s; return a }
+func (a stubAgg) WithVersion(v uint64) es.Aggregate            { a.version = v; return a }
+func (a stubAgg) ApplyCommand(es.Command) (es.Event, error)    { return nil, es.ErrUnknownCommand }
+func (a stubAgg) ApplyEvent(es.Event) es.Aggregate             { return a }
+
+type stubSerializer struct{}
+
+func (stubSerializer) Serialize(stubAgg) ([]byte, error)   { return nil, nil }
+func (stubSerializer) Deserialize([]byte) (stubAgg, error) { return stubAgg{}, nil }
+
 func TestNew_Construct(t *testing.T) {
-	store := v2dynamo.New(fakeClient{}, v2dynamo.DefaultConfig())
+	store := v2dynamo.New[stubAgg](fakeClient{}, v2dynamo.DefaultConfig(), stubSerializer{})
 	if store == nil {
 		t.Fatal("expected non-nil Store")
 	}

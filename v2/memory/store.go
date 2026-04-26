@@ -9,33 +9,37 @@ import (
 	es "github.com/Hiroshi0900/eventstore/v2"
 )
 
-// Store は in-memory な EventStore 実装です。
-type Store struct {
+// Store[T] は in-memory な EventStore[T] 実装です。
+type Store[T es.Aggregate] struct {
 	mu        sync.RWMutex
-	events    map[string][]es.Event       // aggregateID -> events
-	snapshots map[string]*es.SnapshotData // aggregateID -> latest snapshot
+	events    map[string][]es.Event // aggregateID -> events
+	snapshots map[string]T          // aggregateID -> latest aggregate snapshot
+	hasSnap   map[string]bool       // T のゼロ値と区別するための存在フラグ
 }
 
-// New は空の Store を生成します。
-func New() *Store {
-	return &Store{
+// New[T] は空の Store[T] を生成します。
+func New[T es.Aggregate]() *Store[T] {
+	return &Store[T]{
 		events:    map[string][]es.Event{},
-		snapshots: map[string]*es.SnapshotData{},
+		snapshots: map[string]T{},
+		hasSnap:   map[string]bool{},
 	}
 }
 
-// GetLatestSnapshotByID は集約の最新スナップショットを返します。存在しなければ nil。
-func (s *Store) GetLatestSnapshotByID(_ context.Context, id es.AggregateID) (*es.SnapshotData, error) {
+// GetLatestSnapshotByID は集約の最新スナップショットを返します。存在しなければ found=false。
+func (s *Store[T]) GetLatestSnapshotByID(_ context.Context, id es.AggregateID) (T, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if snap, ok := s.snapshots[id.AsString()]; ok {
-		return snap, nil
+	var zero T
+	key := id.AsString()
+	if !s.hasSnap[key] {
+		return zero, false, nil
 	}
-	return nil, nil
+	return s.snapshots[key], true, nil
 }
 
 // GetEventsByIDSinceSeqNr は seqNr より大きい seqNr のイベントを昇順で返します。
-func (s *Store) GetEventsByIDSinceSeqNr(_ context.Context, id es.AggregateID, seqNr uint64) ([]es.Event, error) {
+func (s *Store[T]) GetEventsByIDSinceSeqNr(_ context.Context, id es.AggregateID, seqNr uint64) ([]es.Event, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	all := s.events[id.AsString()]
@@ -57,8 +61,8 @@ func (s *Store) GetEventsByIDSinceSeqNr(_ context.Context, id es.AggregateID, se
 // `attribute_not_exists(#pk)` 条件と同等）。これにより新規集約の二重作成も SeqNr=1 衝突として検出される。
 //
 // version 引数は EventStore interface 互換のため受け取るが使用しない。
-// 楽観的ロックは PersistEventAndSnapshot の snapshot.Version で一本化。
-func (s *Store) PersistEvent(_ context.Context, event es.Event, _ uint64) error {
+// 楽観的ロックは PersistEventAndSnapshot の aggregate.Version() で一本化。
+func (s *Store[T]) PersistEvent(_ context.Context, event es.Event, _ uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -76,42 +80,48 @@ func (s *Store) PersistEvent(_ context.Context, event es.Event, _ uint64) error 
 }
 
 // PersistEventAndSnapshot はイベントとスナップショットをアトミックに保存します。
-// 楽観的ロック: 既存 snapshot の Version + 1 が snapshot.Version と一致しない場合 ErrOptimisticLock。
-// snapshot がない場合は snapshot.Version == 1 を期待。
+// 楽観的ロック: aggregate.Version() - 1 が現行 snapshot Version と一致しなければ ErrOptimisticLock。
+// aggregate.Version() == 1 のとき初回作成扱い (既存 snapshot があれば衝突)。
 // 同じ SeqNr のイベントが既に存在する場合も ErrOptimisticLock (並行更新による競合)。
-// これは v1 DynamoDB の TransactWriteItems が ConditionalCheckFailed を一律 ErrOptimisticLock として扱うのと整合。
-func (s *Store) PersistEventAndSnapshot(_ context.Context, event es.Event, snapshot es.SnapshotData) error {
+func (s *Store[T]) PersistEventAndSnapshot(_ context.Context, event es.Event, aggregate T) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	key := event.AggregateID().AsString()
 
-	// snapshot 世代ベースの楽観ロック (先に判定)
-	var currentSnapVersion uint64
-	if existing, ok := s.snapshots[key]; ok {
-		currentSnapVersion = existing.Version
+	// 楽観ロック: aggregate.Version() を新バージョン、期待 = それ - 1。
+	newVersion := aggregate.Version()
+	var expected uint64
+	if newVersion >= 1 {
+		expected = newVersion - 1
 	}
-	expected := currentSnapVersion + 1
-	if snapshot.Version != expected {
-		return es.NewOptimisticLockError(key, expected, snapshot.Version)
+
+	var currentSnapVersion uint64
+	if s.hasSnap[key] {
+		currentSnapVersion = s.snapshots[key].Version()
+	}
+	if currentSnapVersion != expected {
+		return es.NewOptimisticLockError(key, expected, currentSnapVersion)
 	}
 
 	// 同 SeqNr 衝突は並行更新による競合 → ErrOptimisticLock
 	for _, existing := range s.events[key] {
 		if existing.SeqNr() == event.SeqNr() {
-			return es.NewOptimisticLockError(key, expected, snapshot.Version)
+			return es.NewOptimisticLockError(key, expected, currentSnapVersion)
 		}
 	}
 
 	s.events[key] = append(s.events[key], event)
-	s.snapshots[key] = &snapshot
+	s.snapshots[key] = aggregate
+	s.hasSnap[key] = true
 	return nil
 }
 
 // Clear はストア内のすべてのデータを消去します（テスト用途）。
-func (s *Store) Clear() {
+func (s *Store[T]) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.events = map[string][]es.Event{}
-	s.snapshots = map[string]*es.SnapshotData{}
+	s.snapshots = map[string]T{}
+	s.hasSnap = map[string]bool{}
 }
