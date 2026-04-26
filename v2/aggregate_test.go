@@ -2,7 +2,7 @@ package eventstore
 
 import "testing"
 
-func TestDefaultAggregateID_AsString(t *testing.T) {
+func TestAggregateID_AsString(t *testing.T) {
 	id := NewAggregateID("Visit", "abc-123")
 
 	if got, want := id.TypeName(), "Visit"; got != want {

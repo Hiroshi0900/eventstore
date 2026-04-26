@@ -31,14 +31,16 @@ go get github.com/Hiroshi0900/eventstore/v2
 
 ### Key changes from v1
 
+- **Generic `EventStore[T]`** — type-safe Store/Repository pair; snapshots round-trip as `Aggregate` values, not byte payloads
 - **`Command` abstraction** — domain intent is a first-class type passed to `Repository.Store`
 - **`ApplyCommand` / `ApplyEvent` on the aggregate** — the aggregate decides which event to emit and how to evolve its state
 - **State Pattern friendly** — `ApplyEvent` returns `Aggregate` (interface), so different concrete types can represent different aggregate states
-- **`AggregateFactory[T]` is gone** — replaced by `createBlank func(AggregateID) T` + `AggregateSerializer[T]`
+- **`BaseAggregate` / `BaseEvent`** — embeddable types that supply common boilerplate (AggregateID/SeqNr/Version accessors, etc.)
 - **No `Get` prefix on accessors** — `id.TypeName()`, `event.EventID()`, `aggregate.Version()`, etc.
 - **`OccurredAt` is `time.Time`** (stored as Unix milliseconds on the wire)
+- **`EventSerializer`** — JSON and Protobuf implementations are provided for serializing whole `Event` values
 
-### Define a Command, an Event handler, and an Aggregate
+### Define a Command and an Aggregate (with `BaseAggregate`)
 
 ```go
 import (
@@ -52,22 +54,26 @@ type IncrementCmd struct{ ID es.AggregateID }
 func (c IncrementCmd) CommandTypeName() string     { return "Increment" }
 func (c IncrementCmd) AggregateID() es.AggregateID { return c.ID }
 
-// --- Aggregate ---
+// --- Aggregate (embeds BaseAggregate to skip ID/SeqNr/Version boilerplate) ---
 
 type Counter struct {
-    id      es.AggregateID
-    value   int
-    seqNr   uint64
-    version uint64
+    es.BaseAggregate
+    value int
 }
 
-func NewCounter(id es.AggregateID) Counter { return Counter{id: id} }
+func NewCounter(id es.AggregateID) Counter {
+    return Counter{BaseAggregate: es.NewBaseAggregate(id, 0, 0)}
+}
 
-func (c Counter) AggregateID() es.AggregateID       { return c.id }
-func (c Counter) SeqNr() uint64                     { return c.seqNr }
-func (c Counter) Version() uint64                   { return c.version }
-func (c Counter) WithVersion(v uint64) es.Aggregate { c.version = v; return c }
-func (c Counter) WithSeqNr(s uint64) es.Aggregate   { c.seqNr = s; return c }
+// Aggregate interface's WithSeqNr / WithVersion return Aggregate, so override.
+func (c Counter) WithSeqNr(s uint64) es.Aggregate {
+    c.BaseAggregate = c.BaseAggregate.WithSeqNr(s)
+    return c
+}
+func (c Counter) WithVersion(v uint64) es.Aggregate {
+    c.BaseAggregate = c.BaseAggregate.WithVersion(v)
+    return c
+}
 
 func (c Counter) ApplyCommand(cmd es.Command) (es.Event, error) {
     switch cmd.(type) {
@@ -77,7 +83,7 @@ func (c Counter) ApplyCommand(cmd es.Command) (es.Event, error) {
             "Incremented",
             cmd.AggregateID(),
             nil,
-            es.WithIsCreated(c.seqNr == 0),
+            es.WithIsCreated(c.SeqNr() == 0),
         ), nil
     default:
         return nil, es.ErrUnknownCommand
@@ -87,31 +93,13 @@ func (c Counter) ApplyCommand(cmd es.Command) (es.Event, error) {
 func (c Counter) ApplyEvent(ev es.Event) es.Aggregate {
     if ev.EventTypeName() == "Incremented" {
         c.value++
-        c.seqNr = ev.SeqNr()
+        c.BaseAggregate = c.BaseAggregate.WithSeqNr(ev.SeqNr())
     }
     return c
 }
 ```
 
-### Snapshot serialization
-
-```go
-type counterSerializer struct{}
-
-func (counterSerializer) Serialize(c Counter) ([]byte, error) {
-    return json.Marshal(struct {
-        Value   int    `json:"value"`
-        SeqNr   uint64 `json:"seq_nr"`
-        Version uint64 `json:"version"`
-        IDType  string `json:"id_type"`
-        IDValue string `json:"id_value"`
-    }{c.value, c.seqNr, c.version, c.id.TypeName(), c.id.Value()})
-}
-
-func (counterSerializer) Deserialize(data []byte) (Counter, error) { /* ... */ }
-```
-
-### Use a Repository
+### Use a Repository (in-memory)
 
 ```go
 import (
@@ -119,13 +107,9 @@ import (
     esmem "github.com/Hiroshi0900/eventstore/v2/memory"
 )
 
-store := esmem.New()
-repo := es.NewRepository[Counter](
-    store,
-    NewCounter,
-    counterSerializer{},
-    es.DefaultConfig(),
-)
+// memory.Store keeps Aggregate values in-memory; no serializer needed.
+store := esmem.New[Counter]()
+repo := es.NewRepository[Counter](store, NewCounter, es.DefaultConfig())
 
 id := es.NewAggregateID("Counter", "c1")
 c := NewCounter(id)
@@ -145,8 +129,14 @@ import (
     esdb "github.com/Hiroshi0900/eventstore/v2/dynamodb"
 )
 
-store := esdb.New(dynamoClient, esdb.DefaultConfig())
-repo := es.NewRepository[Counter](store, NewCounter, counterSerializer{}, es.DefaultConfig())
+// dynamodb.Store needs an AggregateSerializer[T] to (de)serialize the snapshot
+// payload. JSON/Protobuf serializers can be reused, or roll your own.
+type counterSerializer struct{}
+func (counterSerializer) Serialize(c Counter) ([]byte, error)   { /* json/proto */ }
+func (counterSerializer) Deserialize([]byte) (Counter, error)   { /* json/proto */ }
+
+store := esdb.New[Counter](dynamoClient, esdb.DefaultConfig(), counterSerializer{})
+repo := es.NewRepository[Counter](store, NewCounter, es.DefaultConfig())
 ```
 
 The DynamoDB store maintains two tables (`journal`, `snapshot`), uses

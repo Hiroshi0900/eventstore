@@ -10,27 +10,32 @@ import (
 )
 
 // --- テスト用ミニ集約: 単純なカウンタ ---
+// BaseAggregate を埋め込むパターンで、AggregateID/SeqNr/Version の boilerplate を省略。
 
 type counter struct {
-	id      es.AggregateID
-	value   int
-	seqNr   uint64
-	version uint64
+	es.BaseAggregate
+	value int
 }
 
-func newCounter(id es.AggregateID) counter { return counter{id: id} }
+func newCounter(id es.AggregateID) counter {
+	return counter{BaseAggregate: es.NewBaseAggregate(id, 0, 0)}
+}
 
-func (c counter) AggregateID() es.AggregateID       { return c.id }
-func (c counter) SeqNr() uint64                     { return c.seqNr }
-func (c counter) Version() uint64                   { return c.version }
-func (c counter) WithVersion(v uint64) es.Aggregate { c.version = v; return c }
-func (c counter) WithSeqNr(s uint64) es.Aggregate   { c.seqNr = s; return c }
+// Aggregate interface の WithSeqNr / WithVersion は戻り値が Aggregate なので embed 元で override。
+func (c counter) WithSeqNr(s uint64) es.Aggregate {
+	c.BaseAggregate = c.BaseAggregate.WithSeqNr(s)
+	return c
+}
+func (c counter) WithVersion(v uint64) es.Aggregate {
+	c.BaseAggregate = c.BaseAggregate.WithVersion(v)
+	return c
+}
 
 func (c counter) ApplyCommand(cmd es.Command) (es.Event, error) {
 	switch cmd.(type) {
 	case incrementCmd:
 		return es.NewEvent("evt-"+cmd.AggregateID().AsString(), "Incremented", cmd.AggregateID(), nil,
-			es.WithSeqNr(c.seqNr+1), es.WithIsCreated(c.seqNr == 0)), nil
+			es.WithSeqNr(c.SeqNr()+1), es.WithIsCreated(c.SeqNr() == 0)), nil
 	default:
 		return nil, es.ErrUnknownCommand
 	}
@@ -40,7 +45,7 @@ func (c counter) ApplyEvent(ev es.Event) es.Aggregate {
 	switch ev.EventTypeName() {
 	case "Incremented":
 		c.value++
-		c.seqNr = ev.SeqNr()
+		c.BaseAggregate = c.BaseAggregate.WithSeqNr(ev.SeqNr())
 	}
 	return c
 }

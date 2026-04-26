@@ -52,7 +52,7 @@ func TestNewEvent_WithOptions(t *testing.T) {
 	}
 }
 
-func TestDefaultEvent_WithSeqNr(t *testing.T) {
+func TestBaseEvent_WithSeqNr(t *testing.T) {
 	id := NewAggregateID("Visit", "v1")
 	ev := NewEvent("evt-1", "VisitScheduled", id, nil, WithSeqNr(1))
 
