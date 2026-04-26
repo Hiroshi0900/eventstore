@@ -63,3 +63,45 @@ func (r *Repository[T]) Load(ctx context.Context, id AggregateID) (T, error) {
 	}
 	return agg, nil
 }
+
+// Store はコマンドを集約に適用してイベントを生成・永続化し、新しい集約を返します。
+func (r *Repository[T]) Store(ctx context.Context, cmd Command, agg T) (T, error) {
+	var zero T
+
+	if cmd.AggregateID().AsString() != agg.AggregateID().AsString() {
+		return zero, NewAggregateIDMismatchError(
+			cmd.AggregateID().AsString(),
+			agg.AggregateID().AsString(),
+		)
+	}
+
+	ev, err := agg.ApplyCommand(cmd)
+	if err != nil {
+		return zero, err
+	}
+
+	nextSeqNr := agg.SeqNr() + 1
+	ev = ev.WithSeqNr(nextSeqNr)
+	nextAgg := agg.ApplyEvent(ev).(T)
+	nextAgg = nextAgg.WithSeqNr(nextSeqNr).(T)
+
+	if r.config.ShouldSnapshot(nextSeqNr) {
+		payload, err := r.serializer.Serialize(nextAgg)
+		if err != nil {
+			return zero, err
+		}
+		nextVersion := agg.Version() + 1
+		snap := SnapshotData{Payload: payload, SeqNr: nextSeqNr, Version: nextVersion}
+		if err := r.store.PersistEventAndSnapshot(ctx, ev, snap); err != nil {
+			return zero, err
+		}
+		nextAgg = nextAgg.WithVersion(nextVersion).(T)
+	} else {
+		if err := r.store.PersistEvent(ctx, ev, agg.Version()); err != nil {
+			return zero, err
+		}
+		nextAgg = nextAgg.WithVersion(agg.Version() + 1).(T)
+	}
+
+	return nextAgg, nil
+}

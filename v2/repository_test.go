@@ -112,3 +112,57 @@ func TestRepository_Load_NotFound(t *testing.T) {
 		t.Errorf("expected ErrAggregateNotFound, got %v", err)
 	}
 }
+
+func TestRepository_Store_FirstCommand(t *testing.T) {
+	r := newTestRepo()
+	id := es.NewAggregateID("Counter", "c1")
+	c := newCounter(id)
+
+	updated, err := r.Store(context.Background(), incrementCmd{id: id}, c)
+	if err != nil {
+		t.Fatalf("Store err: %v", err)
+	}
+	if got, want := updated.value, 1; got != want {
+		t.Errorf("counter.value = %d, want %d", got, want)
+	}
+	if got, want := updated.SeqNr(), uint64(1); got != want {
+		t.Errorf("counter.SeqNr = %d, want %d", got, want)
+	}
+}
+
+func TestRepository_Store_MismatchedAggregateID(t *testing.T) {
+	r := newTestRepo()
+	idA := es.NewAggregateID("Counter", "a")
+	idB := es.NewAggregateID("Counter", "b")
+	c := newCounter(idA)
+
+	_, err := r.Store(context.Background(), incrementCmd{id: idB}, c)
+	if !errors.Is(err, es.ErrAggregateIDMismatch) {
+		t.Errorf("expected ErrAggregateIDMismatch, got %v", err)
+	}
+}
+
+func TestRepository_LoadAfterStore(t *testing.T) {
+	r := newTestRepo()
+	id := es.NewAggregateID("Counter", "c1")
+	c := newCounter(id)
+
+	for i := 0; i < 3; i++ {
+		var err error
+		c, err = r.Store(context.Background(), incrementCmd{id: id}, c)
+		if err != nil {
+			t.Fatalf("Store err at i=%d: %v", i, err)
+		}
+	}
+
+	loaded, err := r.Load(context.Background(), id)
+	if err != nil {
+		t.Fatalf("Load err: %v", err)
+	}
+	if got, want := loaded.value, 3; got != want {
+		t.Errorf("loaded.value = %d, want %d", got, want)
+	}
+	if got, want := loaded.SeqNr(), uint64(3); got != want {
+		t.Errorf("loaded.SeqNr = %d, want %d", got, want)
+	}
+}
