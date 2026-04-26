@@ -6,6 +6,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.41.1
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.53.5
 	go.opentelemetry.io/otel v1.40.0
+	google.golang.org/protobuf v1.36.11
 )
 
 require (

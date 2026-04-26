@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package eventstore.v2;
+
+option go_package = "github.com/Hiroshi0900/eventstore/v2/serialization/protoes;protoes";
+
+// EventEnvelope is the wire-format Protobuf representation of an Event.
+// Mirrors the JSON envelope used by JSONEventSerializer.
+message EventEnvelope {
+  string event_id = 1;
+  string event_type_name = 2;
+  string id_type_name = 3;
+  string id_value = 4;
+  uint64 seq_nr = 5;
+  bool is_created = 6;
+  // OccurredAt encoded as Unix milliseconds for forward-compatibility
+  // with internal/envelope.
+  int64 occurred_at_ms = 7;
+  bytes payload = 8;
+}
