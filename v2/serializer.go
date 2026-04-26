@@ -1,46 +1,71 @@
 package eventstore
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"time"
+)
 
-// Serializer は汎用シリアライザの抽象です。Event payload と Aggregate snapshot の両方を扱います。
-type Serializer interface {
-	SerializeEvent(payload any) ([]byte, error)
-	DeserializeEvent(data []byte, target any) error
-	SerializeAggregate(aggregate any) ([]byte, error)
-	DeserializeAggregate(data []byte, target any) error
+// EventSerializer は Event 全体（メタデータ + payload）の (de)serialization を担います。
+type EventSerializer interface {
+	Serialize(event Event) ([]byte, error)
+	Deserialize(data []byte) (Event, error)
 }
 
-// JSONSerializer は JSON を使う Serializer 実装です。
-type JSONSerializer struct{}
+// JSONEventSerializer は JSON 形式の EventSerializer 実装です。
+type JSONEventSerializer struct{}
 
-func NewJSONSerializer() *JSONSerializer { return &JSONSerializer{} }
+// NewJSONEventSerializer は JSONEventSerializer を生成します。
+func NewJSONEventSerializer() *JSONEventSerializer { return &JSONEventSerializer{} }
 
-func (s *JSONSerializer) SerializeEvent(payload any) ([]byte, error) {
-	data, err := json.Marshal(payload)
+// jsonEventEnvelope は JSON wire format。AggregateID は TypeName/Value 別フィールドで保持。
+type jsonEventEnvelope struct {
+	EventID       string `json:"event_id"`
+	EventTypeName string `json:"event_type_name"`
+	IDTypeName    string `json:"id_type_name"`
+	IDValue       string `json:"id_value"`
+	SeqNr         uint64 `json:"seq_nr"`
+	IsCreated     bool   `json:"is_created"`
+	OccurredAtMs  int64  `json:"occurred_at_ms"`
+	Payload       []byte `json:"payload"`
+}
+
+// Serialize は Event を JSON にエンコードします。
+func (s *JSONEventSerializer) Serialize(event Event) ([]byte, error) {
+	env := jsonEventEnvelope{
+		EventID:       event.EventID(),
+		EventTypeName: event.EventTypeName(),
+		IDTypeName:    event.AggregateID().TypeName(),
+		IDValue:       event.AggregateID().Value(),
+		SeqNr:         event.SeqNr(),
+		IsCreated:     event.IsCreated(),
+		OccurredAtMs:  event.OccurredAt().UnixMilli(),
+		Payload:       event.Payload(),
+	}
+	data, err := json.Marshal(env)
 	if err != nil {
 		return nil, NewSerializationError("event", err)
 	}
 	return data, nil
 }
 
-func (s *JSONSerializer) DeserializeEvent(data []byte, target any) error {
-	if err := json.Unmarshal(data, target); err != nil {
-		return NewDeserializationError("event", err)
+// Deserialize は JSON を Event にデコードします。
+func (s *JSONEventSerializer) Deserialize(data []byte) (Event, error) {
+	var env jsonEventEnvelope
+	if err := json.Unmarshal(data, &env); err != nil {
+		return nil, NewDeserializationError("event", err)
 	}
-	return nil
+	aggID := NewAggregateID(env.IDTypeName, env.IDValue)
+	ev := NewEvent(
+		env.EventID,
+		env.EventTypeName,
+		aggID,
+		env.Payload,
+		WithSeqNr(env.SeqNr),
+		WithIsCreated(env.IsCreated),
+		WithOccurredAt(time.UnixMilli(env.OccurredAtMs)),
+	)
+	return ev, nil
 }
 
-func (s *JSONSerializer) SerializeAggregate(aggregate any) ([]byte, error) {
-	data, err := json.Marshal(aggregate)
-	if err != nil {
-		return nil, NewSerializationError("aggregate", err)
-	}
-	return data, nil
-}
-
-func (s *JSONSerializer) DeserializeAggregate(data []byte, target any) error {
-	if err := json.Unmarshal(data, target); err != nil {
-		return NewDeserializationError("aggregate", err)
-	}
-	return nil
-}
+// コンパイル時 interface 適合確認。
+var _ EventSerializer = (*JSONEventSerializer)(nil)
