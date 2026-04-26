@@ -9,6 +9,8 @@ import (
 
 // AggregateID represents the unique identifier of an aggregate.
 // It combines a type name (e.g. "MemorialSetting") with a unique value (e.g. a ULID).
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 type AggregateID interface {
 	// GetTypeName returns the type name of the aggregate (e.g. "MemorialSetting").
 	GetTypeName() string
@@ -19,12 +21,16 @@ type AggregateID interface {
 }
 
 // DefaultAggregateID is the default implementation of AggregateID.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 type DefaultAggregateID struct {
 	typeName string
 	value    string
 }
 
 // NewAggregateId creates a new DefaultAggregateID.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func NewAggregateId(typeName, value string) *DefaultAggregateID {
 	return &DefaultAggregateID{
 		typeName: typeName,
@@ -32,20 +38,31 @@ func NewAggregateId(typeName, value string) *DefaultAggregateID {
 	}
 }
 
+// GetTypeName returns the type name of the aggregate.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (id *DefaultAggregateID) GetTypeName() string {
 	return id.typeName
 }
 
+// GetValue returns the unique value of the aggregate ID.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (id *DefaultAggregateID) GetValue() string {
 	return id.value
 }
 
+// AsString returns the full string representation of the aggregate ID.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (id *DefaultAggregateID) AsString() string {
 	return fmt.Sprintf("%s-%s", id.typeName, id.value)
 }
 
 // Event represents a domain event that has occurred.
 // Events are immutable and represent facts about what happened in the past.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 type Event interface {
 	// GetID returns the unique identifier of this event.
 	GetID() string
@@ -64,9 +81,13 @@ type Event interface {
 }
 
 // EventOption is a functional option for configuring an event.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 type EventOption func(*DefaultEvent)
 
 // WithSeqNr sets the sequence number of the event.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func WithSeqNr(seqNr uint64) EventOption {
 	return func(e *DefaultEvent) {
 		e.seqNr = seqNr
@@ -74,6 +95,8 @@ func WithSeqNr(seqNr uint64) EventOption {
 }
 
 // WithIsCreated sets whether this is a creation event.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func WithIsCreated(isCreated bool) EventOption {
 	return func(e *DefaultEvent) {
 		e.isCreated = isCreated
@@ -81,6 +104,8 @@ func WithIsCreated(isCreated bool) EventOption {
 }
 
 // WithOccurredAt sets the occurred-at timestamp.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func WithOccurredAt(t time.Time) EventOption {
 	return func(e *DefaultEvent) {
 		// #nosec G115 -- UnixMilli assumes time is after 1970
@@ -89,6 +114,8 @@ func WithOccurredAt(t time.Time) EventOption {
 }
 
 // WithOccurredAtUnixMilli sets the occurred-at timestamp as Unix milliseconds.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func WithOccurredAtUnixMilli(unixMilli uint64) EventOption {
 	return func(e *DefaultEvent) {
 		e.occurredAt = unixMilli
@@ -96,6 +123,8 @@ func WithOccurredAtUnixMilli(unixMilli uint64) EventOption {
 }
 
 // DefaultEvent is the default implementation of Event.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 type DefaultEvent struct {
 	id          string
 	typeName    string
@@ -107,6 +136,8 @@ type DefaultEvent struct {
 }
 
 // NewEvent creates a new DefaultEvent.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func NewEvent(
 	id string,
 	typeName string,
@@ -130,36 +161,59 @@ func NewEvent(
 	return e
 }
 
+// GetID returns the unique identifier of this event.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (e *DefaultEvent) GetID() string {
 	return e.id
 }
 
+// GetTypeName returns the type name of this event.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (e *DefaultEvent) GetTypeName() string {
 	return e.typeName
 }
 
+// GetAggregateId returns the aggregate this event belongs to.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (e *DefaultEvent) GetAggregateId() AggregateID {
 	return e.aggregateId
 }
 
+// GetSeqNr returns the sequence number of this event within the aggregate.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (e *DefaultEvent) GetSeqNr() uint64 {
 	return e.seqNr
 }
 
+// IsCreated returns whether this is a creation event.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (e *DefaultEvent) IsCreated() bool {
 	return e.isCreated
 }
 
+// GetOccurredAt returns the timestamp when this event occurred.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (e *DefaultEvent) GetOccurredAt() uint64 {
 	return e.occurredAt
 }
 
+// GetPayload returns the event payload as a byte slice.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (e *DefaultEvent) GetPayload() []byte {
 	return e.payload
 }
 
 // Aggregate represents an event-sourced aggregate root.
 // It holds version information for optimistic locking.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 type Aggregate interface {
 	// GetId returns the unique identifier of the aggregate.
 	GetId() AggregateID
@@ -174,6 +228,8 @@ type Aggregate interface {
 }
 
 // AggregateResult represents the result of loading an aggregate from the store.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 type AggregateResult struct {
 	// Aggregate is the loaded aggregate, or nil if not found.
 	Aggregate Aggregate
@@ -184,6 +240,8 @@ type AggregateResult struct {
 }
 
 // SnapshotData holds serialized snapshot data.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 type SnapshotData struct {
 	Payload []byte
 	SeqNr   uint64

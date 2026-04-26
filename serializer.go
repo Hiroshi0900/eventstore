@@ -5,6 +5,8 @@ import (
 )
 
 // Serializer handles serialization and deserialization of events and aggregates.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 type Serializer interface {
 	// SerializeEvent serializes an event payload to bytes.
 	SerializeEvent(payload any) ([]byte, error)
@@ -17,13 +19,20 @@ type Serializer interface {
 }
 
 // JSONSerializer is an implementation of Serializer using JSON encoding.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 type JSONSerializer struct{}
 
 // NewJSONSerializer creates a new JSONSerializer.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func NewJSONSerializer() *JSONSerializer {
 	return &JSONSerializer{}
 }
 
+// SerializeEvent serializes an event payload to bytes using JSON encoding.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (s *JSONSerializer) SerializeEvent(payload any) ([]byte, error) {
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -32,6 +41,9 @@ func (s *JSONSerializer) SerializeEvent(payload any) ([]byte, error) {
 	return data, nil
 }
 
+// DeserializeEvent deserializes bytes into an event payload using JSON encoding.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (s *JSONSerializer) DeserializeEvent(data []byte, target any) error {
 	if err := json.Unmarshal(data, target); err != nil {
 		return NewDeserializationError("event", err)
@@ -39,6 +51,9 @@ func (s *JSONSerializer) DeserializeEvent(data []byte, target any) error {
 	return nil
 }
 
+// SerializeAggregate serializes an aggregate to bytes using JSON encoding.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (s *JSONSerializer) SerializeAggregate(aggregate any) ([]byte, error) {
 	data, err := json.Marshal(aggregate)
 	if err != nil {
@@ -47,6 +62,9 @@ func (s *JSONSerializer) SerializeAggregate(aggregate any) ([]byte, error) {
 	return data, nil
 }
 
+// DeserializeAggregate deserializes bytes into an aggregate using JSON encoding.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (s *JSONSerializer) DeserializeAggregate(data []byte, target any) error {
 	if err := json.Unmarshal(data, target); err != nil {
 		return NewDeserializationError("aggregate", err)

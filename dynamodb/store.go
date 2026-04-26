@@ -20,6 +20,8 @@ import (
 
 // Client is the interface for the DynamoDB client.
 // Used to enable mocking in tests.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 type Client interface {
 	GetItem(ctx context.Context, params *dynamodb.GetItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error)
 	Query(ctx context.Context, params *dynamodb.QueryInput, optFns ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error)
@@ -30,6 +32,8 @@ type Client interface {
 }
 
 // Store is the DynamoDB-backed EventStore implementation.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 type Store struct {
 	client      Client
 	keyResolver *keyresolver.Resolver
@@ -37,6 +41,8 @@ type Store struct {
 }
 
 // Config holds the DynamoDB event store configuration.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 type Config struct {
 	JournalTableName  string
 	SnapshotTableName string
@@ -46,6 +52,8 @@ type Config struct {
 }
 
 // DefaultConfig returns the default configuration.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func DefaultConfig() Config {
 	return Config{
 		JournalTableName:  "journal",
@@ -57,6 +65,8 @@ func DefaultConfig() Config {
 }
 
 // New creates a new DynamoDB event store.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func New(client Client, config Config) *Store {
 	return &Store{
 		client:      client,
@@ -82,6 +92,8 @@ const (
 )
 
 // GetLatestSnapshotByID retrieves the latest snapshot for the given aggregate ID.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (s *Store) GetLatestSnapshotByID(ctx context.Context, id es.AggregateID) (*es.SnapshotData, error) {
 	keys := s.keyResolver.ResolveSnapshotKeys(id)
 
@@ -104,6 +116,8 @@ func (s *Store) GetLatestSnapshotByID(ctx context.Context, id es.AggregateID) (*
 }
 
 // GetEventsByIDSinceSeqNr retrieves all events since the given sequence number.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (s *Store) GetEventsByIDSinceSeqNr(ctx context.Context, id es.AggregateID, seqNr uint64) ([]es.Event, error) {
 	aidKey := s.keyResolver.ResolveAggregateIDKey(id)
 
@@ -139,6 +153,8 @@ func (s *Store) GetEventsByIDSinceSeqNr(ctx context.Context, id es.AggregateID, 
 }
 
 // PersistEvent persists a single event without a snapshot.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (s *Store) PersistEvent(ctx context.Context, event es.Event, version uint64) error {
 	keys := s.keyResolver.ResolveEventKeys(event.GetAggregateId(), event.GetSeqNr())
 
@@ -167,6 +183,8 @@ func (s *Store) PersistEvent(ctx context.Context, event es.Event, version uint64
 }
 
 // PersistEventAndSnapshot atomically persists an event and a snapshot.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (s *Store) PersistEventAndSnapshot(ctx context.Context, event es.Event, aggregate es.Aggregate) error {
 	eventKeys := s.keyResolver.ResolveEventKeys(event.GetAggregateId(), event.GetSeqNr())
 	snapshotKeys := s.keyResolver.ResolveSnapshotKeys(event.GetAggregateId())
@@ -362,6 +380,8 @@ func isTableAlreadyExistsError(err error) bool {
 }
 
 // CreateTables creates the journal and snapshot tables (for testing/setup).
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (s *Store) CreateTables(ctx context.Context) error {
 	// Create the journal table
 	_, err := s.client.CreateTable(ctx, &dynamodb.CreateTableInput{
@@ -433,6 +453,8 @@ func (s *Store) CreateTables(ctx context.Context) error {
 }
 
 // WaitForTables waits until both tables are active.
+//
+// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
 func (s *Store) WaitForTables(ctx context.Context) error {
 	waiter := dynamodb.NewTableExistsWaiter(s.client)
 
