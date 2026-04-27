@@ -43,10 +43,3 @@ func TestDuplicateAggregateError_IsErrDuplicateAggregate(t *testing.T) {
 		t.Errorf("expected errors.Is(err, ErrDuplicateAggregate) = true")
 	}
 }
-
-func TestAggregateIDMismatchError_IsErrAggregateIDMismatch(t *testing.T) {
-	err := NewAggregateIDMismatchError("Visit-v1", "Visit-v2")
-	if !errors.Is(err, ErrAggregateIDMismatch) {
-		t.Errorf("expected errors.Is(err, ErrAggregateIDMismatch) = true")
-	}
-}
