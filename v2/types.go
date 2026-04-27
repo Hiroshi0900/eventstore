@@ -74,8 +74,12 @@ type StoredEvent[E Event] struct {
 
 // StoredSnapshot は domain Aggregate に library-side のメタ情報を付与した型。
 // Repository ↔ EventStore 間でやり取りされる。
-type StoredSnapshot[T any] struct {
-	Aggregate  T
+//
+// A は使用サイト (EventStore[A Aggregate[C, E], ...] / Repository[A Aggregate[C, E], ...])
+// で既に Aggregate[C, E] に制約されているため、本構造体自体は any を採用して
+// 型パラメータ爆発 (A, C, E の 3 個) を避けている。
+type StoredSnapshot[A any] struct {
+	Aggregate  A
 	SeqNr      uint64
 	Version    uint64
 	OccurredAt time.Time

@@ -21,7 +21,7 @@ func (c counterID) TypeName() string { return "Counter" }
 func (c counterID) Value() string    { return c.value }
 func (c counterID) AsString() string { return "Counter-" + c.value }
 
-// counterEvent: domain Event interface (E = counterEvent in Repository[T,E])。
+// counterEvent: domain Event interface (E = counterEvent in Repository[A,C,E])。
 type counterEvent interface {
 	es.Event
 	isCounterEvent()
@@ -233,14 +233,14 @@ func TestRepository_LoadAfterSnapshot_usesSnapshot(t *testing.T) {
 // lockFailingStore wraps an EventStore and forces ErrOptimisticLock from
 // PersistEventAndSnapshot. Used to verify Repository.Save propagates
 // store-level optimistic lock errors transparently.
-type lockFailingStore[T es.Aggregate[C, E], C es.Command, E es.Event] struct {
-	es.EventStore[T, C, E]
+type lockFailingStore[A es.Aggregate[C, E], C es.Command, E es.Event] struct {
+	es.EventStore[A, C, E]
 }
 
-func (s *lockFailingStore[T, C, E]) PersistEventAndSnapshot(
+func (s *lockFailingStore[A, C, E]) PersistEventAndSnapshot(
 	_ context.Context,
 	ev es.StoredEvent[E],
-	_ es.StoredSnapshot[T],
+	_ es.StoredSnapshot[A],
 ) error {
 	return es.NewOptimisticLockError(ev.Event.AggregateID().AsString(), 1, 99)
 }

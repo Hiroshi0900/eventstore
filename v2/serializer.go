@@ -1,14 +1,14 @@
 package eventstore
 
-// AggregateSerializer は domain Aggregate (T) を bytes に (de)serialize する。
+// AggregateSerializer は domain Aggregate (A) を bytes に (de)serialize する。
 // snapshot 取得時に Repository から呼ばれ、結果が SnapshotEnvelope.Payload に格納される。
 //
-// 制約 [T Aggregate[C, E], C Command, E Event] により、Aggregate / Command / Event 型の
+// 制約 [A Aggregate[C, E], C Command, E Event] により、Aggregate / Command / Event 型の
 // ミスマッチを compile time に防ぐ。利用側は domain ごとに 1 つ実装する想定
 // (例: visitAggregateSerializer)。
-type AggregateSerializer[T Aggregate[C, E], C Command, E Event] interface {
-	Serialize(T) ([]byte, error)
-	Deserialize([]byte) (T, error)
+type AggregateSerializer[A Aggregate[C, E], C Command, E Event] interface {
+	Serialize(A) ([]byte, error)
+	Deserialize([]byte) (A, error)
 }
 
 // EventSerializer は domain Event を bytes に (de)serialize する。

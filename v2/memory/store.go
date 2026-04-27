@@ -10,42 +10,42 @@ import (
 )
 
 // store is an in-memory EventStore implementation. concrete type は非公開で、
-// 外部からは New() が返す es.EventStore[T, C, E] interface 経由でのみ操作する。
+// 外部からは New() が返す es.EventStore[A, C, E] interface 経由でのみ操作する。
 //
 // in-memory なので (de)serialize は一切行わず、StoredEvent / StoredSnapshot を
 // そのまま保持する。
-type store[T es.Aggregate[C, E], C es.Command, E es.Event] struct {
+type store[A es.Aggregate[C, E], C es.Command, E es.Event] struct {
 	mu        sync.RWMutex
 	events    map[string][]es.StoredEvent[E]   // aggregateID.AsString() -> ordered events
-	snapshots map[string]es.StoredSnapshot[T]  // aggregateID.AsString() -> latest snapshot
-	hasSnap   map[string]bool                  // T のゼロ値と区別するための存在フラグ
+	snapshots map[string]es.StoredSnapshot[A]  // aggregateID.AsString() -> latest snapshot
+	hasSnap   map[string]bool                  // A のゼロ値と区別するための存在フラグ
 }
 
-// New は in-memory EventStore[T, C, E] を生成する。
+// New は in-memory EventStore[A, C, E] を生成する。
 //
 // memory store は (de)serialize を行わないので serializer は不要。
-func New[T es.Aggregate[C, E], C es.Command, E es.Event]() es.EventStore[T, C, E] {
-	return &store[T, C, E]{
+func New[A es.Aggregate[C, E], C es.Command, E es.Event]() es.EventStore[A, C, E] {
+	return &store[A, C, E]{
 		events:    make(map[string][]es.StoredEvent[E]),
-		snapshots: make(map[string]es.StoredSnapshot[T]),
+		snapshots: make(map[string]es.StoredSnapshot[A]),
 		hasSnap:   make(map[string]bool),
 	}
 }
 
 // GetLatestSnapshot returns the latest snapshot or found=false.
-func (s *store[T, C, E]) GetLatestSnapshot(_ context.Context, id es.AggregateID) (es.StoredSnapshot[T], bool, error) {
+func (s *store[A, C, E]) GetLatestSnapshot(_ context.Context, id es.AggregateID) (es.StoredSnapshot[A], bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	key := id.AsString()
 	if !s.hasSnap[key] {
-		var zero es.StoredSnapshot[T]
+		var zero es.StoredSnapshot[A]
 		return zero, false, nil
 	}
 	return s.snapshots[key], true, nil
 }
 
 // GetEventsSince returns events with SeqNr > seqNr, ordered by SeqNr.
-func (s *store[T, C, E]) GetEventsSince(_ context.Context, id es.AggregateID, seqNr uint64) ([]es.StoredEvent[E], error) {
+func (s *store[A, C, E]) GetEventsSince(_ context.Context, id es.AggregateID, seqNr uint64) ([]es.StoredEvent[E], error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -65,7 +65,7 @@ func (s *store[T, C, E]) GetEventsSince(_ context.Context, id es.AggregateID, se
 // exist for the aggregate. expectedVersion>0 has no effect (optimistic locking
 // is performed only by PersistEventAndSnapshot). Duplicate (aggregateID, seqNr)
 // entries are rejected.
-func (s *store[T, C, E]) PersistEvent(_ context.Context, ev es.StoredEvent[E], expectedVersion uint64) error {
+func (s *store[A, C, E]) PersistEvent(_ context.Context, ev es.StoredEvent[E], expectedVersion uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -88,10 +88,10 @@ func (s *store[T, C, E]) PersistEvent(_ context.Context, ev es.StoredEvent[E], e
 // PersistEventAndSnapshot appends an event AND updates the snapshot atomically.
 // 楽観ロック: 現行 snapshot version が snap.Version - 1 と一致しない場合 ErrOptimisticLock を返す。
 // (initial write では現行 snapshot 未存在 ⇔ current=0, snap.Version=1 ⇔ expected=0 で match)
-func (s *store[T, C, E]) PersistEventAndSnapshot(
+func (s *store[A, C, E]) PersistEventAndSnapshot(
 	_ context.Context,
 	ev es.StoredEvent[E],
-	snap es.StoredSnapshot[T],
+	snap es.StoredSnapshot[A],
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
