@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** v2 サブモジュール (`github.com/Hiroshi0900/eventstore/v2`) として、Command 抽象 + 集約に責務を寄せた API を新規実装し、in-memory / DynamoDB の永続化バックエンドを TDD で構築する。
+**Goal:** v2 サブモジュール (`github.com/Hiroshi0900/eventstore/v2`) として、ドメインからストレージのメタ情報 (SeqNr / Version / EventID / OccurredAt / IsCreated / Payload bytes) を完全排除し、Envelope 駆動で永続化する API を新規実装する。
 
-**Architecture:** v1 のコードはそのまま `// Deprecated:` 化して残し、`v2/` ディレクトリ配下に独立した Go モジュールを作成。core types (Aggregate / Command / Event) → memory store → Repository[T] → dynamodb store の順に TDD で積み上げ、最終的に v1 を Deprecated 化して README に v2 への移行ガイドを追記する。
+**Architecture:** v1 のコードはそのまま `// Deprecated:` 化して残し、`v2/` ディレクトリ配下に独立した Go モジュールを作成。core types (Aggregate[E] / Event / Command) → Envelope → Serializer interfaces → memory store → Repository[T,E] → keyresolver → DynamoDB store の順に TDD で積み上げる。
 
-**Tech Stack:** Go 1.25, AWS SDK Go v2 (DynamoDB), OpenTelemetry, 標準 `testing` パッケージ（assertion ヘルパは標準のみ、testify は使わない）
+**Tech Stack:** Go 1.25, AWS SDK Go v2 (DynamoDB), OpenTelemetry, 標準 `testing` パッケージ（assertion ヘルパは標準のみ、testify は使わない）。EventID 生成は `crypto/rand` + hex 16 bytes（外部依存追加なし）。
 
 **スコープ外:** terrat-go-app の v2 移行（別計画）
 
@@ -15,23 +15,26 @@
 ## ファイル構造
 
 ### 新規作成 (v2/)
+
 ```
 v2/
 ├── go.mod                       # module github.com/Hiroshi0900/eventstore/v2
 ├── go.sum
-├── aggregate.go                 # AggregateID, DefaultAggregateID, Aggregate interface
+├── aggregate.go                 # AggregateID interface, DefaultAggregateID, Aggregate[E] interface
 ├── aggregate_test.go
+├── event.go                     # Event interface
 ├── command.go                   # Command interface
-├── event.go                     # Event interface, DefaultEvent, EventOption
-├── event_test.go
+├── envelope.go                  # EventEnvelope, SnapshotEnvelope (public types)
+├── envelope_test.go
+├── serializer.go                # AggregateSerializer[T,E], EventSerializer[E] interfaces
+├── event_store.go               # EventStore interface, Config, ShouldSnapshot
+├── event_store_test.go
 ├── errors.go                    # Sentinel + typed errors
 ├── errors_test.go
-├── serializer.go                # Serializer interface, JSONSerializer
-├── serializer_test.go
-├── event_store.go               # EventStore interface, Config, SnapshotData
-├── event_store_test.go          # Config.ShouldSnapshot テスト
-├── repository.go                # Repository[T], AggregateSerializer[T]
-├── repository_test.go           # Repository を memory store で end-to-end テスト
+├── eventid.go                   # generateEventID() ヘルパ (crypto/rand + hex)
+├── eventid_test.go
+├── repository.go                # Repository[T,E], DefaultRepository, NewRepository
+├── repository_test.go           # counter テスト用集約 + end-to-end テスト
 ├── memory/
 │   ├── store.go
 │   └── store_test.go
@@ -39,18 +42,23 @@ v2/
 │   ├── store.go
 │   └── store_test.go
 └── internal/
-    ├── keyresolver/
-    │   ├── key_resolver.go
-    │   └── key_resolver_test.go
-    └── envelope/
-        ├── envelope.go
-        └── envelope_test.go
+    └── keyresolver/
+        ├── key_resolver.go
+        └── key_resolver_test.go
 ```
 
+設計判断：
+- `EventEnvelope` / `SnapshotEnvelope` は **公開型**かつ **wire-format**を兼ねる（v1 の `internal/envelope` は v2 では不要）
+- `internal/envelope` は v1 にしか存在せず、v2 では top-level の `envelope.go` で代替
+- `memory/store.go` は in-memory 実装。テスト用とライブラリ品質の両立を目指す
+- ULID ではなく `crypto/rand` + hex の理由：外部依存追加を避けるため。32-char hex の一意性は実用上 ULID 同等
+
 ### v1 への変更（互換維持、Deprecated コメントのみ）
+
 - `types.go`, `event_store.go`, `errors.go`, `serializer.go`, `memory/store.go`, `dynamodb/store.go` の公開シンボルに `// Deprecated:` コメント追記
 
 ### ドキュメント
+
 - `README.md` に v2 セクション追加
 
 ---
@@ -91,7 +99,7 @@ git commit -m "chore(v2): initialize v2 submodule"
 
 ---
 
-## Phase 2: Core types (TDD)
+## Phase 2: Core domain interfaces (TDD)
 
 ### Task 2: AggregateID interface と DefaultAggregateID
 
@@ -103,53 +111,58 @@ git commit -m "chore(v2): initialize v2 submodule"
 
 `v2/aggregate_test.go`:
 ```go
-package eventstore
+package eventsourcing_test
 
-import "testing"
+import (
+	"testing"
 
-func TestDefaultAggregateID_AsString(t *testing.T) {
-	id := NewAggregateID("Visit", "abc-123")
+	es "github.com/Hiroshi0900/eventstore/v2"
+)
 
-	if got, want := id.TypeName(), "Visit"; got != want {
-		t.Errorf("TypeName() = %q, want %q", got, want)
+func TestNewAggregateID(t *testing.T) {
+	id := es.NewAggregateID("Visit", "01J0000000")
+
+	if got := id.TypeName(); got != "Visit" {
+		t.Errorf("TypeName(): got %q, want %q", got, "Visit")
 	}
-	if got, want := id.Value(), "abc-123"; got != want {
-		t.Errorf("Value() = %q, want %q", got, want)
+	if got := id.Value(); got != "01J0000000" {
+		t.Errorf("Value(): got %q, want %q", got, "01J0000000")
 	}
-	if got, want := id.AsString(), "Visit-abc-123"; got != want {
-		t.Errorf("AsString() = %q, want %q", got, want)
+	if got := id.AsString(); got != "Visit-01J0000000" {
+		t.Errorf("AsString(): got %q, want %q", got, "Visit-01J0000000")
 	}
 }
 ```
 
 - [ ] **Step 2: テスト失敗を確認**
 
-Run: `cd v2 && go test -run TestDefaultAggregateID_AsString -v`
-Expected: コンパイルエラー（`NewAggregateID undefined` 等）
+Run: `cd v2 && go test ./...`
+Expected: `undefined: es.NewAggregateID` などのコンパイルエラー
 
 - [ ] **Step 3: 最小実装**
 
 `v2/aggregate.go`:
 ```go
-// Package eventstore は Event Sourcing を実現するためのライブラリです (v2)。
-package eventstore
+// Package eventsourcing v2 provides a lightweight library for event sourcing
+// with domain types decoupled from storage metadata.
+package eventsourcing
 
 import "fmt"
 
-// AggregateID は集約の識別子を表します。
+// AggregateID represents the unique identifier of an aggregate.
 type AggregateID interface {
 	TypeName() string
 	Value() string
 	AsString() string
 }
 
-// DefaultAggregateID は AggregateID のデフォルト実装です。
+// DefaultAggregateID is the default implementation of AggregateID.
 type DefaultAggregateID struct {
 	typeName string
 	value    string
 }
 
-// NewAggregateID は DefaultAggregateID を生成します。
+// NewAggregateID creates a new DefaultAggregateID.
 func NewAggregateID(typeName, value string) DefaultAggregateID {
 	return DefaultAggregateID{typeName: typeName, value: value}
 }
@@ -159,205 +172,57 @@ func (id DefaultAggregateID) Value() string    { return id.value }
 func (id DefaultAggregateID) AsString() string {
 	return fmt.Sprintf("%s-%s", id.typeName, id.value)
 }
-
-// Aggregate は Event Sourcing における集約ルートを表します。
-// 状態遷移時に異なる具象型を返せるよう、ApplyEvent の戻り値は interface です。
-type Aggregate interface {
-	AggregateID() AggregateID
-	SeqNr() uint64
-	Version() uint64
-
-	ApplyCommand(Command) (Event, error)
-	ApplyEvent(Event) Aggregate
-
-	WithVersion(uint64) Aggregate
-	WithSeqNr(uint64) Aggregate
-}
 ```
 
-- [ ] **Step 4: テスト成功を確認**
+- [ ] **Step 4: テスト合格を確認**
 
-Run: `cd v2 && go test -run TestDefaultAggregateID -v`
-Expected: コンパイルエラー（Command, Event がまだない）→ Task 3, 4 で解消されるので **このタスクのコミットは Task 4 後**
+Run: `cd v2 && go test -run TestNewAggregateID ./...`
+Expected: PASS
 
-- [ ] **Step 5: コミットは Task 4 完了後にまとめて行う（先送り）**
+- [ ] **Step 5: Commit**
+
+```bash
+git add v2/aggregate.go v2/aggregate_test.go
+git commit -m "feat(v2): add AggregateID interface and DefaultAggregateID"
+```
 
 ---
 
-### Task 3: Event interface と DefaultEvent
+### Task 3: Event interface
 
 **Files:**
 - Create: `v2/event.go`
-- Create: `v2/event_test.go`
 
-- [ ] **Step 1: 失敗するテストを書く**
-
-`v2/event_test.go`:
-```go
-package eventstore
-
-import (
-	"testing"
-	"time"
-)
-
-func TestNewEvent_Defaults(t *testing.T) {
-	id := NewAggregateID("Visit", "v1")
-	ev := NewEvent("evt-1", "VisitScheduled", id, []byte("payload"))
-
-	if got, want := ev.EventID(), "evt-1"; got != want {
-		t.Errorf("EventID() = %q, want %q", got, want)
-	}
-	if got, want := ev.EventTypeName(), "VisitScheduled"; got != want {
-		t.Errorf("EventTypeName() = %q, want %q", got, want)
-	}
-	if got, want := ev.AggregateID().AsString(), "Visit-v1"; got != want {
-		t.Errorf("AggregateID() = %q, want %q", got, want)
-	}
-	if got, want := ev.SeqNr(), uint64(1); got != want {
-		t.Errorf("SeqNr() = %d, want %d", got, want)
-	}
-	if ev.IsCreated() {
-		t.Error("IsCreated() = true, want false (default)")
-	}
-	if got, want := string(ev.Payload()), "payload"; got != want {
-		t.Errorf("Payload() = %q, want %q", got, want)
-	}
-	if ev.OccurredAt().IsZero() {
-		t.Error("OccurredAt() should not be zero by default")
-	}
-}
-
-func TestNewEvent_WithOptions(t *testing.T) {
-	id := NewAggregateID("Visit", "v1")
-	ts := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	ev := NewEvent("evt-1", "VisitScheduled", id, nil,
-		WithSeqNr(42),
-		WithIsCreated(true),
-		WithOccurredAt(ts),
-	)
-
-	if got, want := ev.SeqNr(), uint64(42); got != want {
-		t.Errorf("SeqNr() = %d, want %d", got, want)
-	}
-	if !ev.IsCreated() {
-		t.Error("IsCreated() = false, want true")
-	}
-	if !ev.OccurredAt().Equal(ts) {
-		t.Errorf("OccurredAt() = %v, want %v", ev.OccurredAt(), ts)
-	}
-}
-
-func TestDefaultEvent_WithSeqNr(t *testing.T) {
-	id := NewAggregateID("Visit", "v1")
-	ev := NewEvent("evt-1", "VisitScheduled", id, nil, WithSeqNr(1))
-
-	updated := ev.WithSeqNr(5)
-	if got, want := updated.SeqNr(), uint64(5); got != want {
-		t.Errorf("WithSeqNr(5).SeqNr() = %d, want %d", got, want)
-	}
-	if got, want := ev.SeqNr(), uint64(1); got != want {
-		t.Errorf("original SeqNr() should be unchanged: got %d, want %d", got, want)
-	}
-}
-```
-
-- [ ] **Step 2: テスト失敗を確認**
-
-Run: `cd v2 && go test -run TestNewEvent -v`
-Expected: コンパイルエラー（`NewEvent undefined` 等）
-
-- [ ] **Step 3: 最小実装**
+- [ ] **Step 1: Event interface を定義**
 
 `v2/event.go`:
 ```go
-package eventstore
+package eventsourcing
 
-import "time"
-
-// Event は過去に発生した不変のドメインイベントを表します。
+// Event represents a domain fact. Events carry only domain information;
+// all storage metadata (SeqNr, EventID, OccurredAt, IsCreated, Payload bytes)
+// is held by EventEnvelope at the library layer.
 type Event interface {
-	EventID() string
+	// EventTypeName returns the type discriminator used by EventSerializer
+	// for dispatch on deserialization.
 	EventTypeName() string
+
+	// AggregateID returns the aggregate this event belongs to.
 	AggregateID() AggregateID
-	SeqNr() uint64
-	IsCreated() bool
-	OccurredAt() time.Time
-	Payload() []byte
-	WithSeqNr(uint64) Event
-}
-
-// EventOption は Event の関数オプションです。
-type EventOption func(*DefaultEvent)
-
-// WithSeqNr はシーケンス番号をセットします。
-func WithSeqNr(seqNr uint64) EventOption {
-	return func(e *DefaultEvent) { e.seqNr = seqNr }
-}
-
-// WithIsCreated は IsCreated フラグをセットします。
-func WithIsCreated(isCreated bool) EventOption {
-	return func(e *DefaultEvent) { e.isCreated = isCreated }
-}
-
-// WithOccurredAt は発生時刻をセットします。
-func WithOccurredAt(t time.Time) EventOption {
-	return func(e *DefaultEvent) { e.occurredAt = t }
-}
-
-// DefaultEvent は Event のデフォルト実装です。
-type DefaultEvent struct {
-	eventID     string
-	typeName    string
-	aggregateID AggregateID
-	seqNr       uint64
-	isCreated   bool
-	occurredAt  time.Time
-	payload     []byte
-}
-
-// NewEvent は DefaultEvent を生成します。
-func NewEvent(
-	eventID string,
-	typeName string,
-	aggregateID AggregateID,
-	payload []byte,
-	opts ...EventOption,
-) DefaultEvent {
-	e := DefaultEvent{
-		eventID:     eventID,
-		typeName:    typeName,
-		aggregateID: aggregateID,
-		seqNr:       1,
-		isCreated:   false,
-		occurredAt:  time.Now(),
-		payload:     payload,
-	}
-	for _, opt := range opts {
-		opt(&e)
-	}
-	return e
-}
-
-func (e DefaultEvent) EventID() string           { return e.eventID }
-func (e DefaultEvent) EventTypeName() string     { return e.typeName }
-func (e DefaultEvent) AggregateID() AggregateID  { return e.aggregateID }
-func (e DefaultEvent) SeqNr() uint64             { return e.seqNr }
-func (e DefaultEvent) IsCreated() bool           { return e.isCreated }
-func (e DefaultEvent) OccurredAt() time.Time     { return e.occurredAt }
-func (e DefaultEvent) Payload() []byte           { return e.payload }
-
-// WithSeqNr は新しい SeqNr を持つコピーを返します（不変性）。
-func (e DefaultEvent) WithSeqNr(seqNr uint64) Event {
-	e.seqNr = seqNr
-	return e
 }
 ```
 
-- [ ] **Step 4: テスト成功を確認**
+- [ ] **Step 2: コンパイル確認**
 
-Run: `cd v2 && go test -run TestNewEvent -v && cd v2 && go test -run TestDefaultEvent -v`
-Expected: コンパイルエラー（Command がまだない）→ Task 4 で解消
+Run: `cd v2 && go build ./...`
+Expected: エラーなし
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add v2/event.go
+git commit -m "feat(v2): add domain-pure Event interface"
+```
 
 ---
 
@@ -370,30 +235,137 @@ Expected: コンパイルエラー（Command がまだない）→ Task 4 で解
 
 `v2/command.go`:
 ```go
-package eventstore
+package eventsourcing
 
-// Command はドメインの意図を表します。Repository.Store でターゲット集約に適用されます。
+// Command represents an intent to mutate an aggregate.
+// CommandTypeName is used for OTel span names, audit logs, and metrics.
+// AggregateID is not part of Command because it is passed to Repository.Save explicitly.
 type Command interface {
 	CommandTypeName() string
-	AggregateID() AggregateID
 }
 ```
 
-- [ ] **Step 2: コンパイルと既存テストの実行**
+- [ ] **Step 2: コンパイル確認**
 
-Run: `cd v2 && go build ./... && go test ./...`
-Expected: コンパイル成功、Task 2 と Task 3 のテストが PASS
+Run: `cd v2 && go build ./...`
+Expected: エラーなし
 
-- [ ] **Step 3: Commit (Task 2-4 をまとめて)**
+- [ ] **Step 3: Commit**
 
 ```bash
-git add v2/aggregate.go v2/aggregate_test.go v2/event.go v2/event_test.go v2/command.go
-git commit -m "feat(v2): add core types (AggregateID, Event, Command, Aggregate)"
+git add v2/command.go
+git commit -m "feat(v2): add Command interface"
 ```
 
 ---
 
-### Task 5: Errors
+### Task 5: Aggregate[E] interface
+
+**Files:**
+- Modify: `v2/aggregate.go`
+- Modify: `v2/aggregate_test.go`
+
+- [ ] **Step 1: 失敗するテストを追加（mock aggregate でインタフェース契約を確認）**
+
+`v2/aggregate_test.go` の末尾に追記：
+```go
+// mockEvent + mockAggregate は Aggregate[E] interface 契約を確認するためのテスト用 stub
+type mockEvent struct {
+	typeName string
+	aggID    es.AggregateID
+}
+
+func (e mockEvent) EventTypeName() string       { return e.typeName }
+func (e mockEvent) AggregateID() es.AggregateID { return e.aggID }
+
+type mockCommand struct {
+	name string
+}
+
+func (c mockCommand) CommandTypeName() string { return c.name }
+
+type mockAggregate struct {
+	id es.AggregateID
+}
+
+func (a mockAggregate) AggregateID() es.AggregateID { return a.id }
+
+func (a mockAggregate) ApplyCommand(cmd es.Command) (mockEvent, error) {
+	return mockEvent{typeName: cmd.CommandTypeName() + "Applied", aggID: a.id}, nil
+}
+
+func (a mockAggregate) ApplyEvent(_ mockEvent) es.Aggregate[mockEvent] {
+	return a
+}
+
+func TestAggregateInterface_canBeImplementedWithStatePattern(t *testing.T) {
+	id := es.NewAggregateID("Mock", "x")
+	var agg es.Aggregate[mockEvent] = mockAggregate{id: id}
+
+	ev, err := agg.ApplyCommand(mockCommand{name: "Do"})
+	if err != nil {
+		t.Fatalf("ApplyCommand() error = %v", err)
+	}
+	if got := ev.EventTypeName(); got != "DoApplied" {
+		t.Errorf("event type: got %q, want %q", got, "DoApplied")
+	}
+	if got := ev.AggregateID().AsString(); got != "Mock-x" {
+		t.Errorf("event aggID: got %q, want %q", got, "Mock-x")
+	}
+
+	next := agg.ApplyEvent(ev)
+	if got := next.AggregateID().AsString(); got != "Mock-x" {
+		t.Errorf("next aggID: got %q, want %q", got, "Mock-x")
+	}
+}
+```
+
+- [ ] **Step 2: テスト失敗を確認**
+
+Run: `cd v2 && go test -run TestAggregateInterface ./...`
+Expected: `undefined: es.Aggregate` のコンパイルエラー
+
+- [ ] **Step 3: Aggregate[E] interface を追加**
+
+`v2/aggregate.go` の末尾に追記：
+```go
+// Aggregate is the root entity of an event-sourced state machine.
+// E is the aggregate-specific Event type (e.g. VisitEvent).
+//
+// Aggregate carries no storage metadata: SeqNr, Version, EventID, OccurredAt
+// are managed by Repository / EventEnvelope at the library layer.
+type Aggregate[E Event] interface {
+	// AggregateID returns the unique identifier of this aggregate.
+	AggregateID() AggregateID
+
+	// ApplyCommand validates a command against the current state and
+	// produces a single domain Event. Returns ErrUnknownCommand if the
+	// command is not applicable to the current state.
+	ApplyCommand(Command) (E, error)
+
+	// ApplyEvent applies a domain event and returns the next aggregate state.
+	// The returned value may be a different concrete type (state pattern).
+	ApplyEvent(E) Aggregate[E]
+}
+```
+
+- [ ] **Step 4: テスト合格を確認**
+
+Run: `cd v2 && go test -run TestAggregateInterface ./...`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add v2/aggregate.go v2/aggregate_test.go
+git commit -m "feat(v2): add generic Aggregate[E] interface"
+```
+
+---
+
+## Phase 3: Errors
+
+### Task 6: Sentinel + typed errors
 
 **Files:**
 - Create: `v2/errors.go`
@@ -403,70 +375,67 @@ git commit -m "feat(v2): add core types (AggregateID, Event, Command, Aggregate)
 
 `v2/errors_test.go`:
 ```go
-package eventstore
+package eventsourcing_test
 
 import (
 	"errors"
 	"testing"
+
+	es "github.com/Hiroshi0900/eventstore/v2"
 )
 
 func TestOptimisticLockError_IsErrOptimisticLock(t *testing.T) {
-	err := NewOptimisticLockError("Visit-v1", 5, 3)
-	if !errors.Is(err, ErrOptimisticLock) {
-		t.Errorf("expected errors.Is(err, ErrOptimisticLock) = true")
+	err := es.NewOptimisticLockError("Visit-x", 3, 5)
+	if !errors.Is(err, es.ErrOptimisticLock) {
+		t.Errorf("errors.Is(err, ErrOptimisticLock) = false, want true")
 	}
 }
 
 func TestAggregateNotFoundError_IsErrAggregateNotFound(t *testing.T) {
-	err := NewAggregateNotFoundError("Visit", "v1")
-	if !errors.Is(err, ErrAggregateNotFound) {
-		t.Errorf("expected errors.Is(err, ErrAggregateNotFound) = true")
-	}
-}
-
-func TestSerializationError_IsErrSerializationFailed(t *testing.T) {
-	cause := errors.New("boom")
-	err := NewSerializationError("event", cause)
-	if !errors.Is(err, ErrSerializationFailed) {
-		t.Errorf("expected errors.Is(err, ErrSerializationFailed) = true")
-	}
-	if !errors.Is(err, cause) {
-		t.Errorf("expected unwrap chain to include cause")
-	}
-}
-
-func TestDeserializationError_IsErrDeserializationFailed(t *testing.T) {
-	err := NewDeserializationError("snapshot", errors.New("bad"))
-	if !errors.Is(err, ErrDeserializationFailed) {
-		t.Errorf("expected errors.Is(err, ErrDeserializationFailed) = true")
+	err := es.NewAggregateNotFoundError("Visit", "x")
+	if !errors.Is(err, es.ErrAggregateNotFound) {
+		t.Errorf("errors.Is(err, ErrAggregateNotFound) = false, want true")
 	}
 }
 
 func TestDuplicateAggregateError_IsErrDuplicateAggregate(t *testing.T) {
-	err := NewDuplicateAggregateError("Visit-v1")
-	if !errors.Is(err, ErrDuplicateAggregate) {
-		t.Errorf("expected errors.Is(err, ErrDuplicateAggregate) = true")
+	err := es.NewDuplicateAggregateError("Visit-x")
+	if !errors.Is(err, es.ErrDuplicateAggregate) {
+		t.Errorf("errors.Is(err, ErrDuplicateAggregate) = false, want true")
 	}
 }
 
-func TestAggregateIDMismatchError_IsErrAggregateIDMismatch(t *testing.T) {
-	err := NewAggregateIDMismatchError("Visit-v1", "Visit-v2")
-	if !errors.Is(err, ErrAggregateIDMismatch) {
-		t.Errorf("expected errors.Is(err, ErrAggregateIDMismatch) = true")
+func TestSerializationError_IsErrSerializationFailed(t *testing.T) {
+	err := es.NewSerializationError("event", errors.New("boom"))
+	if !errors.Is(err, es.ErrSerializationFailed) {
+		t.Errorf("errors.Is(err, ErrSerializationFailed) = false, want true")
+	}
+}
+
+func TestDeserializationError_IsErrDeserializationFailed(t *testing.T) {
+	err := es.NewDeserializationError("event", errors.New("boom"))
+	if !errors.Is(err, es.ErrDeserializationFailed) {
+		t.Errorf("errors.Is(err, ErrDeserializationFailed) = false, want true")
+	}
+}
+
+func TestErrUnknownCommand_isSentinel(t *testing.T) {
+	if es.ErrUnknownCommand == nil {
+		t.Fatalf("ErrUnknownCommand should be non-nil sentinel")
 	}
 }
 ```
 
 - [ ] **Step 2: テスト失敗を確認**
 
-Run: `cd v2 && go test -run TestOptimisticLockError -v`
-Expected: コンパイルエラー
+Run: `cd v2 && go test -run TestOptimisticLockError ./...`
+Expected: `undefined: es.ErrOptimisticLock` のコンパイルエラー
 
-- [ ] **Step 3: 最小実装**
+- [ ] **Step 3: 実装**
 
 `v2/errors.go`:
 ```go
-package eventstore
+package eventsourcing
 
 import (
 	"errors"
@@ -484,10 +453,9 @@ var (
 	ErrEventStoreUnavailable = errors.New("event store unavailable")
 	ErrDuplicateAggregate    = errors.New("aggregate already exists")
 	ErrUnknownCommand        = errors.New("unknown command type for current state")
-	ErrAggregateIDMismatch   = errors.New("command aggregate ID does not match aggregate")
 )
 
-// OptimisticLockError は楽観ロック失敗の詳細を持ちます。
+// OptimisticLockError provides detailed information about a lock conflict.
 type OptimisticLockError struct {
 	AggregateID     string
 	ExpectedVersion uint64
@@ -504,7 +472,7 @@ func NewOptimisticLockError(aggregateID string, expected, actual uint64) *Optimi
 	return &OptimisticLockError{AggregateID: aggregateID, ExpectedVersion: expected, ActualVersion: actual}
 }
 
-// AggregateNotFoundError は集約が存在しないことを示します。
+// AggregateNotFoundError provides information about which aggregate was not found.
 type AggregateNotFoundError struct {
 	TypeName    string
 	AggregateID string
@@ -519,10 +487,10 @@ func NewAggregateNotFoundError(typeName, aggregateID string) *AggregateNotFoundE
 	return &AggregateNotFoundError{TypeName: typeName, AggregateID: aggregateID}
 }
 
-// SerializationError はシリアライゼーション/デシリアライゼーション失敗を表します。
+// SerializationError provides details about a (de)serialization failure.
 type SerializationError struct {
 	Operation string // "serialize" or "deserialize"
-	Target    string // "event" / "aggregate" / "snapshot"
+	Target    string // "event", "aggregate"
 	Cause     error
 }
 
@@ -540,12 +508,11 @@ func (e *SerializationError) Is(target error) bool {
 func NewSerializationError(target string, cause error) *SerializationError {
 	return &SerializationError{Operation: "serialize", Target: target, Cause: cause}
 }
-
 func NewDeserializationError(target string, cause error) *SerializationError {
 	return &SerializationError{Operation: "deserialize", Target: target, Cause: cause}
 }
 
-// DuplicateAggregateError は同じ ID の集約が既に存在することを示します。
+// DuplicateAggregateError signals that an aggregate with the same ID already exists.
 type DuplicateAggregateError struct {
 	AggregateID string
 }
@@ -558,25 +525,9 @@ func (e *DuplicateAggregateError) Is(target error) bool { return target == ErrDu
 func NewDuplicateAggregateError(aggregateID string) *DuplicateAggregateError {
 	return &DuplicateAggregateError{AggregateID: aggregateID}
 }
-
-// AggregateIDMismatchError は Command の AggregateID が Aggregate と一致しないときに返されます。
-type AggregateIDMismatchError struct {
-	CommandAggregateID   string
-	AggregateAggregateID string
-}
-
-func (e *AggregateIDMismatchError) Error() string {
-	return fmt.Sprintf("command aggregate ID %q does not match aggregate %q",
-		e.CommandAggregateID, e.AggregateAggregateID)
-}
-func (e *AggregateIDMismatchError) Is(target error) bool { return target == ErrAggregateIDMismatch }
-
-func NewAggregateIDMismatchError(cmdID, aggID string) *AggregateIDMismatchError {
-	return &AggregateIDMismatchError{CommandAggregateID: cmdID, AggregateAggregateID: aggID}
-}
 ```
 
-- [ ] **Step 4: テスト成功を確認**
+- [ ] **Step 4: テスト合格を確認**
 
 Run: `cd v2 && go test ./...`
 Expected: PASS
@@ -585,137 +536,277 @@ Expected: PASS
 
 ```bash
 git add v2/errors.go v2/errors_test.go
-git commit -m "feat(v2): add error types"
+git commit -m "feat(v2): add sentinel and typed errors"
 ```
 
 ---
 
-## Phase 3: Serializer
+## Phase 4: Envelopes
 
-### Task 6: Serializer interface と JSONSerializer
+### Task 7: EventEnvelope と SnapshotEnvelope
 
 **Files:**
-- Create: `v2/serializer.go`
-- Create: `v2/serializer_test.go`
+- Create: `v2/envelope.go`
+- Create: `v2/envelope_test.go`
 
 - [ ] **Step 1: 失敗するテストを書く**
 
-`v2/serializer_test.go`:
+`v2/envelope_test.go`:
 ```go
-package eventstore
+package eventsourcing_test
 
 import (
-	"errors"
+	"encoding/json"
 	"testing"
+	"time"
+
+	es "github.com/Hiroshi0900/eventstore/v2"
 )
 
-type testPayload struct {
-	Name string `json:"name"`
-	Age  int    `json:"age"`
-}
+func TestEventEnvelope_jsonRoundtrip(t *testing.T) {
+	occurred := time.Date(2026, 4, 27, 12, 0, 0, 0, time.UTC)
+	in := es.EventEnvelope{
+		EventID:       "ev-1",
+		EventTypeName: "VisitScheduled",
+		AggregateID:   es.NewAggregateID("Visit", "x"),
+		SeqNr:         1,
+		IsCreated:     true,
+		OccurredAt:    occurred,
+		Payload:       []byte(`{"k":"v"}`),
+		TraceParent:   "00-trace-span-01",
+		TraceState:    "vendor=value",
+	}
 
-func TestJSONSerializer_RoundTrip(t *testing.T) {
-	s := NewJSONSerializer()
-	src := testPayload{Name: "alice", Age: 30}
-
-	data, err := s.SerializeEvent(src)
+	data, err := json.Marshal(in)
 	if err != nil {
-		t.Fatalf("SerializeEvent err: %v", err)
+		t.Fatalf("Marshal error: %v", err)
 	}
 
-	var got testPayload
-	if err := s.DeserializeEvent(data, &got); err != nil {
-		t.Fatalf("DeserializeEvent err: %v", err)
+	var out es.EventEnvelope
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
 	}
-	if got != src {
-		t.Errorf("round trip mismatch: got=%+v, want=%+v", got, src)
+
+	if out.EventID != in.EventID || out.EventTypeName != in.EventTypeName ||
+		out.AggregateID.AsString() != in.AggregateID.AsString() ||
+		out.SeqNr != in.SeqNr || out.IsCreated != in.IsCreated ||
+		!out.OccurredAt.Equal(in.OccurredAt) ||
+		string(out.Payload) != string(in.Payload) ||
+		out.TraceParent != in.TraceParent || out.TraceState != in.TraceState {
+		t.Errorf("roundtrip mismatch: got %+v, want %+v", out, in)
 	}
 }
 
-func TestJSONSerializer_DeserializeError(t *testing.T) {
-	s := NewJSONSerializer()
-	var dst testPayload
-	err := s.DeserializeEvent([]byte("{invalid"), &dst)
-	if !errors.Is(err, ErrDeserializationFailed) {
-		t.Errorf("expected ErrDeserializationFailed, got %v", err)
+func TestSnapshotEnvelope_jsonRoundtrip(t *testing.T) {
+	occurred := time.Date(2026, 4, 27, 12, 0, 0, 0, time.UTC)
+	in := es.SnapshotEnvelope{
+		AggregateID: es.NewAggregateID("Visit", "x"),
+		SeqNr:       5,
+		Version:     1,
+		Payload:     []byte(`{"state":"scheduled"}`),
+		OccurredAt:  occurred,
+	}
+
+	data, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	var out es.SnapshotEnvelope
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+
+	if out.AggregateID.AsString() != in.AggregateID.AsString() ||
+		out.SeqNr != in.SeqNr || out.Version != in.Version ||
+		string(out.Payload) != string(in.Payload) ||
+		!out.OccurredAt.Equal(in.OccurredAt) {
+		t.Errorf("roundtrip mismatch: got %+v, want %+v", out, in)
 	}
 }
 ```
 
 - [ ] **Step 2: テスト失敗を確認**
 
-Run: `cd v2 && go test -run TestJSONSerializer -v`
-Expected: コンパイルエラー
+Run: `cd v2 && go test -run TestEventEnvelope ./...`
+Expected: `undefined: es.EventEnvelope` のコンパイルエラー
 
-- [ ] **Step 3: 最小実装**
+- [ ] **Step 3: 実装**
 
-`v2/serializer.go`:
+`v2/envelope.go`:
 ```go
-package eventstore
+package eventsourcing
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"time"
+)
 
-// Serializer は汎用シリアライザの抽象です。Event payload と Aggregate snapshot の両方を扱います。
-type Serializer interface {
-	SerializeEvent(payload any) ([]byte, error)
-	DeserializeEvent(data []byte, target any) error
-	SerializeAggregate(aggregate any) ([]byte, error)
-	DeserializeAggregate(data []byte, target any) error
+// EventEnvelope wraps a serialized domain event with all storage metadata.
+// This is the wire format used between Repository and EventStore.
+type EventEnvelope struct {
+	EventID       string
+	EventTypeName string
+	AggregateID   AggregateID
+	SeqNr         uint64
+	IsCreated     bool
+	OccurredAt    time.Time
+	Payload       []byte
+	TraceParent   string
+	TraceState    string
 }
 
-// JSONSerializer は JSON を使う Serializer 実装です。
-type JSONSerializer struct{}
-
-func NewJSONSerializer() *JSONSerializer { return &JSONSerializer{} }
-
-func (s *JSONSerializer) SerializeEvent(payload any) ([]byte, error) {
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return nil, NewSerializationError("event", err)
-	}
-	return data, nil
+// envelope JSON format. AggregateID is split into typeName/value.
+type eventEnvelopeJSON struct {
+	EventID         string    `json:"event_id"`
+	EventTypeName   string    `json:"event_type_name"`
+	AggregateType   string    `json:"aggregate_type"`
+	AggregateValue  string    `json:"aggregate_value"`
+	SeqNr           uint64    `json:"seq_nr"`
+	IsCreated       bool      `json:"is_created"`
+	OccurredAt      time.Time `json:"occurred_at"`
+	Payload         []byte    `json:"payload"`
+	TraceParent     string    `json:"traceparent,omitempty"`
+	TraceState      string    `json:"tracestate,omitempty"`
 }
 
-func (s *JSONSerializer) DeserializeEvent(data []byte, target any) error {
-	if err := json.Unmarshal(data, target); err != nil {
-		return NewDeserializationError("event", err)
+func (e EventEnvelope) MarshalJSON() ([]byte, error) {
+	return json.Marshal(eventEnvelopeJSON{
+		EventID:        e.EventID,
+		EventTypeName:  e.EventTypeName,
+		AggregateType:  e.AggregateID.TypeName(),
+		AggregateValue: e.AggregateID.Value(),
+		SeqNr:          e.SeqNr,
+		IsCreated:      e.IsCreated,
+		OccurredAt:     e.OccurredAt,
+		Payload:        e.Payload,
+		TraceParent:    e.TraceParent,
+		TraceState:     e.TraceState,
+	})
+}
+
+func (e *EventEnvelope) UnmarshalJSON(data []byte) error {
+	var j eventEnvelopeJSON
+	if err := json.Unmarshal(data, &j); err != nil {
+		return err
 	}
+	e.EventID = j.EventID
+	e.EventTypeName = j.EventTypeName
+	e.AggregateID = NewAggregateID(j.AggregateType, j.AggregateValue)
+	e.SeqNr = j.SeqNr
+	e.IsCreated = j.IsCreated
+	e.OccurredAt = j.OccurredAt
+	e.Payload = j.Payload
+	e.TraceParent = j.TraceParent
+	e.TraceState = j.TraceState
 	return nil
 }
 
-func (s *JSONSerializer) SerializeAggregate(aggregate any) ([]byte, error) {
-	data, err := json.Marshal(aggregate)
-	if err != nil {
-		return nil, NewSerializationError("aggregate", err)
-	}
-	return data, nil
+// SnapshotEnvelope wraps a serialized aggregate state with metadata.
+type SnapshotEnvelope struct {
+	AggregateID AggregateID
+	SeqNr       uint64
+	Version     uint64
+	Payload     []byte
+	OccurredAt  time.Time
 }
 
-func (s *JSONSerializer) DeserializeAggregate(data []byte, target any) error {
-	if err := json.Unmarshal(data, target); err != nil {
-		return NewDeserializationError("aggregate", err)
+type snapshotEnvelopeJSON struct {
+	AggregateType  string    `json:"aggregate_type"`
+	AggregateValue string    `json:"aggregate_value"`
+	SeqNr          uint64    `json:"seq_nr"`
+	Version        uint64    `json:"version"`
+	Payload        []byte    `json:"payload"`
+	OccurredAt     time.Time `json:"occurred_at"`
+}
+
+func (s SnapshotEnvelope) MarshalJSON() ([]byte, error) {
+	return json.Marshal(snapshotEnvelopeJSON{
+		AggregateType:  s.AggregateID.TypeName(),
+		AggregateValue: s.AggregateID.Value(),
+		SeqNr:          s.SeqNr,
+		Version:        s.Version,
+		Payload:        s.Payload,
+		OccurredAt:     s.OccurredAt,
+	})
+}
+
+func (s *SnapshotEnvelope) UnmarshalJSON(data []byte) error {
+	var j snapshotEnvelopeJSON
+	if err := json.Unmarshal(data, &j); err != nil {
+		return err
 	}
+	s.AggregateID = NewAggregateID(j.AggregateType, j.AggregateValue)
+	s.SeqNr = j.SeqNr
+	s.Version = j.Version
+	s.Payload = j.Payload
+	s.OccurredAt = j.OccurredAt
 	return nil
 }
 ```
 
-- [ ] **Step 4: テスト成功を確認**
+- [ ] **Step 4: テスト合格を確認**
 
-Run: `cd v2 && go test -run TestJSONSerializer -v`
+Run: `cd v2 && go test ./...`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add v2/serializer.go v2/serializer_test.go
-git commit -m "feat(v2): add Serializer and JSONSerializer"
+git add v2/envelope.go v2/envelope_test.go
+git commit -m "feat(v2): add EventEnvelope and SnapshotEnvelope"
 ```
 
 ---
 
-## Phase 4: EventStore interface と関連型
+## Phase 5: Serializer interfaces
 
-### Task 7: EventStore interface, Config, SnapshotData, AggregateSerializer
+### Task 8: AggregateSerializer[T,E] と EventSerializer[E]
+
+**Files:**
+- Create: `v2/serializer.go`
+
+- [ ] **Step 1: Serializer interface を定義**
+
+`v2/serializer.go`:
+```go
+package eventsourcing
+
+// AggregateSerializer encodes/decodes a domain aggregate to/from bytes.
+// T is the aggregate type (typically a domain interface like Visit).
+// E is the aggregate-specific Event type. Both are constrained so the
+// serializer cannot be paired with mismatched aggregate/event types.
+type AggregateSerializer[T Aggregate[E], E Event] interface {
+	Serialize(T) ([]byte, error)
+	Deserialize([]byte) (T, error)
+}
+
+// EventSerializer encodes/decodes a domain event to/from bytes.
+// On Deserialize, typeName (== Event.EventTypeName()) is used to dispatch
+// to the correct concrete event type.
+type EventSerializer[E Event] interface {
+	Serialize(E) ([]byte, error)
+	Deserialize(typeName string, data []byte) (E, error)
+}
+```
+
+- [ ] **Step 2: コンパイル確認**
+
+Run: `cd v2 && go build ./...`
+Expected: エラーなし
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add v2/serializer.go
+git commit -m "feat(v2): add AggregateSerializer and EventSerializer interfaces"
+```
+
+---
+
+## Phase 6: EventStore interface と Config
+
+### Task 9: EventStore interface, Config, ShouldSnapshot
 
 **Files:**
 - Create: `v2/event_store.go`
@@ -725,78 +816,115 @@ git commit -m "feat(v2): add Serializer and JSONSerializer"
 
 `v2/event_store_test.go`:
 ```go
-package eventstore
+package eventsourcing_test
 
-import "testing"
+import (
+	"testing"
 
-func TestDefaultConfig_Defaults(t *testing.T) {
-	c := DefaultConfig()
-	if got, want := c.SnapshotInterval, uint64(5); got != want {
-		t.Errorf("SnapshotInterval = %d, want %d", got, want)
+	es "github.com/Hiroshi0900/eventstore/v2"
+)
+
+func TestDefaultConfig(t *testing.T) {
+	c := es.DefaultConfig()
+	if c.SnapshotInterval != 5 {
+		t.Errorf("SnapshotInterval: got %d, want 5", c.SnapshotInterval)
+	}
+	if c.JournalTableName != "journal" {
+		t.Errorf("JournalTableName: got %q, want %q", c.JournalTableName, "journal")
+	}
+	if c.SnapshotTableName != "snapshot" {
+		t.Errorf("SnapshotTableName: got %q, want %q", c.SnapshotTableName, "snapshot")
+	}
+	if c.ShardCount != 1 {
+		t.Errorf("ShardCount: got %d, want 1", c.ShardCount)
 	}
 }
 
 func TestConfig_ShouldSnapshot(t *testing.T) {
-	cases := []struct {
-		interval uint64
-		seqNr    uint64
-		want     bool
+	tests := []struct {
+		name             string
+		snapshotInterval uint64
+		seqNr            uint64
+		want             bool
 	}{
-		{interval: 5, seqNr: 0, want: true},  // 0 % 5 == 0
-		{interval: 5, seqNr: 1, want: false},
-		{interval: 5, seqNr: 5, want: true},
-		{interval: 5, seqNr: 10, want: true},
-		{interval: 0, seqNr: 5, want: false}, // disabled
-		{interval: 1, seqNr: 1, want: true},
+		{"interval=0 disables snapshots", 0, 5, false},
+		{"seqNr 1 with interval 5", 5, 1, false},
+		{"seqNr 5 with interval 5", 5, 5, true},
+		{"seqNr 6 with interval 5", 5, 6, false},
+		{"seqNr 10 with interval 5", 5, 10, true},
 	}
-	for _, tc := range cases {
-		c := Config{SnapshotInterval: tc.interval}
-		if got := c.ShouldSnapshot(tc.seqNr); got != tc.want {
-			t.Errorf("ShouldSnapshot(interval=%d, seq=%d) = %v, want %v",
-				tc.interval, tc.seqNr, got, tc.want)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := es.Config{SnapshotInterval: tt.snapshotInterval}
+			if got := c.ShouldSnapshot(tt.seqNr); got != tt.want {
+				t.Errorf("ShouldSnapshot(%d) with interval=%d: got %v, want %v",
+					tt.seqNr, tt.snapshotInterval, got, tt.want)
+			}
+		})
 	}
 }
 ```
 
 - [ ] **Step 2: テスト失敗を確認**
 
-Run: `cd v2 && go test -run TestDefaultConfig -v`
-Expected: コンパイルエラー
+Run: `cd v2 && go test -run TestDefaultConfig ./...`
+Expected: `undefined: es.DefaultConfig` のコンパイルエラー
 
-- [ ] **Step 3: 最小実装**
+- [ ] **Step 3: 実装**
 
 `v2/event_store.go`:
 ```go
-package eventstore
+package eventsourcing
 
 import "context"
 
-// SnapshotData はスナップショットの永続化データを表します。
-type SnapshotData struct {
-	Payload []byte // serialized aggregate state
-	SeqNr   uint64
-	Version uint64
+// EventStore is the low-level persistence abstraction.
+// All operations work on Envelopes; domain types are not exposed at this layer.
+type EventStore interface {
+	// GetLatestSnapshot returns the most recent snapshot for the aggregate,
+	// or nil if no snapshot exists.
+	GetLatestSnapshot(ctx context.Context, id AggregateID) (*SnapshotEnvelope, error)
+
+	// GetEventsSince returns all events with SeqNr > seqNr, ordered by SeqNr.
+	GetEventsSince(ctx context.Context, id AggregateID, seqNr uint64) ([]*EventEnvelope, error)
+
+	// PersistEvent appends a single event without a snapshot.
+	// expectedVersion is used only for first-write detection (== 0 means
+	// "this aggregate must not exist yet"). It is NOT used as an optimistic
+	// lock; that is performed by PersistEventAndSnapshot.
+	// The store rejects events with duplicate (AggregateID, SeqNr) via
+	// ErrDuplicateAggregate.
+	PersistEvent(ctx context.Context, ev *EventEnvelope, expectedVersion uint64) error
+
+	// PersistEventAndSnapshot atomically appends an event and updates the
+	// snapshot. The snapshot's Version field is used for optimistic locking:
+	// the operation fails with ErrOptimisticLock if the stored snapshot's
+	// version != snap.Version - 1 (i.e. the version was incremented by
+	// someone else in parallel).
+	PersistEventAndSnapshot(ctx context.Context, ev *EventEnvelope, snap *SnapshotEnvelope) error
 }
 
-// Config は EventStore / Repository の設定を保持します。
+// Config holds configuration for the EventStore.
 type Config struct {
-	// SnapshotInterval はスナップショットを取る seqNr の間隔です。
-	// 0 を指定するとスナップショットは取られません。
+	// SnapshotInterval determines the number of events between snapshots.
+	// Default 5. A value of 0 disables snapshots entirely.
 	SnapshotInterval uint64
 
-	// JournalTableName / SnapshotTableName は DynamoDB 実装用のテーブル名です。
-	JournalTableName  string
+	// JournalTableName is the table name for events (DynamoDB only).
+	JournalTableName string
+
+	// SnapshotTableName is the table name for snapshots (DynamoDB only).
 	SnapshotTableName string
 
-	// ShardCount は DynamoDB 実装の partition key sharding 数です。
+	// ShardCount controls FNV-1a-based partition key sharding (DynamoDB only).
 	ShardCount uint64
 
-	// KeepSnapshotCount は DynamoDB 実装で保持する古いスナップショット数。0 は全保持。
+	// KeepSnapshotCount determines how many old snapshots to retain.
+	// 0 means all snapshots are retained.
 	KeepSnapshotCount uint64
 }
 
-// DefaultConfig はデフォルト設定を返します。
+// DefaultConfig returns the default configuration.
 func DefaultConfig() Config {
 	return Config{
 		SnapshotInterval:  5,
@@ -807,30 +935,16 @@ func DefaultConfig() Config {
 	}
 }
 
-// ShouldSnapshot は seqNr においてスナップショットを取るべきかを返します。
+// ShouldSnapshot returns true when seqNr triggers a snapshot.
 func (c Config) ShouldSnapshot(seqNr uint64) bool {
 	if c.SnapshotInterval == 0 {
 		return false
 	}
 	return seqNr%c.SnapshotInterval == 0
 }
-
-// EventStore はイベント・スナップショットの永続化抽象です。
-type EventStore interface {
-	GetLatestSnapshotByID(ctx context.Context, id AggregateID) (*SnapshotData, error)
-	GetEventsByIDSinceSeqNr(ctx context.Context, id AggregateID, seqNr uint64) ([]Event, error)
-	PersistEvent(ctx context.Context, event Event, version uint64) error
-	PersistEventAndSnapshot(ctx context.Context, event Event, snapshot SnapshotData) error
-}
-
-// AggregateSerializer は集約 T のスナップショット用シリアライザです。
-type AggregateSerializer[T Aggregate] interface {
-	Serialize(T) ([]byte, error)
-	Deserialize([]byte) (T, error)
-}
 ```
 
-- [ ] **Step 4: テスト成功を確認**
+- [ ] **Step 4: テスト合格を確認**
 
 Run: `cd v2 && go test ./...`
 Expected: PASS
@@ -839,67 +953,174 @@ Expected: PASS
 
 ```bash
 git add v2/event_store.go v2/event_store_test.go
-git commit -m "feat(v2): add EventStore interface, Config, SnapshotData, AggregateSerializer"
+git commit -m "feat(v2): add EventStore interface, Config, ShouldSnapshot"
 ```
 
 ---
 
-## Phase 5: memory store (TDD)
+## Phase 7: EventID generator
 
-### Task 8: memory.Store の skeleton
+### Task 10: generateEventID ヘルパ
 
 **Files:**
-- Create: `v2/memory/store.go`
-- Create: `v2/memory/store_test.go`
+- Create: `v2/eventid.go`
+- Create: `v2/eventid_test.go`
+
+`generateEventID` は Repository 内部で EventEnvelope.EventID を埋めるために使う。`crypto/rand` で 16 bytes 取って hex 化（32 文字）。外部依存追加なし。
 
 - [ ] **Step 1: 失敗するテストを書く**
 
-`v2/memory/store_test.go`:
+`v2/eventid_test.go`:
 ```go
-package memory
+package eventsourcing
 
 import (
-	"context"
+	"regexp"
 	"testing"
-
-	es "github.com/Hiroshi0900/eventstore/v2"
 )
 
-func TestNew_Empty(t *testing.T) {
-	s := New()
-	if s == nil {
-		t.Fatal("New() returned nil")
-	}
-
-	id := es.NewAggregateID("Visit", "v1")
-	snap, err := s.GetLatestSnapshotByID(context.Background(), id)
+func TestGenerateEventID_format(t *testing.T) {
+	id, err := generateEventID()
 	if err != nil {
-		t.Fatalf("GetLatestSnapshotByID err: %v", err)
+		t.Fatalf("generateEventID() error = %v", err)
 	}
-	if snap != nil {
-		t.Errorf("expected nil snapshot, got %+v", snap)
+	if !regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(id) {
+		t.Errorf("id format unexpected: %q", id)
 	}
+}
 
-	events, err := s.GetEventsByIDSinceSeqNr(context.Background(), id, 0)
-	if err != nil {
-		t.Fatalf("GetEventsByIDSinceSeqNr err: %v", err)
-	}
-	if len(events) != 0 {
-		t.Errorf("expected empty events, got %d", len(events))
+func TestGenerateEventID_unique(t *testing.T) {
+	const n = 1000
+	seen := make(map[string]struct{}, n)
+	for i := 0; i < n; i++ {
+		id, err := generateEventID()
+		if err != nil {
+			t.Fatalf("iteration %d: %v", i, err)
+		}
+		if _, dup := seen[id]; dup {
+			t.Fatalf("duplicate id at iteration %d: %s", i, id)
+		}
+		seen[id] = struct{}{}
 	}
 }
 ```
 
 - [ ] **Step 2: テスト失敗を確認**
 
-Run: `cd v2 && go test ./memory/... -v`
-Expected: コンパイルエラー
+Run: `cd v2 && go test -run TestGenerateEventID ./...`
+Expected: `undefined: generateEventID` のコンパイルエラー
 
-- [ ] **Step 3: 最小実装**
+- [ ] **Step 3: 実装**
+
+`v2/eventid.go`:
+```go
+package eventsourcing
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+)
+
+// generateEventID produces a 32-char hex string from 16 random bytes.
+// Equivalent uniqueness to UUIDv4 / ULID for practical purposes.
+func generateEventID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+```
+
+- [ ] **Step 4: テスト合格を確認**
+
+Run: `cd v2 && go test -run TestGenerateEventID ./...`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add v2/eventid.go v2/eventid_test.go
+git commit -m "feat(v2): add internal generateEventID helper"
+```
+
+---
+
+## Phase 8: memory store (TDD)
+
+### Task 11: memory.Store skeleton + GetLatestSnapshot + GetEventsSince
+
+**Files:**
+- Create: `v2/memory/store.go`
+- Create: `v2/memory/store_test.go`
+
+memory store は EventEnvelope ベースで動作する。集約ごとに events と snapshot を map で保持。
+
+- [ ] **Step 1: 失敗するテストを書く**
+
+`v2/memory/store_test.go`:
+```go
+package memory_test
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	es "github.com/Hiroshi0900/eventstore/v2"
+	"github.com/Hiroshi0900/eventstore/v2/memory"
+)
+
+func TestStore_GetLatestSnapshot_empty(t *testing.T) {
+	store := memory.New()
+	id := es.NewAggregateID("Visit", "x")
+
+	snap, err := store.GetLatestSnapshot(context.Background(), id)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if snap != nil {
+		t.Errorf("snap = %+v, want nil", snap)
+	}
+}
+
+func TestStore_GetEventsSince_empty(t *testing.T) {
+	store := memory.New()
+	id := es.NewAggregateID("Visit", "x")
+
+	events, err := store.GetEventsSince(context.Background(), id, 0)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if len(events) != 0 {
+		t.Errorf("events len = %d, want 0", len(events))
+	}
+}
+
+func newEventEnvelope(t *testing.T, id es.AggregateID, seqNr uint64, isCreated bool) *es.EventEnvelope {
+	t.Helper()
+	return &es.EventEnvelope{
+		EventID:       "ev-test",
+		EventTypeName: "Test",
+		AggregateID:   id,
+		SeqNr:         seqNr,
+		IsCreated:     isCreated,
+		OccurredAt:    time.Now(),
+		Payload:       []byte(`{}`),
+	}
+}
+```
+
+- [ ] **Step 2: テスト失敗を確認**
+
+Run: `cd v2 && go test ./memory/...`
+Expected: `package memory not found` のコンパイルエラー
+
+- [ ] **Step 3: skeleton 実装**
 
 `v2/memory/store.go`:
 ```go
-// Package memory は in-memory な EventStore 実装を提供します（テスト用途）。
+// Package memory provides an in-memory EventStore implementation for testing.
 package memory
 
 import (
@@ -910,316 +1131,340 @@ import (
 	es "github.com/Hiroshi0900/eventstore/v2"
 )
 
-// Store は in-memory な EventStore 実装です。
+// Store is an in-memory EventStore implementation.
 type Store struct {
 	mu        sync.RWMutex
-	events    map[string][]es.Event       // aggregateID -> events
-	snapshots map[string]*es.SnapshotData // aggregateID -> latest snapshot
+	events    map[string][]*es.EventEnvelope    // aggregateID.AsString() -> ordered events
+	snapshots map[string]*es.SnapshotEnvelope   // aggregateID.AsString() -> latest snapshot
 }
 
-// New は空の Store を生成します。
+// New creates a new in-memory store.
 func New() *Store {
 	return &Store{
-		events:    map[string][]es.Event{},
-		snapshots: map[string]*es.SnapshotData{},
+		events:    make(map[string][]*es.EventEnvelope),
+		snapshots: make(map[string]*es.SnapshotEnvelope),
 	}
 }
 
-// GetLatestSnapshotByID は集約の最新スナップショットを返します。存在しなければ nil。
-func (s *Store) GetLatestSnapshotByID(_ context.Context, id es.AggregateID) (*es.SnapshotData, error) {
+// GetLatestSnapshot returns the latest snapshot or nil.
+func (s *Store) GetLatestSnapshot(_ context.Context, id es.AggregateID) (*es.SnapshotEnvelope, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if snap, ok := s.snapshots[id.AsString()]; ok {
-		return snap, nil
-	}
-	return nil, nil
+	return s.snapshots[id.AsString()], nil
 }
 
-// GetEventsByIDSinceSeqNr は seqNr より大きい seqNr のイベントを昇順で返します。
-func (s *Store) GetEventsByIDSinceSeqNr(_ context.Context, id es.AggregateID, seqNr uint64) ([]es.Event, error) {
+// GetEventsSince returns events with SeqNr > seqNr, ordered by SeqNr.
+func (s *Store) GetEventsSince(_ context.Context, id es.AggregateID, seqNr uint64) ([]*es.EventEnvelope, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	all := s.events[id.AsString()]
-	if len(all) == 0 {
-		return nil, nil
-	}
-	out := make([]es.Event, 0, len(all))
-	for _, ev := range all {
-		if ev.SeqNr() > seqNr {
+
+	src := s.events[id.AsString()]
+	var out []*es.EventEnvelope
+	for _, ev := range src {
+		if ev.SeqNr > seqNr {
 			out = append(out, ev)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].SeqNr() < out[j].SeqNr() })
+	sort.Slice(out, func(i, j int) bool { return out[i].SeqNr < out[j].SeqNr })
 	return out, nil
 }
 
-// Clear はストア内のすべてのデータを消去します（テスト用途）。
-func (s *Store) Clear() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.events = map[string][]es.Event{}
-	s.snapshots = map[string]*es.SnapshotData{}
+// PersistEvent and PersistEventAndSnapshot are implemented in subsequent tasks.
+func (s *Store) PersistEvent(_ context.Context, _ *es.EventEnvelope, _ uint64) error {
+	panic("not implemented")
+}
+func (s *Store) PersistEventAndSnapshot(_ context.Context, _ *es.EventEnvelope, _ *es.SnapshotEnvelope) error {
+	panic("not implemented")
 }
 ```
 
-- [ ] **Step 4: テスト成功を確認**
+- [ ] **Step 4: テスト合格を確認**
 
-Run: `cd v2 && go test ./memory/... -v`
+Run: `cd v2 && go test ./memory/...`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add v2/memory/
-git commit -m "feat(v2/memory): add Store skeleton with read methods"
+git add v2/memory/store.go v2/memory/store_test.go
+git commit -m "feat(v2/memory): add Store skeleton with snapshot/event reads"
 ```
 
 ---
 
-### Task 9: memory.Store.PersistEvent
+### Task 12: memory.Store.PersistEvent
 
 **Files:**
 - Modify: `v2/memory/store.go`
 - Modify: `v2/memory/store_test.go`
 
-- [ ] **Step 1: テスト追加**
+- [ ] **Step 1: 失敗するテストを追加**
 
-`v2/memory/store_test.go` に追記:
+`v2/memory/store_test.go` の末尾に追記：
 ```go
-func TestStore_PersistEvent_FirstEvent(t *testing.T) {
-	s := New()
-	id := es.NewAggregateID("Visit", "v1")
-	ev := es.NewEvent("evt-1", "VisitScheduled", id, []byte("p"),
-		es.WithSeqNr(1), es.WithIsCreated(true))
+func TestStore_PersistEvent_persistsAndQueryable(t *testing.T) {
+	store := memory.New()
+	id := es.NewAggregateID("Visit", "x")
 
-	if err := s.PersistEvent(context.Background(), ev, 0); err != nil {
-		t.Fatalf("PersistEvent err: %v", err)
+	ev := newEventEnvelope(t, id, 1, true)
+	if err := store.PersistEvent(context.Background(), ev, 0); err != nil {
+		t.Fatalf("PersistEvent: %v", err)
 	}
 
-	got, err := s.GetEventsByIDSinceSeqNr(context.Background(), id, 0)
+	got, err := store.GetEventsSince(context.Background(), id, 0)
 	if err != nil {
-		t.Fatalf("GetEventsByIDSinceSeqNr err: %v", err)
+		t.Fatalf("GetEventsSince: %v", err)
 	}
-	if len(got) != 1 || got[0].EventID() != "evt-1" {
-		t.Errorf("expected single event evt-1, got %+v", got)
+	if len(got) != 1 || got[0].SeqNr != 1 {
+		t.Errorf("got %+v, want 1 event with SeqNr=1", got)
 	}
 }
 
-func TestStore_PersistEvent_DuplicateOnCreate(t *testing.T) {
-	s := New()
-	id := es.NewAggregateID("Visit", "v1")
-	ev := es.NewEvent("evt-1", "VisitScheduled", id, nil, es.WithSeqNr(1))
+func TestStore_PersistEvent_duplicateSeqNr(t *testing.T) {
+	store := memory.New()
+	id := es.NewAggregateID("Visit", "x")
 
-	if err := s.PersistEvent(context.Background(), ev, 0); err != nil {
-		t.Fatalf("first PersistEvent err: %v", err)
+	if err := store.PersistEvent(context.Background(), newEventEnvelope(t, id, 1, true), 0); err != nil {
+		t.Fatalf("first PersistEvent: %v", err)
 	}
-	err := s.PersistEvent(context.Background(), ev, 0)
-	if !errors.Is(err, es.ErrDuplicateAggregate) {
+	err := store.PersistEvent(context.Background(), newEventEnvelope(t, id, 1, false), 0)
+	if err == nil {
+		t.Fatalf("second PersistEvent: want error, got nil")
+	}
+}
+
+func TestStore_PersistEvent_initialEventOnExistingAggregate(t *testing.T) {
+	store := memory.New()
+	id := es.NewAggregateID("Visit", "x")
+
+	if err := store.PersistEvent(context.Background(), newEventEnvelope(t, id, 1, true), 0); err != nil {
+		t.Fatalf("first PersistEvent: %v", err)
+	}
+	// Second persist with expectedVersion=0 (i.e. "I think this aggregate is new")
+	// must fail because the aggregate already has events.
+	err := store.PersistEvent(context.Background(), newEventEnvelope(t, id, 2, true), 0)
+	if err == nil {
+		t.Fatalf("PersistEvent with expectedVersion=0 on existing aggregate: want error, got nil")
+	}
+	if !errorsIs(err, es.ErrDuplicateAggregate) {
 		t.Errorf("expected ErrDuplicateAggregate, got %v", err)
 	}
 }
 
-func TestStore_PersistEvent_DuplicateSeqNr(t *testing.T) {
-	s := New()
-	id := es.NewAggregateID("Visit", "v1")
-	ev1 := es.NewEvent("evt-1", "VisitScheduled", id, nil, es.WithSeqNr(1))
-	ev2 := es.NewEvent("evt-2", "VisitCompleted", id, nil, es.WithSeqNr(1)) // 同じ SeqNr
-
-	if err := s.PersistEvent(context.Background(), ev1, 0); err != nil {
-		t.Fatalf("ev1 err: %v", err)
+// errorsIs is a small helper to avoid importing errors in every test file.
+func errorsIs(err, target error) bool {
+	if err == nil {
+		return target == nil
 	}
-	// 同じ SeqNr のイベントを書き込もうとすると ErrDuplicateAggregate
-	err := s.PersistEvent(context.Background(), ev2, 1)
-	if !errors.Is(err, es.ErrDuplicateAggregate) {
-		t.Errorf("expected ErrDuplicateAggregate, got %v", err)
+	type isCheck interface{ Is(error) bool }
+	if c, ok := err.(isCheck); ok && c.Is(target) {
+		return true
 	}
+	return err == target
 }
 ```
 
-`v2/memory/store_test.go` の import に `"errors"` を追加。
-
-> **設計メモ**: `PersistEvent` の `version` 引数は **「初回作成識別」専用**として扱う（version==0 で既存ありなら Duplicate、それ以外は無視）。楽観的ロックは `PersistEventAndSnapshot` 経由の snapshot.Version でのみ行う。これは v1 DynamoDB の挙動と整合する。
-
 - [ ] **Step 2: テスト失敗を確認**
 
-Run: `cd v2 && go test ./memory/... -v`
-Expected: コンパイルエラー（`PersistEvent undefined`）
+Run: `cd v2 && go test -run TestStore_PersistEvent ./memory/...`
+Expected: panic（"not implemented"）
 
-- [ ] **Step 3: 実装**
+- [ ] **Step 3: PersistEvent を実装**
 
-`v2/memory/store.go` に追記:
+`v2/memory/store.go` の `PersistEvent` を置き換え：
 ```go
-// PersistEvent はイベントを保存します。
-// 初回イベント (version == 0) で既存があれば ErrDuplicateAggregate。
-// 同じ SeqNr のイベントが既に存在する場合も ErrDuplicateAggregate。
-// version 引数は初回識別以外には使用しない（v1 DynamoDB と意味論を揃えるため）。
-// 楽観的ロックは PersistEventAndSnapshot の snapshot.Version で行う。
-func (s *Store) PersistEvent(_ context.Context, event es.Event, version uint64) error {
+// PersistEvent appends a single event. expectedVersion==0 indicates "first
+// write" and the operation fails with ErrDuplicateAggregate if events already
+// exist for the aggregate. expectedVersion>0 has no effect (optimistic locking
+// is performed only by PersistEventAndSnapshot).
+// Duplicate (aggregateID, seqNr) entries are rejected.
+func (s *Store) PersistEvent(_ context.Context, ev *es.EventEnvelope, expectedVersion uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := event.AggregateID().AsString()
+	key := ev.AggregateID.AsString()
 
-	// 初回作成の整合性チェック
-	if version == 0 && len(s.events[key]) > 0 {
+	if expectedVersion == 0 && len(s.events[key]) > 0 {
 		return es.NewDuplicateAggregateError(key)
 	}
 
-	// 同 SeqNr 衝突チェック
 	for _, existing := range s.events[key] {
-		if existing.SeqNr() == event.SeqNr() {
+		if existing.SeqNr == ev.SeqNr {
 			return es.NewDuplicateAggregateError(key)
 		}
 	}
 
-	s.events[key] = append(s.events[key], event)
+	s.events[key] = append(s.events[key], ev)
 	return nil
 }
 ```
 
-> versions マップは PersistEvent では更新しない。snapshot.Version の管理は PersistEventAndSnapshot に集約。
+- [ ] **Step 4: テスト合格を確認**
 
-- [ ] **Step 4: テスト成功を確認**
-
-Run: `cd v2 && go test ./memory/... -v`
+Run: `cd v2 && go test ./memory/...`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add v2/memory/
-git commit -m "feat(v2/memory): add PersistEvent with optimistic lock"
+git add v2/memory/store.go v2/memory/store_test.go
+git commit -m "feat(v2/memory): implement PersistEvent with duplicate detection"
 ```
 
 ---
 
-### Task 10: memory.Store.PersistEventAndSnapshot
+### Task 13: memory.Store.PersistEventAndSnapshot
 
 **Files:**
 - Modify: `v2/memory/store.go`
 - Modify: `v2/memory/store_test.go`
 
-- [ ] **Step 1: テスト追加**
+- [ ] **Step 1: 失敗するテストを追加**
 
-`v2/memory/store_test.go` に追記:
+`v2/memory/store_test.go` の末尾に追記：
 ```go
-func TestStore_PersistEventAndSnapshot_First(t *testing.T) {
-	s := New()
-	id := es.NewAggregateID("Visit", "v1")
-	ev := es.NewEvent("evt-1", "VisitScheduled", id, nil,
-		es.WithSeqNr(1), es.WithIsCreated(true))
-	snap := es.SnapshotData{Payload: []byte("snap-1"), SeqNr: 1, Version: 1}
-
-	if err := s.PersistEventAndSnapshot(context.Background(), ev, snap); err != nil {
-		t.Fatalf("PersistEventAndSnapshot err: %v", err)
-	}
-
-	got, err := s.GetLatestSnapshotByID(context.Background(), id)
-	if err != nil {
-		t.Fatalf("GetLatestSnapshotByID err: %v", err)
-	}
-	if got == nil {
-		t.Fatal("snapshot is nil")
-	}
-	if string(got.Payload) != "snap-1" || got.SeqNr != 1 || got.Version != 1 {
-		t.Errorf("snapshot mismatch: %+v", got)
-	}
-
-	events, _ := s.GetEventsByIDSinceSeqNr(context.Background(), id, 0)
-	if len(events) != 1 {
-		t.Errorf("expected 1 event, got %d", len(events))
+func newSnapshotEnvelope(id es.AggregateID, seqNr, version uint64) *es.SnapshotEnvelope {
+	return &es.SnapshotEnvelope{
+		AggregateID: id,
+		SeqNr:       seqNr,
+		Version:     version,
+		Payload:     []byte(`{"state":"ok"}`),
+		OccurredAt:  time.Now(),
 	}
 }
 
-func TestStore_PersistEventAndSnapshot_OptimisticLock(t *testing.T) {
-	s := New()
-	id := es.NewAggregateID("Visit", "v1")
-	ev1 := es.NewEvent("evt-1", "VisitScheduled", id, nil, es.WithSeqNr(1))
-	snap1 := es.SnapshotData{Payload: []byte("v1"), SeqNr: 1, Version: 1}
-	if err := s.PersistEventAndSnapshot(context.Background(), ev1, snap1); err != nil {
-		t.Fatalf("first err: %v", err)
+func TestStore_PersistEventAndSnapshot_initialWrite(t *testing.T) {
+	store := memory.New()
+	id := es.NewAggregateID("Visit", "x")
+
+	ev := newEventEnvelope(t, id, 5, false)
+	snap := newSnapshotEnvelope(id, 5, 1)
+
+	if err := store.PersistEventAndSnapshot(context.Background(), ev, snap); err != nil {
+		t.Fatalf("PersistEventAndSnapshot: %v", err)
 	}
 
-	ev2 := es.NewEvent("evt-2", "VisitCompleted", id, nil, es.WithSeqNr(2))
-	snap2 := es.SnapshotData{Payload: []byte("v2"), SeqNr: 2, Version: 99} // ズレた version
-	err := s.PersistEventAndSnapshot(context.Background(), ev2, snap2)
-	if !errors.Is(err, es.ErrOptimisticLock) {
-		t.Errorf("expected ErrOptimisticLock, got %v", err)
+	got, err := store.GetLatestSnapshot(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetLatestSnapshot: %v", err)
+	}
+	if got == nil || got.Version != 1 || got.SeqNr != 5 {
+		t.Errorf("snapshot mismatch: got %+v", got)
+	}
+}
+
+func TestStore_PersistEventAndSnapshot_optimisticLockFailure(t *testing.T) {
+	store := memory.New()
+	id := es.NewAggregateID("Visit", "x")
+
+	if err := store.PersistEventAndSnapshot(
+		context.Background(),
+		newEventEnvelope(t, id, 5, false),
+		newSnapshotEnvelope(id, 5, 1),
+	); err != nil {
+		t.Fatalf("first persist: %v", err)
+	}
+	// Concurrent caller still thinks the version is 1, computes Version=2,
+	// but another writer already moved the version to 2 below.
+	if err := store.PersistEventAndSnapshot(
+		context.Background(),
+		newEventEnvelope(t, id, 10, false),
+		newSnapshotEnvelope(id, 10, 2),
+	); err != nil {
+		t.Fatalf("second persist: %v", err)
+	}
+	// Now a stale writer attempts to commit Version=2 again.
+	err := store.PersistEventAndSnapshot(
+		context.Background(),
+		newEventEnvelope(t, id, 11, false),
+		newSnapshotEnvelope(id, 11, 2),
+	)
+	if err == nil {
+		t.Fatalf("want ErrOptimisticLock, got nil")
+	}
+	if !errorsIs(err, es.ErrOptimisticLock) {
+		t.Errorf("got %v, want ErrOptimisticLock", err)
 	}
 }
 ```
 
 - [ ] **Step 2: テスト失敗を確認**
 
-Run: `cd v2 && go test ./memory/... -v`
-Expected: コンパイルエラー（`PersistEventAndSnapshot undefined`）
+Run: `cd v2 && go test -run TestStore_PersistEventAndSnapshot ./memory/...`
+Expected: panic（"not implemented"）
 
-- [ ] **Step 3: 実装**
+- [ ] **Step 3: PersistEventAndSnapshot を実装**
 
-`v2/memory/store.go` に追記:
+`v2/memory/store.go` の `PersistEventAndSnapshot` を置き換え：
 ```go
-// PersistEventAndSnapshot はイベントとスナップショットをアトミックに保存します。
-// 楽観的ロック: 既存 snapshot の Version + 1 が snapshot.Version と一致しない場合 ErrOptimisticLock。
-// snapshot がない場合は snapshot.Version == 1 を期待。
-func (s *Store) PersistEventAndSnapshot(_ context.Context, event es.Event, snapshot es.SnapshotData) error {
+// PersistEventAndSnapshot appends an event AND updates the snapshot atomically.
+// The snapshot's Version field acts as the optimistic lock: the caller is
+// expected to pass Version = currentSnapshotVersion + 1. The operation fails
+// with ErrOptimisticLock if the stored snapshot's Version is not snap.Version - 1.
+// (For initial writes there is no stored snapshot; snap.Version must be 1.)
+func (s *Store) PersistEventAndSnapshot(
+	_ context.Context,
+	ev *es.EventEnvelope,
+	snap *es.SnapshotEnvelope,
+) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := event.AggregateID().AsString()
+	key := ev.AggregateID.AsString()
 
-	// 同 SeqNr 衝突チェック (PersistEvent と同じ整合性)
+	expected := snap.Version - 1
+	current := uint64(0)
+	if existing := s.snapshots[key]; existing != nil {
+		current = existing.Version
+	}
+	if current != expected {
+		return es.NewOptimisticLockError(key, expected, current)
+	}
+
 	for _, existing := range s.events[key] {
-		if existing.SeqNr() == event.SeqNr() {
+		if existing.SeqNr == ev.SeqNr {
 			return es.NewDuplicateAggregateError(key)
 		}
 	}
 
-	// snapshot 世代ベースの楽観ロック
-	var currentSnapVersion uint64
-	if existing, ok := s.snapshots[key]; ok {
-		currentSnapVersion = existing.Version
-	}
-	expected := currentSnapVersion + 1
-	if snapshot.Version != expected {
-		return es.NewOptimisticLockError(key, expected, snapshot.Version)
-	}
-
-	s.events[key] = append(s.events[key], event)
-	s.snapshots[key] = &snapshot
+	s.events[key] = append(s.events[key], ev)
+	s.snapshots[key] = snap
 	return nil
 }
 ```
 
-> Store struct から `versions` マップを削除する。snapshot version は `snapshots[key].Version` から取得する（情報の二重管理を避ける）。
+- [ ] **Step 4: テスト合格を確認**
 
-- [ ] **Step 4: テスト成功を確認**
-
-Run: `cd v2 && go test ./memory/... -v`
+Run: `cd v2 && go test ./memory/...`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add v2/memory/
-git commit -m "feat(v2/memory): add PersistEventAndSnapshot"
+git add v2/memory/store.go v2/memory/store_test.go
+git commit -m "feat(v2/memory): implement PersistEventAndSnapshot with optimistic lock"
 ```
 
 ---
 
-## Phase 6: Repository[T] (TDD)
+## Phase 9: Repository[T,E] (TDD)
 
-このフェーズではテスト用のミニ集約を導入し、`Repository[T]` の各シナリオを TDD で実装する。
-
-### Task 11: テスト用集約 (counterAggregate) を `repository_test.go` に定義
+### Task 14: Repository テスト用の counter 集約とシリアライザを定義
 
 **Files:**
 - Create: `v2/repository_test.go`
 
-- [ ] **Step 1: テスト用集約と Command/Event を定義（外部テストパッケージで循環参照を回避）**
+repository テストでは domain-pure な集約を実装し、Repository.Save / Load を end-to-end で検証する。counter 集約：
+
+- 状態は `count int` のみ
+- Command: `IncrementCommand{By int}`
+- Event: `IncrementedEvent{By int}`
+
+- [ ] **Step 1: テスト用集約を定義**
 
 `v2/repository_test.go`:
 ```go
-package eventstore_test
+package eventsourcing_test
 
 import (
 	"context"
@@ -1231,330 +1476,440 @@ import (
 	"github.com/Hiroshi0900/eventstore/v2/memory"
 )
 
-// --- テスト用ミニ集約: 単純なカウンタ ---
+// === counter ドメイン (テスト用) ===
 
-type counter struct {
-	id      es.AggregateID
-	value   int
-	seqNr   uint64
-	version uint64
+type counterEvent interface {
+	es.Event
+	isCounterEvent()
 }
 
-func newCounter(id es.AggregateID) counter { return counter{id: id} }
+type incrementedEvent struct {
+	AggID es.AggregateID
+	By    int
+}
 
-func (c counter) AggregateID() es.AggregateID         { return c.id }
-func (c counter) SeqNr() uint64                       { return c.seqNr }
-func (c counter) Version() uint64                     { return c.version }
-func (c counter) WithVersion(v uint64) es.Aggregate   { c.version = v; return c }
-func (c counter) WithSeqNr(s uint64) es.Aggregate     { c.seqNr = s; return c }
+func (e incrementedEvent) EventTypeName() string       { return "Incremented" }
+func (e incrementedEvent) AggregateID() es.AggregateID { return e.AggID }
+func (incrementedEvent) isCounterEvent()               {}
 
-func (c counter) ApplyCommand(cmd es.Command) (es.Event, error) {
-	switch cmd.(type) {
-	case incrementCmd:
-		return es.NewEvent("evt-"+cmd.AggregateID().AsString(), "Incremented", cmd.AggregateID(), nil,
-			es.WithSeqNr(c.seqNr+1), es.WithIsCreated(c.seqNr == 0)), nil
+type incrementCommand struct{ By int }
+
+func (incrementCommand) CommandTypeName() string { return "Increment" }
+
+type counterAggregate struct {
+	id    es.AggregateID
+	count int
+}
+
+func (c counterAggregate) AggregateID() es.AggregateID { return c.id }
+
+func (c counterAggregate) ApplyCommand(cmd es.Command) (counterEvent, error) {
+	switch x := cmd.(type) {
+	case incrementCommand:
+		return incrementedEvent{AggID: c.id, By: x.By}, nil
 	default:
 		return nil, es.ErrUnknownCommand
 	}
 }
 
-func (c counter) ApplyEvent(ev es.Event) es.Aggregate {
-	switch ev.EventTypeName() {
-	case "Incremented":
-		c.value++
-		c.seqNr = ev.SeqNr()
+func (c counterAggregate) ApplyEvent(ev counterEvent) es.Aggregate[counterEvent] {
+	if e, ok := ev.(incrementedEvent); ok {
+		return counterAggregate{id: c.id, count: c.count + e.By}
 	}
 	return c
 }
 
-type incrementCmd struct{ id es.AggregateID }
+// === Serializers ===
 
-func (c incrementCmd) CommandTypeName() string    { return "Increment" }
-func (c incrementCmd) AggregateID() es.AggregateID { return c.id }
-
-// --- AggregateSerializer ---
-
-type counterSnapshot struct {
-	Value   int    `json:"value"`
-	SeqNr   uint64 `json:"seq_nr"`
-	Version uint64 `json:"version"`
-	IDType  string `json:"id_type"`
-	IDValue string `json:"id_value"`
+type counterAggregateState struct {
+	TypeName string `json:"type_name"`
+	Value    string `json:"value"`
+	Count    int    `json:"count"`
 }
 
-type counterSerializer struct{}
+type counterAggregateSerializer struct{}
 
-func (counterSerializer) Serialize(c counter) ([]byte, error) {
-	return json.Marshal(counterSnapshot{
-		Value: c.value, SeqNr: c.seqNr, Version: c.version,
-		IDType: c.id.TypeName(), IDValue: c.id.Value(),
+func (counterAggregateSerializer) Serialize(c counterAggregate) ([]byte, error) {
+	return json.Marshal(counterAggregateState{
+		TypeName: c.id.TypeName(),
+		Value:    c.id.Value(),
+		Count:    c.count,
 	})
 }
 
-func (counterSerializer) Deserialize(data []byte) (counter, error) {
-	var s counterSnapshot
+func (counterAggregateSerializer) Deserialize(data []byte) (counterAggregate, error) {
+	var s counterAggregateState
 	if err := json.Unmarshal(data, &s); err != nil {
-		return counter{}, err
+		return counterAggregate{}, es.NewDeserializationError("aggregate", err)
 	}
-	return counter{
-		id:      es.NewAggregateID(s.IDType, s.IDValue),
-		value:   s.Value,
-		seqNr:   s.SeqNr,
-		version: s.Version,
-	}, nil
+	return counterAggregate{id: es.NewAggregateID(s.TypeName, s.Value), count: s.Count}, nil
 }
 
-// --- 共通ヘルパ ---
+type incrementedEventWire struct {
+	AggregateType  string `json:"aggregate_type"`
+	AggregateValue string `json:"aggregate_value"`
+	By             int    `json:"by"`
+}
 
-func newTestRepo() *es.Repository[counter] {
-	return es.NewRepository[counter](
-		memory.New(),
-		func(id es.AggregateID) counter { return newCounter(id) },
-		counterSerializer{},
-		es.DefaultConfig(),
+type counterEventSerializer struct{}
+
+func (counterEventSerializer) Serialize(ev counterEvent) ([]byte, error) {
+	switch e := ev.(type) {
+	case incrementedEvent:
+		return json.Marshal(incrementedEventWire{
+			AggregateType:  e.AggID.TypeName(),
+			AggregateValue: e.AggID.Value(),
+			By:             e.By,
+		})
+	default:
+		return nil, es.NewSerializationError("event", errors.New("unknown event type"))
+	}
+}
+
+func (counterEventSerializer) Deserialize(typeName string, data []byte) (counterEvent, error) {
+	switch typeName {
+	case "Incremented":
+		var w incrementedEventWire
+		if err := json.Unmarshal(data, &w); err != nil {
+			return nil, es.NewDeserializationError("event", err)
+		}
+		return incrementedEvent{
+			AggID: es.NewAggregateID(w.AggregateType, w.AggregateValue),
+			By:    w.By,
+		}, nil
+	default:
+		return nil, es.NewDeserializationError("event", errors.New("unknown event type: "+typeName))
+	}
+}
+
+// blankCounter is the createBlank function passed to NewRepository.
+func blankCounter(id es.AggregateID) counterAggregate {
+	return counterAggregate{id: id, count: 0}
+}
+
+// helper: build a Repository with a fresh memory store.
+func newCounterRepo(t *testing.T, cfg es.Config) (*es.DefaultRepository[counterAggregate, counterEvent], *memory.Store) {
+	t.Helper()
+	store := memory.New()
+	repo := es.NewRepository[counterAggregate, counterEvent](
+		store,
+		blankCounter,
+		counterAggregateSerializer{},
+		counterEventSerializer{},
+		cfg,
 	)
+	return repo, store
 }
 
-// プレースホルダテスト（次タスクで本格テストを追加）
-func TestRepository_Construct(t *testing.T) {
-	r := newTestRepo()
-	if r == nil {
-		t.Fatal("nil repo")
-	}
-	_ = context.Background
-	_ = errors.Is
+// useless test to confirm the test fixtures compile.
+func TestCounterFixturesCompile(t *testing.T) {
+	repo, _ := newCounterRepo(t, es.DefaultConfig())
+	_ = repo
 }
 ```
 
-- [ ] **Step 2: テスト失敗を確認**
+- [ ] **Step 2: テスト失敗を確認（Repository が未実装）**
 
-Run: `cd v2 && go test -run TestRepository_Construct -v`
-Expected: コンパイルエラー（`Repository undefined`、`NewRepository undefined`）
+Run: `cd v2 && go test ./...`
+Expected: `undefined: es.DefaultRepository` 等のコンパイルエラー
 
-- [ ] **Step 3: Repository skeleton を作成**
+(以下のタスクで実装する)
+
+---
+
+### Task 15: Repository.Load - 集約が存在しない時 ErrAggregateNotFound
+
+**Files:**
+- Create: `v2/repository.go`
+- Modify: `v2/repository_test.go`
+
+- [ ] **Step 1: 失敗するテストを追加**
+
+`v2/repository_test.go` の末尾に追記：
+```go
+func TestRepository_Load_notFound(t *testing.T) {
+	repo, _ := newCounterRepo(t, es.DefaultConfig())
+	id := es.NewAggregateID("Counter", "missing")
+
+	_, err := repo.Load(context.Background(), id)
+	if err == nil {
+		t.Fatalf("Load: want error, got nil")
+	}
+	if !errors.Is(err, es.ErrAggregateNotFound) {
+		t.Errorf("Load: want ErrAggregateNotFound, got %v", err)
+	}
+}
+```
+
+- [ ] **Step 2: Repository skeleton + Load 実装**
 
 `v2/repository.go`:
 ```go
-package eventstore
+package eventsourcing
 
-// Repository[T] は集約 T の高レベルロード/保存 API です。
-type Repository[T Aggregate] struct {
-	store       EventStore
-	createBlank func(AggregateID) T
-	serializer  AggregateSerializer[T]
-	config      Config
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+// Repository provides a high-level API over EventStore.
+// T is the aggregate type and E is its associated Event type.
+type Repository[T Aggregate[E], E Event] interface {
+	// Load returns the current state of the aggregate by replaying events
+	// from the latest snapshot. Returns ErrAggregateNotFound if no snapshot
+	// and no events exist.
+	Load(ctx context.Context, id AggregateID) (T, error)
+
+	// Save loads the current state, applies the command to produce a single
+	// event, persists the event (and snapshot when SnapshotInterval is hit),
+	// and returns the next state. If the aggregate does not yet exist,
+	// the createBlank function is used to construct an initial state.
+	Save(ctx context.Context, id AggregateID, cmd Command) (T, error)
 }
 
-// NewRepository は Repository[T] を生成します。
-func NewRepository[T Aggregate](
+// DefaultRepository is the default Repository implementation.
+type DefaultRepository[T Aggregate[E], E Event] struct {
+	store         EventStore
+	createBlank   func(AggregateID) T
+	aggSerializer AggregateSerializer[T, E]
+	evSerializer  EventSerializer[E]
+	config        Config
+}
+
+// NewRepository creates a new DefaultRepository.
+func NewRepository[T Aggregate[E], E Event](
 	store EventStore,
 	createBlank func(AggregateID) T,
-	serializer AggregateSerializer[T],
+	aggSerializer AggregateSerializer[T, E],
+	evSerializer EventSerializer[E],
 	config Config,
-) *Repository[T] {
-	return &Repository[T]{
-		store:       store,
-		createBlank: createBlank,
-		serializer:  serializer,
-		config:      config,
+) *DefaultRepository[T, E] {
+	return &DefaultRepository[T, E]{
+		store:         store,
+		createBlank:   createBlank,
+		aggSerializer: aggSerializer,
+		evSerializer:  evSerializer,
+		config:        config,
 	}
 }
-```
 
-- [ ] **Step 4: テスト成功を確認**
-
-Run: `cd v2 && go test -run TestRepository_Construct -v`
-Expected: PASS
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add v2/repository.go v2/repository_test.go
-git commit -m "feat(v2): scaffold Repository[T] with test counter aggregate"
-```
-
----
-
-### Task 12: Repository.Load - 集約が存在しない場合 ErrAggregateNotFound
-
-**Files:**
-- Modify: `v2/repository.go`
-- Modify: `v2/repository_test.go`
-
-- [ ] **Step 1: テスト追加**
-
-`v2/repository_test.go` の末尾に追記:
-```go
-func TestRepository_Load_NotFound(t *testing.T) {
-	r := newTestRepo()
-	id := es.NewAggregateID("Counter", "c1")
-
-	_, err := r.Load(context.Background(), id)
-	if !errors.Is(err, es.ErrAggregateNotFound) {
-		t.Errorf("expected ErrAggregateNotFound, got %v", err)
-	}
-}
-```
-
-- [ ] **Step 2: テスト失敗を確認**
-
-Run: `cd v2 && go test -run TestRepository_Load_NotFound -v`
-Expected: コンパイルエラー（`Load undefined`）
-
-- [ ] **Step 3: 実装**
-
-`v2/repository.go` に追記:
-```go
-import "context"
-
-// Load は集約をロードします。スナップショットがあれば起点に、なければ空集約から
-// イベントを replay。スナップショットもイベントもない場合は ErrAggregateNotFound。
-func (r *Repository[T]) Load(ctx context.Context, id AggregateID) (T, error) {
-	var zero T
-
-	snap, err := r.store.GetLatestSnapshotByID(ctx, id)
+// loadInternal returns the current aggregate state, plus the seqNr and version
+// of the latest snapshot (or 0,0 if no snapshot exists).
+// notFound==true indicates that neither snapshot nor events exist.
+func (r *DefaultRepository[T, E]) loadInternal(
+	ctx context.Context,
+	id AggregateID,
+) (agg T, seqNr, version uint64, notFound bool, err error) {
+	snap, err := r.store.GetLatestSnapshot(ctx, id)
 	if err != nil {
-		return zero, err
+		return agg, 0, 0, false, err
 	}
 
-	var agg T
-	var seqNr uint64
 	if snap != nil {
-		restored, err := r.serializer.Deserialize(snap.Payload)
+		agg, err = r.aggSerializer.Deserialize(snap.Payload)
 		if err != nil {
-			return zero, err
+			return agg, 0, 0, false, err
 		}
-		// version をスナップショットのものに復元
-		agg = restored.WithVersion(snap.Version).(T)
 		seqNr = snap.SeqNr
+		version = snap.Version
 	} else {
 		agg = r.createBlank(id)
 		seqNr = 0
+		version = 0
 	}
 
-	events, err := r.store.GetEventsByIDSinceSeqNr(ctx, id, seqNr)
+	events, err := r.store.GetEventsSince(ctx, id, seqNr)
 	if err != nil {
-		return zero, err
+		return agg, 0, 0, false, err
 	}
 
 	if snap == nil && len(events) == 0 {
-		return zero, NewAggregateNotFoundError(id.TypeName(), id.Value())
+		return agg, 0, 0, true, nil
 	}
 
-	for _, ev := range events {
-		agg = agg.ApplyEvent(ev).(T)
+	for _, env := range events {
+		ev, err := r.evSerializer.Deserialize(env.EventTypeName, env.Payload)
+		if err != nil {
+			return agg, 0, 0, false, err
+		}
+		next, ok := agg.ApplyEvent(ev).(T)
+		if !ok {
+			return agg, 0, 0, false, fmt.Errorf(
+				"%w: ApplyEvent returned a value that does not implement T",
+				ErrInvalidAggregate,
+			)
+		}
+		agg = next
+		seqNr = env.SeqNr
+	}
+	return agg, seqNr, version, false, nil
+}
+
+// Load returns the aggregate, or ErrAggregateNotFound if it doesn't exist.
+func (r *DefaultRepository[T, E]) Load(ctx context.Context, id AggregateID) (T, error) {
+	agg, _, _, notFound, err := r.loadInternal(ctx, id)
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	if notFound {
+		var zero T
+		return zero, NewAggregateNotFoundError(id.TypeName(), id.Value())
 	}
 	return agg, nil
 }
+
+// Save is implemented in the next task.
+func (r *DefaultRepository[T, E]) Save(ctx context.Context, id AggregateID, cmd Command) (T, error) {
+	var zero T
+	_ = ctx
+	_ = id
+	_ = cmd
+	return zero, fmt.Errorf("not implemented")
+}
 ```
 
-注: Go の import 文は通常先頭に固める。`v2/repository.go` は最終的にこのような形になる:
-```go
-package eventstore
+> **Note**: Repository[T,E] interface 充足は `repository_test.go` の `newCounterRepo` で実 instantiation しているため、コンパイル時に検証される。専用の `var _` アサーションは不要。
 
-import "context"
+> **設計メモ**: 末尾の `var _` アサーションは Repository[T,E] interface を DefaultRepository[T,E] が満たすことを compile time に固定するための型チェックダミー。
 
-// (Repository struct と NewRepository、Load を順に配置)
-```
+- [ ] **Step 3: テスト合格を確認**
 
-- [ ] **Step 4: テスト成功を確認**
-
-Run: `cd v2 && go test ./...`
+Run: `cd v2 && go test -run TestRepository_Load_notFound ./...`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add v2/repository.go v2/repository_test.go
-git commit -m "feat(v2): add Repository.Load with ErrAggregateNotFound"
+git commit -m "feat(v2): add Repository skeleton and Load with not-found handling"
 ```
 
 ---
 
-### Task 13: Repository.Store - 単純な保存（スナップショットなし）
+### Task 16: Repository.Save - 単純な保存（snapshot 非到達）
 
 **Files:**
 - Modify: `v2/repository.go`
 - Modify: `v2/repository_test.go`
 
-- [ ] **Step 1: テスト追加**
+- [ ] **Step 1: 失敗するテストを追加**
 
-`v2/repository_test.go` の末尾に追記:
+`v2/repository_test.go` の末尾に追記：
 ```go
-func TestRepository_Store_FirstCommand(t *testing.T) {
-	r := newTestRepo()
-	id := es.NewAggregateID("Counter", "c1")
-	c := newCounter(id)
+func TestRepository_Save_firstEventCreatesAggregate(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 100 // 大きく取って snapshot を回避
+	repo, store := newCounterRepo(t, cfg)
+	id := es.NewAggregateID("Counter", "1")
 
-	updated, err := r.Store(context.Background(), incrementCmd{id: id}, c)
+	got, err := repo.Save(context.Background(), id, incrementCommand{By: 3})
 	if err != nil {
-		t.Fatalf("Store err: %v", err)
+		t.Fatalf("Save: %v", err)
 	}
-	if got, want := updated.value, 1; got != want {
-		t.Errorf("counter.value = %d, want %d", got, want)
+	if got.count != 3 {
+		t.Errorf("count: got %d, want 3", got.count)
 	}
-	if got, want := updated.SeqNr(), uint64(1); got != want {
-		t.Errorf("counter.SeqNr = %d, want %d", got, want)
+
+	// 永続化された Event を直接確認
+	envs, err := store.GetEventsSince(context.Background(), id, 0)
+	if err != nil {
+		t.Fatalf("GetEventsSince: %v", err)
+	}
+	if len(envs) != 1 {
+		t.Fatalf("event count: got %d, want 1", len(envs))
+	}
+	if envs[0].SeqNr != 1 {
+		t.Errorf("SeqNr: got %d, want 1", envs[0].SeqNr)
+	}
+	if !envs[0].IsCreated {
+		t.Errorf("IsCreated: got false, want true")
+	}
+	if envs[0].EventTypeName != "Incremented" {
+		t.Errorf("EventTypeName: got %q, want %q", envs[0].EventTypeName, "Incremented")
+	}
+	if envs[0].EventID == "" {
+		t.Errorf("EventID: empty")
+	}
+	if envs[0].OccurredAt.IsZero() {
+		t.Errorf("OccurredAt: zero")
 	}
 }
 
-func TestRepository_Store_MismatchedAggregateID(t *testing.T) {
-	r := newTestRepo()
-	idA := es.NewAggregateID("Counter", "a")
-	idB := es.NewAggregateID("Counter", "b")
-	c := newCounter(idA)
+func TestRepository_Save_subsequentEvent(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 100
+	repo, store := newCounterRepo(t, cfg)
+	id := es.NewAggregateID("Counter", "2")
 
-	_, err := r.Store(context.Background(), incrementCmd{id: idB}, c)
-	if !errors.Is(err, es.ErrAggregateIDMismatch) {
-		t.Errorf("expected ErrAggregateIDMismatch, got %v", err)
+	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
+		t.Fatalf("first Save: %v", err)
+	}
+	got, err := repo.Save(context.Background(), id, incrementCommand{By: 4})
+	if err != nil {
+		t.Fatalf("second Save: %v", err)
+	}
+	if got.count != 5 {
+		t.Errorf("count: got %d, want 5", got.count)
+	}
+
+	envs, _ := store.GetEventsSince(context.Background(), id, 0)
+	if len(envs) != 2 {
+		t.Fatalf("event count: got %d, want 2", len(envs))
+	}
+	if envs[1].IsCreated {
+		t.Errorf("second event IsCreated: got true, want false")
+	}
+	if envs[1].SeqNr != 2 {
+		t.Errorf("second SeqNr: got %d, want 2", envs[1].SeqNr)
 	}
 }
 
-func TestRepository_LoadAfterStore(t *testing.T) {
-	r := newTestRepo()
-	id := es.NewAggregateID("Counter", "c1")
-	c := newCounter(id)
+func TestRepository_LoadAfterSave_replaysCorrectly(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 100
+	repo, _ := newCounterRepo(t, cfg)
+	id := es.NewAggregateID("Counter", "3")
 
-	// 3 回 Increment （SnapshotInterval=5 なのでスナップショットは取られない）
-	for i := 0; i < 3; i++ {
-		var err error
-		c, err = r.Store(context.Background(), incrementCmd{id: id}, c)
-		if err != nil {
-			t.Fatalf("Store err at i=%d: %v", i, err)
-		}
+	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 7}); err != nil {
+		t.Fatalf("Save 1: %v", err)
+	}
+	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 3}); err != nil {
+		t.Fatalf("Save 2: %v", err)
 	}
 
-	loaded, err := r.Load(context.Background(), id)
+	got, err := repo.Load(context.Background(), id)
 	if err != nil {
-		t.Fatalf("Load err: %v", err)
+		t.Fatalf("Load: %v", err)
 	}
-	if got, want := loaded.value, 3; got != want {
-		t.Errorf("loaded.value = %d, want %d", got, want)
-	}
-	if got, want := loaded.SeqNr(), uint64(3); got != want {
-		t.Errorf("loaded.SeqNr = %d, want %d", got, want)
+	if got.count != 10 {
+		t.Errorf("count: got %d, want 10", got.count)
 	}
 }
 ```
 
 - [ ] **Step 2: テスト失敗を確認**
 
-Run: `cd v2 && go test -run TestRepository_Store -v`
-Expected: コンパイルエラー（`Store undefined`）
+Run: `cd v2 && go test -run TestRepository_Save ./...`
+Expected: 「not implemented」エラー
 
-- [ ] **Step 3: 実装**
+- [ ] **Step 3: Save を実装**
 
-`v2/repository.go` に追記:
+`v2/repository.go` の `Save` メソッドを次のように置き換え：
 ```go
-// Store はコマンドを集約に適用してイベントを生成・永続化し、新しい集約を返します。
-func (r *Repository[T]) Store(ctx context.Context, cmd Command, agg T) (T, error) {
+// Save loads the aggregate (or starts blank), applies the command, persists
+// the resulting event, optionally creating a snapshot.
+func (r *DefaultRepository[T, E]) Save(
+	ctx context.Context,
+	id AggregateID,
+	cmd Command,
+) (T, error) {
 	var zero T
 
-	if cmd.AggregateID().AsString() != agg.AggregateID().AsString() {
-		return zero, NewAggregateIDMismatchError(
-			cmd.AggregateID().AsString(),
-			agg.AggregateID().AsString(),
-		)
+	agg, currentSeqNr, currentVersion, _, err := r.loadInternal(ctx, id)
+	if err != nil {
+		return zero, err
 	}
 
 	ev, err := agg.ApplyCommand(cmd)
@@ -1562,33 +1917,63 @@ func (r *Repository[T]) Store(ctx context.Context, cmd Command, agg T) (T, error
 		return zero, err
 	}
 
-	nextSeqNr := agg.SeqNr() + 1
-	ev = ev.WithSeqNr(nextSeqNr)
-	nextAgg := agg.ApplyEvent(ev).(T)
-	nextAgg = nextAgg.WithSeqNr(nextSeqNr).(T)
+	next, ok := agg.ApplyEvent(ev).(T)
+	if !ok {
+		return zero, fmt.Errorf(
+			"%w: ApplyEvent returned a value that does not implement T",
+			ErrInvalidAggregate,
+		)
+	}
+
+	nextSeqNr := currentSeqNr + 1
+
+	payload, err := r.evSerializer.Serialize(ev)
+	if err != nil {
+		return zero, err
+	}
+
+	eventID, err := generateEventID()
+	if err != nil {
+		return zero, err
+	}
+
+	envelope := &EventEnvelope{
+		EventID:       eventID,
+		EventTypeName: ev.EventTypeName(),
+		AggregateID:   ev.AggregateID(),
+		SeqNr:         nextSeqNr,
+		IsCreated:     currentSeqNr == 0,
+		OccurredAt:    time.Now().UTC(),
+		Payload:       payload,
+		// TraceParent / TraceState are filled by DynamoDB store via context.
+	}
 
 	if r.config.ShouldSnapshot(nextSeqNr) {
-		payload, err := r.serializer.Serialize(nextAgg)
+		snapPayload, err := r.aggSerializer.Serialize(next)
 		if err != nil {
 			return zero, err
 		}
-		nextVersion := agg.Version() + 1
-		snap := SnapshotData{Payload: payload, SeqNr: nextSeqNr, Version: nextVersion}
-		if err := r.store.PersistEventAndSnapshot(ctx, ev, snap); err != nil {
+		snap := &SnapshotEnvelope{
+			AggregateID: ev.AggregateID(),
+			SeqNr:       nextSeqNr,
+			Version:     currentVersion + 1,
+			Payload:     snapPayload,
+			OccurredAt:  envelope.OccurredAt,
+		}
+		if err := r.store.PersistEventAndSnapshot(ctx, envelope, snap); err != nil {
 			return zero, err
 		}
-		nextAgg = nextAgg.WithVersion(nextVersion).(T)
 	} else {
-		if err := r.store.PersistEvent(ctx, ev, agg.Version()); err != nil {
+		if err := r.store.PersistEvent(ctx, envelope, currentVersion); err != nil {
 			return zero, err
 		}
 	}
 
-	return nextAgg, nil
+	return next, nil
 }
 ```
 
-- [ ] **Step 4: テスト成功を確認**
+- [ ] **Step 4: テスト合格を確認**
 
 Run: `cd v2 && go test ./...`
 Expected: PASS
@@ -1597,296 +1982,486 @@ Expected: PASS
 
 ```bash
 git add v2/repository.go v2/repository_test.go
-git commit -m "feat(v2): add Repository.Store (no-snapshot path)"
+git commit -m "feat(v2): implement Repository.Save without snapshot trigger"
 ```
 
 ---
 
-### Task 14: Repository.Store - スナップショット間隔到達時
+### Task 17: Repository.Save - snapshot 間隔到達時
 
 **Files:**
 - Modify: `v2/repository_test.go`
 
-- [ ] **Step 1: テスト追加**
+Save の実装は既に snapshot 分岐を含んでいる（前タスク）。本タスクでは snapshot がトリガされる動作を確認するテストのみを追加。
 
-`v2/repository_test.go` の末尾に追記:
+- [ ] **Step 1: テストを追加**
+
+`v2/repository_test.go` の末尾に追記：
 ```go
-func TestRepository_Store_TakesSnapshot(t *testing.T) {
-	store := memory.New()
-	r := es.NewRepository[counter](
-		store,
-		func(id es.AggregateID) counter { return newCounter(id) },
-		counterSerializer{},
-		es.Config{SnapshotInterval: 3},
-	)
-	id := es.NewAggregateID("Counter", "c1")
-	c := newCounter(id)
+func TestRepository_Save_triggersSnapshot(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 3
+	repo, store := newCounterRepo(t, cfg)
+	id := es.NewAggregateID("Counter", "snap")
 
 	for i := 0; i < 3; i++ {
-		var err error
-		c, err = r.Store(context.Background(), incrementCmd{id: id}, c)
-		if err != nil {
-			t.Fatalf("Store err at i=%d: %v", i, err)
+		if _, err := repo.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
+			t.Fatalf("Save %d: %v", i, err)
 		}
 	}
 
-	// SeqNr=3 でスナップショットが取られているはず
-	snap, err := store.GetLatestSnapshotByID(context.Background(), id)
+	snap, err := store.GetLatestSnapshot(context.Background(), id)
 	if err != nil {
-		t.Fatalf("GetLatestSnapshotByID err: %v", err)
+		t.Fatalf("GetLatestSnapshot: %v", err)
 	}
 	if snap == nil {
-		t.Fatal("expected snapshot to be saved at seqNr=3")
+		t.Fatalf("snapshot: nil, want present")
 	}
 	if snap.SeqNr != 3 {
-		t.Errorf("snap.SeqNr = %d, want 3", snap.SeqNr)
+		t.Errorf("snapshot SeqNr: got %d, want 3", snap.SeqNr)
 	}
 	if snap.Version != 1 {
-		t.Errorf("snap.Version = %d, want 1", snap.Version)
+		t.Errorf("snapshot Version: got %d, want 1", snap.Version)
+	}
+}
+
+func TestRepository_LoadAfterSnapshot_usesSnapshot(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 2
+	repo, _ := newCounterRepo(t, cfg)
+	id := es.NewAggregateID("Counter", "snapload")
+
+	for i := 0; i < 4; i++ {
+		if _, err := repo.Save(context.Background(), id, incrementCommand{By: 2}); err != nil {
+			t.Fatalf("Save %d: %v", i, err)
+		}
 	}
 
-	// Load して状態が正しく復元されること
-	loaded, err := r.Load(context.Background(), id)
+	got, err := repo.Load(context.Background(), id)
 	if err != nil {
-		t.Fatalf("Load err: %v", err)
+		t.Fatalf("Load: %v", err)
 	}
-	if loaded.value != 3 {
-		t.Errorf("loaded.value = %d, want 3", loaded.value)
+	if got.count != 8 {
+		t.Errorf("count: got %d, want 8", got.count)
 	}
 }
 ```
 
-- [ ] **Step 2: テスト実行**
+- [ ] **Step 2: テスト合格を確認**
 
-Run: `cd v2 && go test -run TestRepository_Store_TakesSnapshot -v`
-Expected: PASS（既に Task 13 の実装でカバー済み）
+Run: `cd v2 && go test -run TestRepository_Save_triggersSnapshot ./...`
+Expected: PASS
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add v2/repository_test.go
-git commit -m "test(v2): add Repository snapshot interval test"
+git commit -m "test(v2): cover Repository.Save snapshot trigger and load"
 ```
 
 ---
 
-### Task 15: Repository.Store - 楽観ロック失敗
+### Task 18: Repository.Save - 楽観ロック失敗
 
 **Files:**
 - Modify: `v2/repository_test.go`
 
-- [ ] **Step 1: テスト追加**
+- [ ] **Step 1: テストを追加**
 
-`v2/repository_test.go` の末尾に追記:
+`v2/repository_test.go` の末尾に追記：
 ```go
-func TestRepository_Store_OptimisticLockOnSnapshot(t *testing.T) {
-	store := memory.New()
-	r := es.NewRepository[counter](
-		store,
-		func(id es.AggregateID) counter { return newCounter(id) },
-		counterSerializer{},
-		es.Config{SnapshotInterval: 1}, // 毎回スナップショット
-	)
-	id := es.NewAggregateID("Counter", "c1")
-	c := newCounter(id)
+func TestRepository_Save_optimisticLockFailure(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 1 // 毎イベントで snapshot → 毎回楽観ロックが効く
+	repo, store := newCounterRepo(t, cfg)
+	id := es.NewAggregateID("Counter", "lock")
 
-	// 1 回目は成功
-	c, err := r.Store(context.Background(), incrementCmd{id: id}, c)
-	if err != nil {
-		t.Fatalf("first Store err: %v", err)
+	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
+		t.Fatalf("first Save: %v", err)
 	}
 
-	// stale: version=1 のローカルコピー
-	stale := c
-	// 別経路でもう一度進めて store の version を 2 にする
-	c, err = r.Store(context.Background(), incrementCmd{id: id}, c)
-	if err != nil {
-		t.Fatalf("second Store err: %v", err)
+	// ストアを直接書き換えて並行更新を模擬：snapshot Version を 99 に上げる
+	store.SetSnapshotForTest(id, 1, 99, []byte(`{"type_name":"Counter","value":"lock","count":1}`))
+
+	_, err := repo.Save(context.Background(), id, incrementCommand{By: 1})
+	if err == nil {
+		t.Fatalf("Save: want optimistic lock error, got nil")
 	}
-	// stale から保存しようとすると、store の current=2 に対して expected=2 を要求することになり失敗
-	_, err = r.Store(context.Background(), incrementCmd{id: id}, stale)
 	if !errors.Is(err, es.ErrOptimisticLock) {
-		t.Errorf("expected ErrOptimisticLock, got %v", err)
+		t.Errorf("Save: want ErrOptimisticLock, got %v", err)
 	}
 }
 ```
 
-- [ ] **Step 2: テスト実行**
+- [ ] **Step 2: テスト失敗を確認**
 
-Run: `cd v2 && go test -run TestRepository_Store_OptimisticLockOnSnapshot -v`
-Expected: PASS（Task 13 の実装でカバー済み）
+Run: `cd v2 && go test -run TestRepository_Save_optimisticLockFailure ./...`
+Expected: `undefined: store.SetSnapshotForTest` のコンパイルエラー
+
+- [ ] **Step 3: memory.Store にテスト用ヘルパを追加**
+
+`v2/memory/store.go` の末尾に追記：
+```go
+// SetSnapshotForTest directly overwrites a snapshot's version. Test helper
+// only — used to simulate concurrent writers.
+func (s *Store) SetSnapshotForTest(id es.AggregateID, seqNr, version uint64, payload []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := id.AsString()
+	s.snapshots[key] = &es.SnapshotEnvelope{
+		AggregateID: id,
+		SeqNr:       seqNr,
+		Version:     version,
+		Payload:     payload,
+	}
+}
+```
+
+- [ ] **Step 4: テスト合格を確認**
+
+Run: `cd v2 && go test ./...`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add v2/memory/store.go v2/repository_test.go
+git commit -m "test(v2): cover Repository.Save optimistic lock failure"
+```
+
+---
+
+### Task 19: Repository.Save - ApplyCommand エラー伝搬
+
+**Files:**
+- Modify: `v2/repository_test.go`
+
+- [ ] **Step 1: テストを追加**
+
+`v2/repository_test.go` の末尾に追記：
+```go
+type unknownCmd struct{}
+
+func (unknownCmd) CommandTypeName() string { return "Unknown" }
+
+func TestRepository_Save_propagatesApplyCommandError(t *testing.T) {
+	repo, _ := newCounterRepo(t, es.DefaultConfig())
+	id := es.NewAggregateID("Counter", "err")
+
+	_, err := repo.Save(context.Background(), id, unknownCmd{})
+	if err == nil {
+		t.Fatalf("want ErrUnknownCommand, got nil")
+	}
+	if !errors.Is(err, es.ErrUnknownCommand) {
+		t.Errorf("got %v, want ErrUnknownCommand", err)
+	}
+}
+```
+
+- [ ] **Step 2: テスト合格を確認**
+
+Run: `cd v2 && go test -run TestRepository_Save_propagatesApplyCommandError ./...`
+Expected: PASS（既存実装でエラーが伝搬する）
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add v2/repository_test.go
-git commit -m "test(v2): add Repository optimistic lock test"
+git commit -m "test(v2): cover Repository.Save command rejection"
 ```
 
 ---
 
-## Phase 7: internal packages 移植
+## Phase 10: keyresolver の v2 移植
 
-### Task 16: internal/keyresolver を v1 から移植
+### Task 20: internal/keyresolver を v1 から移植
 
 **Files:**
 - Create: `v2/internal/keyresolver/key_resolver.go`
 - Create: `v2/internal/keyresolver/key_resolver_test.go`
 
-- [ ] **Step 1: v1 のファイルを v2 にコピー**
+v1 の keyresolver は v1 の `AggregateID` interface（`GetTypeName()` / `GetValue()` メソッド）に依存しているので、v2 版に書き換える（`TypeName()` / `Value()` への変更）。
+
+- [ ] **Step 1: ファイル雛形コピー**
 
 ```bash
+mkdir -p /Users/sakemihiroshi/develop/terrat/eventstore/v2/internal/keyresolver
 cp /Users/sakemihiroshi/develop/terrat/eventstore/internal/keyresolver/key_resolver.go \
    /Users/sakemihiroshi/develop/terrat/eventstore/v2/internal/keyresolver/key_resolver.go
-
 cp /Users/sakemihiroshi/develop/terrat/eventstore/internal/keyresolver/key_resolver_test.go \
    /Users/sakemihiroshi/develop/terrat/eventstore/v2/internal/keyresolver/key_resolver_test.go
 ```
 
-- [ ] **Step 2: import パスを v2 用に書き換え**
+- [ ] **Step 2: import パスを v2 に書き換え**
 
-`v2/internal/keyresolver/key_resolver.go`:
-- `es "github.com/Hiroshi0900/eventstore"` → `es "github.com/Hiroshi0900/eventstore/v2"`
-
-`v2/internal/keyresolver/key_resolver_test.go`:
-- 同様に書き換え
-
-加えて、v1 の `id.GetTypeName()` / `id.GetValue()` / `id.AsString()` 呼び出しを v2 のメソッド名 `id.TypeName()` / `id.Value()` / `id.AsString()` に変更。
-
-具体的には `v2/internal/keyresolver/key_resolver.go` の以下の行を変更:
+`v2/internal/keyresolver/key_resolver.go` 冒頭：
 ```go
-// Before (v1):
-return fmt.Sprintf("%s-%d", id.GetTypeName(), shardID)
-return fmt.Sprintf("%s-%s-%020d", id.GetTypeName(), id.GetValue(), seqNr)
-return fmt.Sprintf("%s-%s-0", id.GetTypeName(), id.GetValue())
+import (
+	"fmt"
+	"hash/fnv"
 
-// After (v2):
-return fmt.Sprintf("%s-%d", id.TypeName(), shardID)
-return fmt.Sprintf("%s-%s-%020d", id.TypeName(), id.Value(), seqNr)
-return fmt.Sprintf("%s-%s-0", id.TypeName(), id.Value())
-
-// computeShardID は同じく id.Value() を使うように
+	es "github.com/Hiroshi0900/eventstore/v2"
+)
 ```
 
-`v2/internal/keyresolver/key_resolver_test.go` 内のテストでも `NewAggregateId` → `NewAggregateID` に変更（v2 では大文字 ID）。
+- [ ] **Step 3: メソッド呼び出しを v2 に書き換え**
 
-- [ ] **Step 3: テスト実行**
+`key_resolver.go` 内の `id.GetTypeName()` → `id.TypeName()`、`id.GetValue()` → `id.Value()` に全て置換。
 
-Run: `cd v2 && go test ./internal/keyresolver/... -v`
-Expected: PASS
+- [ ] **Step 4: テストファイルも同様に v2 化**
 
-- [ ] **Step 4: Commit**
+`v2/internal/keyresolver/key_resolver_test.go`：
+- import パスを `github.com/Hiroshi0900/eventstore/v2` に変更
+- AggregateID 構築を `es.NewAggregateID(...)` に変更
+- `GetTypeName()` / `GetValue()` 呼び出しを `TypeName()` / `Value()` に変更
+
+- [ ] **Step 5: テスト合格を確認**
+
+Run: `cd v2 && go test ./internal/keyresolver/...`
+Expected: PASS（v1 と同等の挙動）
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add v2/internal/keyresolver/
-git commit -m "feat(v2): port internal/keyresolver"
+git commit -m "feat(v2/keyresolver): port internal keyresolver to v2 API"
 ```
 
 ---
 
-### Task 17: internal/envelope を v1 から移植
+## Phase 11: DynamoDB store
+
+### Task 21: dynamodb.Store skeleton + 依存追加
 
 **Files:**
-- Create: `v2/internal/envelope/envelope.go`
-- Create: `v2/internal/envelope/envelope_test.go`
+- Modify: `v2/go.mod`
+- Create: `v2/dynamodb/store.go`
+- Create: `v2/dynamodb/store_test.go`
 
-- [ ] **Step 1: v1 のファイルをコピー**
+- [ ] **Step 1: go.mod に依存追加**
 
 ```bash
-cp /Users/sakemihiroshi/develop/terrat/eventstore/internal/envelope/envelope.go \
-   /Users/sakemihiroshi/develop/terrat/eventstore/v2/internal/envelope/envelope.go
-
-cp /Users/sakemihiroshi/develop/terrat/eventstore/internal/envelope/envelope_test.go \
-   /Users/sakemihiroshi/develop/terrat/eventstore/v2/internal/envelope/envelope_test.go
+cd /Users/sakemihiroshi/develop/terrat/eventstore/v2
+go get github.com/aws/aws-sdk-go-v2@v1.41.1
+go get github.com/aws/aws-sdk-go-v2/service/dynamodb@v1.53.5
+go get go.opentelemetry.io/otel@v1.40.0
+go mod tidy
+cd ..
 ```
 
-- [ ] **Step 2: import パスとメソッド名を v2 用に書き換え**
+- [ ] **Step 2: skeleton 実装**
 
-`v2/internal/envelope/envelope.go`:
+`v2/dynamodb/store.go`:
 ```go
-package envelope
+// Package dynamodb provides a DynamoDB-backed EventStore implementation for v2.
+package dynamodb
 
 import (
+	"context"
+
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+
 	es "github.com/Hiroshi0900/eventstore/v2"
+	"github.com/Hiroshi0900/eventstore/v2/internal/keyresolver"
 )
 
-type EventEnvelope struct {
-	ID          string `json:"id"`
-	TypeName    string `json:"type_name"`
-	AggregateID string `json:"aggregate_id"`
-	SeqNr       uint64 `json:"seq_nr"`
-	IsCreated   bool   `json:"is_created"`
-	OccurredAt  int64  `json:"occurred_at"` // Unix milli
-	Payload     []byte `json:"payload"`
+// Client is the subset of dynamodb.Client used by Store. Defined as an
+// interface to enable mocking.
+type Client interface {
+	GetItem(ctx context.Context, params *dynamodb.GetItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error)
+	Query(ctx context.Context, params *dynamodb.QueryInput, optFns ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error)
+	PutItem(ctx context.Context, params *dynamodb.PutItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
+	TransactWriteItems(ctx context.Context, params *dynamodb.TransactWriteItemsInput, optFns ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error)
 }
 
-func FromEvent(e es.Event) *EventEnvelope {
-	return &EventEnvelope{
-		ID:          e.EventID(),
-		TypeName:    e.EventTypeName(),
-		AggregateID: e.AggregateID().AsString(),
-		SeqNr:       e.SeqNr(),
-		IsCreated:   e.IsCreated(),
-		OccurredAt:  e.OccurredAt().UnixMilli(),
-		Payload:     e.Payload(),
+// Config holds DynamoDB-specific settings.
+type Config struct {
+	JournalTableName  string
+	SnapshotTableName string
+	JournalGSIName    string
+	SnapshotGSIName   string
+	ShardCount        uint64
+}
+
+// DefaultConfig returns the default DynamoDB configuration.
+func DefaultConfig() Config {
+	return Config{
+		JournalTableName:  "journal",
+		SnapshotTableName: "snapshot",
+		JournalGSIName:    "journal-aid-index",
+		SnapshotGSIName:   "snapshot-aid-index",
+		ShardCount:        1,
 	}
 }
 
-type SnapshotEnvelope struct {
-	AggregateID string `json:"aggregate_id"`
-	TypeName    string `json:"type_name"`
-	SeqNr       uint64 `json:"seq_nr"`
-	Version     uint64 `json:"version"`
-	Payload     []byte `json:"payload"`
+// Store implements es.EventStore on top of DynamoDB.
+type Store struct {
+	client      Client
+	keyResolver *keyresolver.Resolver
+	config      Config
+}
+
+// New creates a new Store.
+func New(client Client, config Config) *Store {
+	return &Store{
+		client:      client,
+		keyResolver: keyresolver.New(keyresolver.Config{ShardCount: config.ShardCount}),
+		config:      config,
+	}
+}
+
+// DynamoDB attribute names.
+const (
+	colPKey        = "pkey"
+	colSKey        = "skey"
+	colAid         = "aid"
+	colSeqNr       = "seq_nr"
+	colPayload     = "payload"
+	colOccurred    = "occurred_at"
+	colTypeName    = "type_name"
+	colEventID     = "event_id"
+	colIsCreated   = "is_created"
+	colVersion     = "version"
+	colTraceparent = "traceparent"
+	colTracestate  = "tracestate"
+)
+
+// Compile-time interface assertion.
+var _ es.EventStore = (*Store)(nil)
+
+// Method bodies are added in subsequent tasks.
+func (s *Store) GetLatestSnapshot(_ context.Context, _ es.AggregateID) (*es.SnapshotEnvelope, error) {
+	panic("not implemented")
+}
+func (s *Store) GetEventsSince(_ context.Context, _ es.AggregateID, _ uint64) ([]*es.EventEnvelope, error) {
+	panic("not implemented")
+}
+func (s *Store) PersistEvent(_ context.Context, _ *es.EventEnvelope, _ uint64) error {
+	panic("not implemented")
+}
+func (s *Store) PersistEventAndSnapshot(_ context.Context, _ *es.EventEnvelope, _ *es.SnapshotEnvelope) error {
+	panic("not implemented")
 }
 ```
 
-`v2/internal/envelope/envelope_test.go` も上記 API 変更に追従。
+- [ ] **Step 3: コンパイル確認**
 
-- [ ] **Step 3: テスト実行**
-
-Run: `cd v2 && go test ./internal/envelope/... -v`
-Expected: PASS
+Run: `cd v2 && go build ./...`
+Expected: エラーなし
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add v2/internal/envelope/
-git commit -m "feat(v2): port internal/envelope"
+git add v2/go.mod v2/go.sum v2/dynamodb/store.go
+git commit -m "feat(v2/dynamodb): add Store skeleton with deps"
 ```
 
 ---
 
-## Phase 8: dynamodb store 移植 + シグネチャ変更対応
-
-### Task 18: dynamodb.Store の skeleton と依存追加
+### Task 22: dynamodb.Store.PersistEvent + GetEventsSince + GetLatestSnapshot
 
 **Files:**
-- Modify: `v2/go.mod`
-- Create: `v2/dynamodb/store.go` (skeleton 部分のみ)
+- Modify: `v2/dynamodb/store.go`
+- Create: `v2/dynamodb/store_test.go`
 
-- [ ] **Step 1: 依存追加**
+DynamoDB の attribute marshalling は v1 を参考にしながら、新しい `EventEnvelope` / `SnapshotEnvelope` に合わせる。テストは fake Client を使う（実 DynamoDB は CI 外）。
 
-```bash
-cd v2 && go get github.com/aws/aws-sdk-go-v2 \
-  github.com/aws/aws-sdk-go-v2/service/dynamodb \
-  go.opentelemetry.io/otel
-```
+- [ ] **Step 1: Fake client + PersistEvent テストを書く**
 
-- [ ] **Step 2: v1 から store.go をコピー**
-
-```bash
-cp /Users/sakemihiroshi/develop/terrat/eventstore/dynamodb/store.go \
-   /Users/sakemihiroshi/develop/terrat/eventstore/v2/dynamodb/store.go
-```
-
-- [ ] **Step 3: v2 用に修正**
-
-`v2/dynamodb/store.go` のヘッダ部:
+`v2/dynamodb/store_test.go`:
 ```go
-// Package dynamodb provides a DynamoDB-backed EventStore implementation (v2).
-package dynamodb
+package dynamodb_test
 
+import (
+	"context"
+	"testing"
+	"time"
+
+	awssdk "github.com/aws/aws-sdk-go-v2/aws"
+	ddb "github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
+	es "github.com/Hiroshi0900/eventstore/v2"
+	v2ddb "github.com/Hiroshi0900/eventstore/v2/dynamodb"
+)
+
+// fakeClient records the last received PutItem / TransactWriteItems call.
+type fakeClient struct {
+	lastPut   *ddb.PutItemInput
+	lastTrans *ddb.TransactWriteItemsInput
+	getResp   *ddb.GetItemOutput
+	queryResp *ddb.QueryOutput
+	putErr    error
+	transErr  error
+}
+
+func (f *fakeClient) GetItem(_ context.Context, _ *ddb.GetItemInput, _ ...func(*ddb.Options)) (*ddb.GetItemOutput, error) {
+	if f.getResp == nil {
+		return &ddb.GetItemOutput{}, nil
+	}
+	return f.getResp, nil
+}
+func (f *fakeClient) Query(_ context.Context, _ *ddb.QueryInput, _ ...func(*ddb.Options)) (*ddb.QueryOutput, error) {
+	if f.queryResp == nil {
+		return &ddb.QueryOutput{}, nil
+	}
+	return f.queryResp, nil
+}
+func (f *fakeClient) PutItem(_ context.Context, in *ddb.PutItemInput, _ ...func(*ddb.Options)) (*ddb.PutItemOutput, error) {
+	f.lastPut = in
+	return &ddb.PutItemOutput{}, f.putErr
+}
+func (f *fakeClient) TransactWriteItems(_ context.Context, in *ddb.TransactWriteItemsInput, _ ...func(*ddb.Options)) (*ddb.TransactWriteItemsOutput, error) {
+	f.lastTrans = in
+	return &ddb.TransactWriteItemsOutput{}, f.transErr
+}
+
+func TestStore_PersistEvent_writesPutItem(t *testing.T) {
+	c := &fakeClient{}
+	store := v2ddb.New(c, v2ddb.DefaultConfig())
+	id := es.NewAggregateID("Visit", "x")
+
+	ev := &es.EventEnvelope{
+		EventID:       "ev-1",
+		EventTypeName: "Test",
+		AggregateID:   id,
+		SeqNr:         1,
+		IsCreated:     true,
+		OccurredAt:    time.Date(2026, 4, 27, 0, 0, 0, 0, time.UTC),
+		Payload:       []byte(`{"k":"v"}`),
+	}
+
+	if err := store.PersistEvent(context.Background(), ev, 0); err != nil {
+		t.Fatalf("PersistEvent: %v", err)
+	}
+	if c.lastPut == nil {
+		t.Fatalf("PutItem not called")
+	}
+	if got := awssdk.ToString(c.lastPut.TableName); got != "journal" {
+		t.Errorf("TableName: got %q, want %q", got, "journal")
+	}
+	if _, ok := c.lastPut.Item["pkey"].(*types.AttributeValueMemberS); !ok {
+		t.Errorf("pkey attribute missing or wrong type")
+	}
+	if _, ok := c.lastPut.Item["skey"].(*types.AttributeValueMemberS); !ok {
+		t.Errorf("skey attribute missing or wrong type")
+	}
+	if v, ok := c.lastPut.Item["seq_nr"].(*types.AttributeValueMemberN); !ok || v.Value != "1" {
+		t.Errorf("seq_nr attribute mismatch: %+v", c.lastPut.Item["seq_nr"])
+	}
+}
+```
+
+- [ ] **Step 2: テスト失敗を確認**
+
+Run: `cd v2 && go test ./dynamodb/...`
+Expected: panic("not implemented")
+
+- [ ] **Step 3: PersistEvent + Get* を実装**
+
+`v2/dynamodb/store.go` のメソッド実装を追記（`panic` を置き換え）：
+```go
 import (
 	"context"
 	"errors"
@@ -1894,7 +2469,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
+	awssdk "github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"go.opentelemetry.io/otel"
@@ -1905,326 +2480,579 @@ import (
 )
 ```
 
-メソッド名変更を全体に適用:
-- `id.GetTypeName()` → `id.TypeName()`
-- `id.GetValue()` → `id.Value()`
-- `event.GetID()` → `event.EventID()`
-- `event.GetTypeName()` → `event.EventTypeName()`
-- `event.GetAggregateId()` → `event.AggregateID()`
-- `event.GetSeqNr()` → `event.SeqNr()`
-- `event.GetPayload()` → `event.Payload()`
-- `event.GetOccurredAt()` → `event.OccurredAt().UnixMilli()` （`uint64` → `time.Time` 化に対応）
-- `aggregate.GetVersion()` → `aggregate.Version()`
-- `es.NewEvent(...)` の `WithOccurredAtUnixMilli(occurredAt)` を `WithOccurredAt(time.UnixMilli(int64(occurredAt)))` に置換
+(import セクションは file 先頭に統合)
 
-- [ ] **Step 4: ビルド確認**
-
-Run: `cd v2 && go build ./dynamodb/...`
-Expected: コンパイル成功（`PersistEventAndSnapshot` の signature mismatch エラーが出る → 次タスクで修正）
-
-NOTE: 一旦コンパイルエラーが残ってもこのタスクではここまでとし、Task 19 で signature 変更を完成させる。
-
-- [ ] **Step 5: ビルド失敗が PersistEventAndSnapshot シグネチャ問題に絞られていることを確認した上で commit**
-
-```bash
-git add v2/go.mod v2/go.sum v2/dynamodb/store.go
-git commit -m "feat(v2/dynamodb): port store skeleton, method names updated"
-```
-
----
-
-### Task 19: dynamodb.Store.PersistEventAndSnapshot シグネチャ変更
-
-**Files:**
-- Modify: `v2/dynamodb/store.go`
-
-- [ ] **Step 1: シグネチャを `(ctx, event, snapshot SnapshotData)` に変更**
-
-`v2/dynamodb/store.go` 内の `PersistEventAndSnapshot` メソッドを以下に置換:
 ```go
-// PersistEventAndSnapshot atomically persists an event and a snapshot.
-// snapshot.Payload は呼び出し側 (Repository) が事前に作成済みであることを期待する。
-func (s *Store) PersistEventAndSnapshot(ctx context.Context, event es.Event, snapshot es.SnapshotData) error {
-	eventKeys := s.keyResolver.ResolveEventKeys(event.AggregateID(), event.SeqNr())
-	snapshotKeys := s.keyResolver.ResolveSnapshotKeys(event.AggregateID())
-
-	eventItem, err := s.marshalEvent(ctx, event, eventKeys)
-	if err != nil {
-		return err
-	}
-
-	snapshotItem := s.marshalSnapshot(snapshot, snapshotKeys)
-
-	expectedVersion := snapshot.Version - 1 // 期待する現状 version
-
-	transactItems := []types.TransactWriteItem{
-		{
-			Put: &types.Put{
-				TableName:           aws.String(s.config.JournalTableName),
-				Item:                eventItem,
-				ConditionExpression: aws.String("attribute_not_exists(#pk)"),
-				ExpressionAttributeNames: map[string]string{"#pk": colPKey},
-			},
+// GetLatestSnapshot returns the latest snapshot or nil.
+func (s *Store) GetLatestSnapshot(ctx context.Context, id es.AggregateID) (*es.SnapshotEnvelope, error) {
+	keys := s.keyResolver.ResolveSnapshotKeys(id)
+	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: awssdk.String(s.config.SnapshotTableName),
+		Key: map[string]types.AttributeValue{
+			colPKey: &types.AttributeValueMemberS{Value: keys.PartitionKey},
+			colSKey: &types.AttributeValueMemberS{Value: keys.SortKey},
 		},
-	}
-
-	if expectedVersion == 0 {
-		// 初回: snapshot 行が存在しないことを condition に
-		transactItems = append(transactItems, types.TransactWriteItem{
-			Put: &types.Put{
-				TableName:           aws.String(s.config.SnapshotTableName),
-				Item:                snapshotItem,
-				ConditionExpression: aws.String("attribute_not_exists(#pk)"),
-				ExpressionAttributeNames: map[string]string{"#pk": colPKey},
-			},
-		})
-	} else {
-		transactItems = append(transactItems, types.TransactWriteItem{
-			Put: &types.Put{
-				TableName:           aws.String(s.config.SnapshotTableName),
-				Item:                snapshotItem,
-				ConditionExpression: aws.String("#version = :expected_version"),
-				ExpressionAttributeNames: map[string]string{"#version": colVersion},
-				ExpressionAttributeValues: map[string]types.AttributeValue{
-					":expected_version": &types.AttributeValueMemberN{Value: strconv.FormatUint(expectedVersion, 10)},
-				},
-			},
-		})
-	}
-
-	_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
-		TransactItems: transactItems,
 	})
 	if err != nil {
-		if isTransactionCanceledDueToCondition(err) {
-			return es.NewOptimisticLockError(
-				event.AggregateID().AsString(),
-				expectedVersion,
-				0, // 実際の version は不明
-			)
+		return nil, fmt.Errorf("get snapshot: %w", err)
+	}
+	if out.Item == nil {
+		return nil, nil
+	}
+	return s.unmarshalSnapshot(out.Item)
+}
+
+// GetEventsSince queries the journal GSI for events with SeqNr > seqNr.
+func (s *Store) GetEventsSince(ctx context.Context, id es.AggregateID, seqNr uint64) ([]*es.EventEnvelope, error) {
+	aidKey := s.keyResolver.ResolveAggregateIDKey(id)
+	out, err := s.client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              awssdk.String(s.config.JournalTableName),
+		IndexName:              awssdk.String(s.config.JournalGSIName),
+		KeyConditionExpression: awssdk.String("#aid = :aid AND #seq_nr > :seq_nr"),
+		ExpressionAttributeNames: map[string]string{
+			"#aid":    colAid,
+			"#seq_nr": colSeqNr,
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":aid":    &types.AttributeValueMemberS{Value: aidKey},
+			":seq_nr": &types.AttributeValueMemberN{Value: strconv.FormatUint(seqNr, 10)},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("query events: %w", err)
+	}
+	envs := make([]*es.EventEnvelope, 0, len(out.Items))
+	for _, item := range out.Items {
+		ev, err := s.unmarshalEvent(item)
+		if err != nil {
+			return nil, err
 		}
-		return fmt.Errorf("failed to persist event and snapshot: %w", err)
+		envs = append(envs, ev)
+	}
+	return envs, nil
+}
+
+// PersistEvent writes a single event without snapshot. Uses ConditionExpression
+// to reject duplicate (pkey, skey).
+func (s *Store) PersistEvent(ctx context.Context, ev *es.EventEnvelope, expectedVersion uint64) error {
+	item := s.marshalEvent(ctx, ev)
+	_, err := s.client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName:           awssdk.String(s.config.JournalTableName),
+		Item:                item,
+		ConditionExpression: awssdk.String("attribute_not_exists(#pkey)"),
+		ExpressionAttributeNames: map[string]string{
+			"#pkey": colPKey,
+		},
+	})
+	if err != nil {
+		var ccfe *types.ConditionalCheckFailedException
+		if errors.As(err, &ccfe) {
+			return es.NewDuplicateAggregateError(ev.AggregateID.AsString())
+		}
+		return fmt.Errorf("put event: %w", err)
+	}
+	_ = expectedVersion // not used for non-snapshot writes
+	return nil
+}
+
+// PersistEventAndSnapshot writes both atomically using TransactWriteItems.
+// The snapshot put has a Version condition for optimistic locking.
+func (s *Store) PersistEventAndSnapshot(ctx context.Context, ev *es.EventEnvelope, snap *es.SnapshotEnvelope) error {
+	eventItem := s.marshalEvent(ctx, ev)
+	snapshotItem := s.marshalSnapshot(snap)
+
+	expected := snap.Version - 1
+	condExpr := "attribute_not_exists(#version) OR #version = :expected"
+	if expected == 0 {
+		condExpr = "attribute_not_exists(#version)"
+	}
+
+	_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []types.TransactWriteItem{
+			{
+				Put: &types.Put{
+					TableName:           awssdk.String(s.config.JournalTableName),
+					Item:                eventItem,
+					ConditionExpression: awssdk.String("attribute_not_exists(#pkey)"),
+					ExpressionAttributeNames: map[string]string{
+						"#pkey": colPKey,
+					},
+				},
+			},
+			{
+				Put: &types.Put{
+					TableName:           awssdk.String(s.config.SnapshotTableName),
+					Item:                snapshotItem,
+					ConditionExpression: awssdk.String(condExpr),
+					ExpressionAttributeNames: map[string]string{
+						"#version": colVersion,
+					},
+					ExpressionAttributeValues: condValues(expected),
+				},
+			},
+		},
+	})
+	if err != nil {
+		var tce *types.TransactionCanceledException
+		if errors.As(err, &tce) {
+			return es.NewOptimisticLockError(ev.AggregateID.AsString(), expected, 0)
+		}
+		return fmt.Errorf("transact write: %w", err)
 	}
 	return nil
 }
-```
 
-- [ ] **Step 2: marshalSnapshot を SnapshotData ベースに変更**
-
-`v2/dynamodb/store.go` 内の `marshalSnapshot` メソッドを以下に置換:
-```go
-// marshalSnapshot marshals SnapshotData into a DynamoDB item.
-func (s *Store) marshalSnapshot(snapshot es.SnapshotData, keys keyresolver.KeyComponents) map[string]types.AttributeValue {
-	return map[string]types.AttributeValue{
-		colPKey:    &types.AttributeValueMemberS{Value: keys.PartitionKey},
-		colSKey:    &types.AttributeValueMemberS{Value: keys.SortKey},
-		colAid:     &types.AttributeValueMemberS{Value: keys.AggregateIDKey},
-		colSeqNr:   &types.AttributeValueMemberN{Value: strconv.FormatUint(snapshot.SeqNr, 10)},
-		colVersion: &types.AttributeValueMemberN{Value: strconv.FormatUint(snapshot.Version, 10)},
-		colPayload: &types.AttributeValueMemberB{Value: snapshot.Payload},
+func condValues(expected uint64) map[string]types.AttributeValue {
+	if expected == 0 {
+		return nil
 	}
+	return map[string]types.AttributeValue{
+		":expected": &types.AttributeValueMemberN{Value: strconv.FormatUint(expected, 10)},
+	}
+}
+
+// --- attribute marshal / unmarshal ---
+
+func (s *Store) marshalEvent(ctx context.Context, ev *es.EventEnvelope) map[string]types.AttributeValue {
+	keys := s.keyResolver.ResolveEventKeys(ev.AggregateID, ev.SeqNr)
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+
+	item := map[string]types.AttributeValue{
+		colPKey:      &types.AttributeValueMemberS{Value: keys.PartitionKey},
+		colSKey:      &types.AttributeValueMemberS{Value: keys.SortKey},
+		colAid:       &types.AttributeValueMemberS{Value: keys.AggregateIDKey},
+		colSeqNr:     &types.AttributeValueMemberN{Value: strconv.FormatUint(ev.SeqNr, 10)},
+		colPayload:   &types.AttributeValueMemberB{Value: ev.Payload},
+		colOccurred:  &types.AttributeValueMemberN{Value: strconv.FormatInt(ev.OccurredAt.UnixMilli(), 10)},
+		colTypeName:  &types.AttributeValueMemberS{Value: ev.EventTypeName},
+		colEventID:   &types.AttributeValueMemberS{Value: ev.EventID},
+		colIsCreated: &types.AttributeValueMemberBOOL{Value: ev.IsCreated},
+	}
+	if tp := carrier.Get("traceparent"); tp != "" {
+		item[colTraceparent] = &types.AttributeValueMemberS{Value: tp}
+	}
+	if ts := carrier.Get("tracestate"); ts != "" {
+		item[colTracestate] = &types.AttributeValueMemberS{Value: ts}
+	}
+	return item
+}
+
+func (s *Store) marshalSnapshot(snap *es.SnapshotEnvelope) map[string]types.AttributeValue {
+	keys := s.keyResolver.ResolveSnapshotKeys(snap.AggregateID)
+	return map[string]types.AttributeValue{
+		colPKey:     &types.AttributeValueMemberS{Value: keys.PartitionKey},
+		colSKey:     &types.AttributeValueMemberS{Value: keys.SortKey},
+		colAid:      &types.AttributeValueMemberS{Value: keys.AggregateIDKey},
+		colSeqNr:    &types.AttributeValueMemberN{Value: strconv.FormatUint(snap.SeqNr, 10)},
+		colVersion:  &types.AttributeValueMemberN{Value: strconv.FormatUint(snap.Version, 10)},
+		colPayload:  &types.AttributeValueMemberB{Value: snap.Payload},
+		colOccurred: &types.AttributeValueMemberN{Value: strconv.FormatInt(snap.OccurredAt.UnixMilli(), 10)},
+	}
+}
+
+func (s *Store) unmarshalEvent(item map[string]types.AttributeValue) (*es.EventEnvelope, error) {
+	aidStr, _ := getS(item, colAid)
+	id, err := parseAggregateIDKey(aidStr)
+	if err != nil {
+		return nil, err
+	}
+	seqNr, err := getN(item, colSeqNr)
+	if err != nil {
+		return nil, err
+	}
+	occurred, err := getN(item, colOccurred)
+	if err != nil {
+		return nil, err
+	}
+	payload, _ := getB(item, colPayload)
+	typeName, _ := getS(item, colTypeName)
+	eventID, _ := getS(item, colEventID)
+	isCreated, _ := getBool(item, colIsCreated)
+	traceparent, _ := getS(item, colTraceparent)
+	tracestate, _ := getS(item, colTracestate)
+
+	return &es.EventEnvelope{
+		EventID:       eventID,
+		EventTypeName: typeName,
+		AggregateID:   id,
+		SeqNr:         seqNr,
+		IsCreated:     isCreated,
+		// #nosec G115 -- UnixMilli timestamp fits within int64 for any realistic value
+		OccurredAt:  time.UnixMilli(int64(occurred)).UTC(),
+		Payload:     payload,
+		TraceParent: traceparent,
+		TraceState:  tracestate,
+	}, nil
+}
+
+func (s *Store) unmarshalSnapshot(item map[string]types.AttributeValue) (*es.SnapshotEnvelope, error) {
+	aidStr, _ := getS(item, colAid)
+	id, err := parseAggregateIDKey(aidStr)
+	if err != nil {
+		return nil, err
+	}
+	seqNr, err := getN(item, colSeqNr)
+	if err != nil {
+		return nil, err
+	}
+	version, err := getN(item, colVersion)
+	if err != nil {
+		return nil, err
+	}
+	payload, _ := getB(item, colPayload)
+	occurred, _ := getN(item, colOccurred)
+
+	return &es.SnapshotEnvelope{
+		AggregateID: id,
+		SeqNr:       seqNr,
+		Version:     version,
+		Payload:     payload,
+		// #nosec G115
+		OccurredAt: time.UnixMilli(int64(occurred)).UTC(),
+	}, nil
+}
+
+// --- low-level helpers ---
+
+func getS(item map[string]types.AttributeValue, key string) (string, bool) {
+	v, ok := item[key].(*types.AttributeValueMemberS)
+	if !ok {
+		return "", false
+	}
+	return v.Value, true
+}
+func getB(item map[string]types.AttributeValue, key string) ([]byte, bool) {
+	v, ok := item[key].(*types.AttributeValueMemberB)
+	if !ok {
+		return nil, false
+	}
+	return v.Value, true
+}
+func getBool(item map[string]types.AttributeValue, key string) (bool, bool) {
+	v, ok := item[key].(*types.AttributeValueMemberBOOL)
+	if !ok {
+		return false, false
+	}
+	return v.Value, true
+}
+func getN(item map[string]types.AttributeValue, key string) (uint64, error) {
+	v, ok := item[key].(*types.AttributeValueMemberN)
+	if !ok {
+		return 0, fmt.Errorf("attribute %s missing or wrong type", key)
+	}
+	n, err := strconv.ParseUint(v.Value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("attribute %s parse: %w", key, err)
+	}
+	return n, nil
+}
+
+// parseAggregateIDKey reverses Resolver.ResolveAggregateIDKey == "{TypeName}-{Value}".
+// We split on the first dash; aggregate IDs may legitimately contain dashes
+// (e.g., ULIDs), so use the prefix only as type discriminator.
+func parseAggregateIDKey(s string) (es.AggregateID, error) {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '-' {
+			return es.NewAggregateID(s[:i], s[i+1:]), nil
+		}
+	}
+	return nil, fmt.Errorf("invalid aggregate id key: %q", s)
 }
 ```
 
-- [ ] **Step 3: ビルド確認**
+- [ ] **Step 4: テスト合格を確認**
 
-Run: `cd v2 && go build ./...`
-Expected: コンパイル成功
+Run: `cd v2 && go test ./dynamodb/...`
+Expected: PASS
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add v2/dynamodb/store.go
-git commit -m "feat(v2/dynamodb): change PersistEventAndSnapshot signature to use SnapshotData"
+git add v2/dynamodb/store.go v2/dynamodb/store_test.go
+git commit -m "feat(v2/dynamodb): implement PersistEvent + queries + (un)marshal helpers"
 ```
 
 ---
 
-### Task 20: dynamodb.Store の最低限のテスト（モック使用）
+### Task 23: dynamodb.Store.PersistEventAndSnapshot のテスト追加
 
 **Files:**
-- Create: `v2/dynamodb/store_test.go`
+- Modify: `v2/dynamodb/store_test.go`
 
-- [ ] **Step 1: フェイク Client を作って構築のみテスト**
+PersistEventAndSnapshot 本体は前タスクで実装済み。本タスクでは TransactWriteItems が期待通り組み立てられることを確認するテストのみ追加。
 
-`v2/dynamodb/store_test.go`:
+- [ ] **Step 1: テストを追加**
+
+`v2/dynamodb/store_test.go` の末尾に追記：
 ```go
-package dynamodb
+func TestStore_PersistEventAndSnapshot_initialWriteUsesAttributeNotExists(t *testing.T) {
+	c := &fakeClient{}
+	store := v2ddb.New(c, v2ddb.DefaultConfig())
+	id := es.NewAggregateID("Visit", "x")
+	ev := &es.EventEnvelope{
+		EventID:       "ev-2",
+		EventTypeName: "Test",
+		AggregateID:   id,
+		SeqNr:         5,
+		IsCreated:     false,
+		OccurredAt:    time.Now().UTC(),
+		Payload:       []byte(`{}`),
+	}
+	snap := &es.SnapshotEnvelope{
+		AggregateID: id,
+		SeqNr:       5,
+		Version:     1,
+		Payload:     []byte(`{"state":"x"}`),
+		OccurredAt:  time.Now().UTC(),
+	}
 
-import (
-	"context"
-	"testing"
-
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-)
-
-type fakeClient struct {
-	getItem            func(ctx context.Context, in *dynamodb.GetItemInput, opts ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error)
-	query              func(ctx context.Context, in *dynamodb.QueryInput, opts ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error)
-	putItem            func(ctx context.Context, in *dynamodb.PutItemInput, opts ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
-	transactWriteItems func(ctx context.Context, in *dynamodb.TransactWriteItemsInput, opts ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error)
-	createTable        func(ctx context.Context, in *dynamodb.CreateTableInput, opts ...func(*dynamodb.Options)) (*dynamodb.CreateTableOutput, error)
-	describeTable      func(ctx context.Context, in *dynamodb.DescribeTableInput, opts ...func(*dynamodb.Options)) (*dynamodb.DescribeTableOutput, error)
-}
-
-func (f *fakeClient) GetItem(ctx context.Context, in *dynamodb.GetItemInput, opts ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
-	if f.getItem != nil { return f.getItem(ctx, in, opts...) }
-	return &dynamodb.GetItemOutput{}, nil
-}
-func (f *fakeClient) Query(ctx context.Context, in *dynamodb.QueryInput, opts ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error) {
-	if f.query != nil { return f.query(ctx, in, opts...) }
-	return &dynamodb.QueryOutput{}, nil
-}
-func (f *fakeClient) PutItem(ctx context.Context, in *dynamodb.PutItemInput, opts ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error) {
-	if f.putItem != nil { return f.putItem(ctx, in, opts...) }
-	return &dynamodb.PutItemOutput{}, nil
-}
-func (f *fakeClient) TransactWriteItems(ctx context.Context, in *dynamodb.TransactWriteItemsInput, opts ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error) {
-	if f.transactWriteItems != nil { return f.transactWriteItems(ctx, in, opts...) }
-	return &dynamodb.TransactWriteItemsOutput{}, nil
-}
-func (f *fakeClient) CreateTable(ctx context.Context, in *dynamodb.CreateTableInput, opts ...func(*dynamodb.Options)) (*dynamodb.CreateTableOutput, error) {
-	if f.createTable != nil { return f.createTable(ctx, in, opts...) }
-	return &dynamodb.CreateTableOutput{}, nil
-}
-func (f *fakeClient) DescribeTable(ctx context.Context, in *dynamodb.DescribeTableInput, opts ...func(*dynamodb.Options)) (*dynamodb.DescribeTableOutput, error) {
-	if f.describeTable != nil { return f.describeTable(ctx, in, opts...) }
-	return &dynamodb.DescribeTableOutput{}, nil
+	if err := store.PersistEventAndSnapshot(context.Background(), ev, snap); err != nil {
+		t.Fatalf("PersistEventAndSnapshot: %v", err)
+	}
+	if c.lastTrans == nil {
+		t.Fatalf("TransactWriteItems not called")
+	}
+	if len(c.lastTrans.TransactItems) != 2 {
+		t.Errorf("TransactItems count: got %d, want 2", len(c.lastTrans.TransactItems))
+	}
+	snapPut := c.lastTrans.TransactItems[1].Put
+	if snapPut == nil {
+		t.Fatalf("snapshot put is nil")
+	}
+	if got := awssdk.ToString(snapPut.ConditionExpression); got != "attribute_not_exists(#version)" {
+		t.Errorf("initial-write ConditionExpression: got %q, want %q",
+			got, "attribute_not_exists(#version)")
+	}
 }
 
-func TestNew_Construct(t *testing.T) {
-	s := New(&fakeClient{}, DefaultConfig())
-	if s == nil {
-		t.Fatal("nil store")
+func TestStore_PersistEventAndSnapshot_subsequentWriteUsesVersionCondition(t *testing.T) {
+	c := &fakeClient{}
+	store := v2ddb.New(c, v2ddb.DefaultConfig())
+	id := es.NewAggregateID("Visit", "x")
+	ev := &es.EventEnvelope{
+		EventID:     "ev-3",
+		AggregateID: id,
+		SeqNr:       10,
+		OccurredAt:  time.Now().UTC(),
+		Payload:     []byte(`{}`),
+	}
+	snap := &es.SnapshotEnvelope{
+		AggregateID: id,
+		SeqNr:       10,
+		Version:     3, // expected = 2
+		Payload:     []byte(`{}`),
+		OccurredAt:  time.Now().UTC(),
+	}
+
+	if err := store.PersistEventAndSnapshot(context.Background(), ev, snap); err != nil {
+		t.Fatalf("PersistEventAndSnapshot: %v", err)
+	}
+	snapPut := c.lastTrans.TransactItems[1].Put
+	got := awssdk.ToString(snapPut.ConditionExpression)
+	want := "attribute_not_exists(#version) OR #version = :expected"
+	if got != want {
+		t.Errorf("subsequent-write ConditionExpression: got %q, want %q", got, want)
+	}
+	expected, ok := snapPut.ExpressionAttributeValues[":expected"].(*types.AttributeValueMemberN)
+	if !ok || expected.Value != "2" {
+		t.Errorf(":expected value: got %+v, want N=2", snapPut.ExpressionAttributeValues[":expected"])
 	}
 }
 ```
 
-- [ ] **Step 2: テスト実行**
+- [ ] **Step 2: テスト合格を確認**
 
-Run: `cd v2 && go test ./dynamodb/... -v`
+Run: `cd v2 && go test ./dynamodb/...`
 Expected: PASS
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add v2/dynamodb/store_test.go
-git commit -m "test(v2/dynamodb): add construction smoke test with fake client"
+git commit -m "test(v2/dynamodb): cover PersistEventAndSnapshot condition expressions"
 ```
-
-NOTE: 完全な DynamoDB integration test は別途 dynamodb-local を使った integration スイートで対応。本計画では skeleton + 単体ロジックの確認に留める。
 
 ---
 
-## Phase 9: v1 を Deprecated 化
-
-### Task 21: v1 公開シンボルに Deprecated コメント追加
+### Task 24: dynamodb.Store.GetEventsSince の unmarshal を確認
 
 **Files:**
-- Modify: `types.go`
-- Modify: `event_store.go`
-- Modify: `errors.go`
-- Modify: `serializer.go`
-- Modify: `memory/store.go`
-- Modify: `dynamodb/store.go`
+- Modify: `v2/dynamodb/store_test.go`
 
-- [ ] **Step 1: types.go の各公開型/関数に Deprecated コメント追記**
+- [ ] **Step 1: テストを追加**
 
-`types.go` の各公開シンボル（`AggregateID`, `DefaultAggregateID`, `NewAggregateId`, `Event`, `EventOption`, `WithSeqNr`, `WithIsCreated`, `WithOccurredAt`, `WithOccurredAtUnixMilli`, `DefaultEvent`, `NewEvent`, `Aggregate`, `AggregateResult`, `SnapshotData`）の doc コメント末尾に下記を追加。例：
-
+`v2/dynamodb/store_test.go` の末尾に追記：
 ```go
-// AggregateID represents the unique identifier of an aggregate.
-// ...
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-type AggregateID interface {
-	...
+func TestStore_GetEventsSince_unmarshalsCorrectly(t *testing.T) {
+	c := &fakeClient{
+		queryResp: &ddb.QueryOutput{
+			Items: []map[string]types.AttributeValue{
+				{
+					"pkey":        &types.AttributeValueMemberS{Value: "Visit-0"},
+					"skey":        &types.AttributeValueMemberS{Value: "Visit-x-00000000000000000001"},
+					"aid":         &types.AttributeValueMemberS{Value: "Visit-x"},
+					"seq_nr":      &types.AttributeValueMemberN{Value: "1"},
+					"payload":     &types.AttributeValueMemberB{Value: []byte(`{"k":"v"}`)},
+					"occurred_at": &types.AttributeValueMemberN{Value: "1700000000000"},
+					"type_name":   &types.AttributeValueMemberS{Value: "VisitScheduled"},
+					"event_id":    &types.AttributeValueMemberS{Value: "ev-1"},
+					"is_created":  &types.AttributeValueMemberBOOL{Value: true},
+				},
+			},
+		},
+	}
+	store := v2ddb.New(c, v2ddb.DefaultConfig())
+	id := es.NewAggregateID("Visit", "x")
+
+	envs, err := store.GetEventsSince(context.Background(), id, 0)
+	if err != nil {
+		t.Fatalf("GetEventsSince: %v", err)
+	}
+	if len(envs) != 1 {
+		t.Fatalf("len: got %d, want 1", len(envs))
+	}
+	got := envs[0]
+	if got.SeqNr != 1 || got.EventID != "ev-1" || got.EventTypeName != "VisitScheduled" || !got.IsCreated {
+		t.Errorf("envelope mismatch: %+v", got)
+	}
+	if got.AggregateID.AsString() != "Visit-x" {
+		t.Errorf("AggregateID: got %q, want Visit-x", got.AggregateID.AsString())
+	}
+	if string(got.Payload) != `{"k":"v"}` {
+		t.Errorf("Payload: got %q, want %q", got.Payload, `{"k":"v"}`)
+	}
 }
 ```
 
-同様に他の公開シンボルにも追記。
+- [ ] **Step 2: テスト合格を確認**
 
-- [ ] **Step 2: 同じ作業を残りのファイルにも適用**
+Run: `cd v2 && go test ./dynamodb/...`
+Expected: PASS
 
-`event_store.go`, `errors.go`, `serializer.go`, `memory/store.go`, `dynamodb/store.go` の公開シンボルに同じコメント。
-
-- [ ] **Step 3: ビルド・テスト実行**
-
-Run: `go build ./... && go test ./...`
-Expected: PASS（v1 のテストはそのまま動作）
-
-- [ ] **Step 4: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
-git add types.go event_store.go errors.go serializer.go memory/store.go dynamodb/store.go
-git commit -m "deprecate(v1): mark all public symbols as Deprecated, point to v2"
+git add v2/dynamodb/store_test.go
+git commit -m "test(v2/dynamodb): cover GetEventsSince unmarshal"
 ```
 
 ---
 
-## Phase 10: ドキュメント
+## Phase 12: v1 Deprecation
 
-### Task 22: README に v2 セクション追加
+### Task 25: v1 の公開シンボルに Deprecated コメント追加
+
+**Files:**
+- Modify: `types.go`, `event_store.go`, `errors.go`, `serializer.go`, `memory/store.go`, `dynamodb/store.go`
+
+v1 は API 非破壊で残す。利用者を v2 に誘導するため Deprecated コメントを各公開シンボルに追加。
+
+- [ ] **Step 1: types.go の各公開型に追加**
+
+`types.go` の `AggregateID`, `DefaultAggregateID`, `Event`, `DefaultEvent`, `Aggregate`, `AggregateResult`, `SnapshotData`, `NewAggregateId`, `NewEvent`, `EventOption`, `WithSeqNr`, `WithIsCreated`, `WithOccurredAt`, `WithOccurredAtUnixMilli` の **doc コメント先頭** に：
+
+```go
+// Deprecated: use github.com/Hiroshi0900/eventstore/v2 instead.
+```
+
+例：
+```go
+// AggregateID represents the unique identifier of an aggregate.
+// It combines a type name (e.g. "MemorialSetting") with a unique value (e.g. a ULID).
+//
+// Deprecated: use github.com/Hiroshi0900/eventstore/v2 instead.
+type AggregateID interface {
+```
+
+- [ ] **Step 2: 同様に他のファイルにも追加**
+
+- `event_store.go`: `EventStore`, `EventStoreConfig`, `DefaultEventStoreConfig`, `Repository`, `AggregateFactory`, `DefaultRepository`, `NewRepository`
+- `errors.go`: 全 sentinel と error 構造体 + コンストラクタ
+- `serializer.go`: `Serializer`, `JSONSerializer`, `NewJSONSerializer`
+- `memory/store.go`: `Store`, `New`, 公開メソッド全部
+- `dynamodb/store.go`: `Store`, `Client`, `Config`, `DefaultConfig`, `New`, 公開メソッド全部
+
+- [ ] **Step 3: ビルド確認**
+
+Run: `go build ./...`
+Expected: エラーなし（コメントだけの変更）
+
+- [ ] **Step 4: 既存テストが通ることを確認**
+
+Run: `go test ./...`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add types.go event_store.go errors.go serializer.go memory/store.go dynamodb/store.go
+git commit -m "chore: deprecate v1 in favor of v2"
+```
+
+---
+
+## Phase 13: Documentation
+
+### Task 26: README に v2 セクション追加
 
 **Files:**
 - Modify: `README.md`
 
-- [ ] **Step 1: README に v2 セクション追記**
+- [ ] **Step 1: README の現状を確認**
 
-`README.md` の末尾（License の前）に以下のセクションを追加:
+```bash
+cat /Users/sakemihiroshi/develop/terrat/eventstore/README.md
+```
+
+- [ ] **Step 2: v2 セクションを追記**
+
+`README.md` の末尾に追記：
 
 ```markdown
 ## v2
 
-A redesigned API is available at `github.com/Hiroshi0900/eventstore/v2`. v2 introduces:
+v2 は `github.com/Hiroshi0900/eventstore/v2` サブモジュールとして提供されます。
+v1 のメタ情報がドメインに混在する課題を解消し、Aggregate / Event / Command を
+ビジネス情報のみのピュアな型として定義できます。
 
-- `Command` abstraction (`Repository.Store(ctx, cmd, agg)`)
-- `ApplyCommand` / `ApplyEvent` on the `Aggregate` interface
-- State Pattern support: `ApplyEvent(Event) Aggregate` returns interface, allowing transitions to a different concrete type
-- Removal of `AggregateFactory[T]` in favor of `createBlank` function + `AggregateSerializer[T]` interface
-- Method names without `Get` prefix (`AggregateID()`, `EventID()`, `SeqNr()`, etc.)
-
-v1 (this package root) remains available but is deprecated.
-
-### Quick start (v2)
+### Quick start
 
 ```go
 import (
     es "github.com/Hiroshi0900/eventstore/v2"
-    esmem "github.com/Hiroshi0900/eventstore/v2/memory"
+    "github.com/Hiroshi0900/eventstore/v2/memory"
 )
 
-// Define your domain interface and state types
-type Visit interface {
-    es.Aggregate
-    IsActive() bool
-}
+// 1. ドメイン側で Aggregate / Event / Command と Serializer を実装
+//    (詳細は docs/superpowers/specs/2026-04-26-eventstore-v2-design.md §7 参照)
 
-type VisitScheduled struct { /* ... */ }
-
-func (v VisitScheduled) AggregateID() es.AggregateID { /* ... */ }
-func (v VisitScheduled) ApplyCommand(cmd es.Command) (es.Event, error) { /* ... */ }
-func (v VisitScheduled) ApplyEvent(ev es.Event) es.Aggregate { /* ... */ }
-// ...
-
-// Construct repository
-store := esmem.New()
-repo := es.NewRepository[Visit](
+// 2. Repository を構築
+store := memory.New()
+repo := es.NewRepository[Visit, VisitEvent](
     store,
-    func(id es.AggregateID) Visit { return VisitScheduled{ /* ... */ } },
-    visitSerializer{},
+    func(id es.AggregateID) Visit { return EmptyVisit{id: id.(VisitID)} },
+    visitAggregateSerializer{},
+    visitEventSerializer{},
     es.DefaultConfig(),
 )
 
-// Use it
-visit, err := repo.Load(ctx, visitID)
-visit, err = repo.Store(ctx, RescheduleCommand{...}, visit)
+// 3. ユースケース層は aggID と Command を渡すだけ
+visit, err := repo.Save(ctx, visitID, ScheduleVisitCommand{ScheduledAt: t})
 ```
 
-See `docs/superpowers/specs/2026-04-26-eventstore-v2-design.md` for the full design.
+### v1 との主な違い
+
+- ドメイン側の Aggregate / Event / Command がメタ情報を持たない
+- ライブラリ側の `EventEnvelope` / `SnapshotEnvelope` がメタ情報を持つ
+- `Repository.Save(aggID, cmd)` で load → ApplyCommand → ApplyEvent → 永続化を一括
+- `AggregateFactory[T]` を廃止、`AggregateSerializer[T,E]` + `EventSerializer[E]` + `createBlank` 関数に分離
+- 状態別型 (state pattern) を `ApplyEvent(E) Aggregate[E]` で正式サポート
+
+詳細仕様: `docs/superpowers/specs/2026-04-26-eventstore-v2-design.md`
 ```
 
-- [ ] **Step 2: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
 git add README.md
@@ -2235,21 +3063,26 @@ git commit -m "docs: add v2 section to README"
 
 ## 完了チェックリスト
 
-すべてのタスクが完了した時点で以下を確認:
+実装完了の確認：
 
+- [ ] `cd v2 && go build ./...` がエラーなし
+- [ ] `cd v2 && go test ./...` が全 PASS
 - [ ] `cd v2 && go vet ./...` がエラーなし
-- [ ] `cd v2 && go test ./...` がすべて PASS
+- [ ] `go build ./...` (v1) がエラーなし
+- [ ] `go test ./...` (v1) が PASS
 - [ ] `go vet ./...` (v1) がエラーなし
-- [ ] `go test ./...` (v1) がすべて PASS
-- [ ] v1 の公開シンボル全てに `// Deprecated:` コメントあり (`grep -r "// Deprecated:" --include="*.go" .` で確認)
-- [ ] README.md に v2 セクションが存在
-- [ ] git log で各 Phase ごとに段階的にコミットされている
+- [ ] v1 の全公開シンボルに `// Deprecated:` コメントが付いている
+- [ ] README に v2 セクションがある
+- [ ] git log で各 Task が個別の commit になっている
 
 ---
 
 ## 注意事項
 
-- **v1 のコードは変更しない**（Deprecated コメント以外）。v1 のテストは既存のまま動作する必要がある
-- **v2 の internal package は v2 module の中だけで使う**。v1 の `internal/` を v2 から import してはいけない（モジュール境界を超えるため Go ビルダがエラーを出す）
-- **DynamoDB の integration test は本計画外**。dynamodb-local を使う E2E テストは別途追加する想定
-- **terrat-go-app の v2 移行は本計画外**。本計画完了後に別計画として着手する
+- **Go 1.25** のジェネリクスを前提（v1 と同じ）
+- **assertion ライブラリ非使用**：標準 `testing` のみ。`testify` 等は導入しない
+- **外部 ULID/UUID 依存なし**：`crypto/rand` + hex で代替
+- **v1 と v2 を同じパッケージ名 `eventsourcing` で揃える**：import パスの違いだけで混乱させない
+- **TDD 厳守**：テスト → 失敗確認 → 実装 → 合格確認 → コミット のサイクル
+- **小さい commit**：1 タスク 1 commit、メッセージは Conventional Commits（`feat(v2):`, `test(v2):`, `chore:`, `docs:` 等）
+- **terrat-go-app の v2 移行は別計画**：本計画は v2 ライブラリ単体の構築のみ
