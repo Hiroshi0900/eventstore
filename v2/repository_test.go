@@ -291,3 +291,58 @@ func TestRepository_LoadAfterSnapshot_usesSnapshot(t *testing.T) {
 		t.Errorf("count: got %d, want 8", got.count)
 	}
 }
+
+// lockFailingStore wraps memory.Store and always returns ErrOptimisticLock from
+// PersistEventAndSnapshot. Used to verify Repository.Save propagates store errors
+// transparently. The underlying optimistic lock semantics are exercised against
+// real concurrent writers in v2/memory/store_test.go.
+type lockFailingStore struct {
+	*memory.Store
+}
+
+func (s *lockFailingStore) PersistEventAndSnapshot(
+	_ context.Context,
+	ev *es.EventEnvelope,
+	_ *es.SnapshotEnvelope,
+) error {
+	return es.NewOptimisticLockError(ev.AggregateID.AsString(), 1, 99)
+}
+
+func TestRepository_Save_propagatesOptimisticLockError(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 1 // first Save triggers PersistEventAndSnapshot
+	store := &lockFailingStore{Store: memory.New()}
+	repo := es.NewRepository[counterAggregate, counterEvent](
+		store,
+		blankCounter,
+		counterAggregateSerializer{},
+		counterEventSerializer{},
+		cfg,
+	)
+	id := es.NewAggregateID("Counter", "lock")
+
+	_, err := repo.Save(context.Background(), id, incrementCommand{By: 1})
+	if err == nil {
+		t.Fatalf("Save: want optimistic lock error, got nil")
+	}
+	if !errors.Is(err, es.ErrOptimisticLock) {
+		t.Errorf("Save: want ErrOptimisticLock, got %v", err)
+	}
+}
+
+type unknownCmd struct{}
+
+func (unknownCmd) CommandTypeName() string { return "Unknown" }
+
+func TestRepository_Save_propagatesApplyCommandError(t *testing.T) {
+	repo, _ := newCounterRepo(t, es.DefaultConfig())
+	id := es.NewAggregateID("Counter", "err")
+
+	_, err := repo.Save(context.Background(), id, unknownCmd{})
+	if err == nil {
+		t.Fatalf("want ErrUnknownCommand, got nil")
+	}
+	if !errors.Is(err, es.ErrUnknownCommand) {
+		t.Errorf("got %v, want ErrUnknownCommand", err)
+	}
+}
