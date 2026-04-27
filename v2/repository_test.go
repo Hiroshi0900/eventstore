@@ -243,3 +243,51 @@ func TestRepository_LoadAfterSave_replaysCorrectly(t *testing.T) {
 		t.Errorf("count: got %d, want 10", got.count)
 	}
 }
+
+func TestRepository_Save_triggersSnapshot(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 3
+	repo, store := newCounterRepo(t, cfg)
+	id := es.NewAggregateID("Counter", "snap")
+
+	for i := 0; i < 3; i++ {
+		if _, err := repo.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
+			t.Fatalf("Save %d: %v", i, err)
+		}
+	}
+
+	snap, err := store.GetLatestSnapshot(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetLatestSnapshot: %v", err)
+	}
+	if snap == nil {
+		t.Fatalf("snapshot: nil, want present")
+	}
+	if snap.SeqNr != 3 {
+		t.Errorf("snapshot SeqNr: got %d, want 3", snap.SeqNr)
+	}
+	if snap.Version != 1 {
+		t.Errorf("snapshot Version: got %d, want 1", snap.Version)
+	}
+}
+
+func TestRepository_LoadAfterSnapshot_usesSnapshot(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 2
+	repo, _ := newCounterRepo(t, cfg)
+	id := es.NewAggregateID("Counter", "snapload")
+
+	for i := 0; i < 4; i++ {
+		if _, err := repo.Save(context.Background(), id, incrementCommand{By: 2}); err != nil {
+			t.Fatalf("Save %d: %v", i, err)
+		}
+	}
+
+	got, err := repo.Load(context.Background(), id)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.count != 8 {
+		t.Errorf("count: got %d, want 8", got.count)
+	}
+}
