@@ -16,7 +16,6 @@ var (
 	ErrEventStoreUnavailable = errors.New("event store unavailable")
 	ErrDuplicateAggregate    = errors.New("aggregate already exists")
 	ErrUnknownCommand        = errors.New("unknown command type for current state")
-	ErrAggregateIDMismatch   = errors.New("command aggregate ID does not match aggregate")
 )
 
 // OptimisticLockError は楽観ロック失敗の詳細を持ちます。
@@ -91,18 +90,3 @@ func NewDuplicateAggregateError(aggregateID string) *DuplicateAggregateError {
 	return &DuplicateAggregateError{AggregateID: aggregateID}
 }
 
-// AggregateIDMismatchError は Command の AggregateID が Aggregate と一致しないときに返されます。
-type AggregateIDMismatchError struct {
-	CommandAggregateID   string
-	AggregateAggregateID string
-}
-
-func (e *AggregateIDMismatchError) Error() string {
-	return fmt.Sprintf("command aggregate ID %q does not match aggregate %q",
-		e.CommandAggregateID, e.AggregateAggregateID)
-}
-func (e *AggregateIDMismatchError) Is(target error) bool { return target == ErrAggregateIDMismatch }
-
-func NewAggregateIDMismatchError(cmdID, aggID string) *AggregateIDMismatchError {
-	return &AggregateIDMismatchError{CommandAggregateID: cmdID, AggregateAggregateID: aggID}
-}

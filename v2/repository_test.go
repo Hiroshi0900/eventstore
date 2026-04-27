@@ -9,238 +9,264 @@ import (
 	"github.com/Hiroshi0900/eventstore/v2/memory"
 )
 
-// --- テスト用ミニ集約: 単純なカウンタ ---
-// BaseAggregate を埋め込むパターンで、AggregateID/SeqNr/Version の boilerplate を省略。
+// === counter ドメイン (テスト用、pure struct + typed AggregateID) ===
 
-// counterID は Counter ドメインの typed AggregateID。
-// AggregateID interface はドメイン側で typed に実装するのが推奨パターン。
-type counterID string
+// counterID is a typed AggregateID。library から default 実装は提供されないので
+// テスト側で typed な値型として定義する。
+type counterID struct {
+	value string
+}
 
 func (c counterID) TypeName() string { return "Counter" }
-func (c counterID) Value() string    { return string(c) }
-func (c counterID) AsString() string { return "Counter-" + string(c) }
+func (c counterID) Value() string    { return c.value }
+func (c counterID) AsString() string { return "Counter-" + c.value }
 
-type counter struct {
-	es.BaseAggregate
-	value int
+// counterEvent: domain Event interface (E = counterEvent in Repository[T,E])。
+type counterEvent interface {
+	es.Event
+	isCounterEvent()
 }
 
-func newCounter(id es.AggregateID) counter {
-	return counter{BaseAggregate: es.NewBaseAggregate(id, 0, 0)}
+type incrementedEvent struct {
+	AggID counterID
+	By    int
 }
 
-// Aggregate interface の WithSeqNr / WithVersion は戻り値が Aggregate なので embed 元で override。
-func (c counter) WithSeqNr(s uint64) es.Aggregate {
-	c.BaseAggregate = c.BaseAggregate.WithSeqNr(s)
-	return c
-}
-func (c counter) WithVersion(v uint64) es.Aggregate {
-	c.BaseAggregate = c.BaseAggregate.WithVersion(v)
-	return c
+func (e incrementedEvent) EventTypeName() string       { return "Incremented" }
+func (e incrementedEvent) AggregateID() es.AggregateID { return e.AggID }
+func (incrementedEvent) isCounterEvent()               {}
+
+type incrementCommand struct {
+	By int
 }
 
-func (c counter) ApplyCommand(cmd es.Command) (es.Event, error) {
-	switch cmd.(type) {
-	case incrementCmd:
-		return es.NewEvent("evt-"+cmd.AggregateID().AsString(), "Incremented", cmd.AggregateID(), nil,
-			es.WithSeqNr(c.SeqNr()+1), es.WithIsCreated(c.SeqNr() == 0)), nil
+func (incrementCommand) CommandTypeName() string { return "Increment" }
+
+// counterAggregate: pure struct, no embedded boilerplate, no SeqNr/Version。
+// 全メタは library の StoredEvent / StoredSnapshot に集約。
+type counterAggregate struct {
+	id    counterID
+	count int
+}
+
+func (c counterAggregate) AggregateID() es.AggregateID { return c.id }
+
+func (c counterAggregate) ApplyCommand(cmd es.Command) (counterEvent, error) {
+	switch x := cmd.(type) {
+	case incrementCommand:
+		return incrementedEvent{AggID: c.id, By: x.By}, nil
 	default:
 		return nil, es.ErrUnknownCommand
 	}
 }
 
-func (c counter) ApplyEvent(ev es.Event) es.Aggregate {
-	switch ev.EventTypeName() {
-	case "Incremented":
-		c.value++
-		c.BaseAggregate = c.BaseAggregate.WithSeqNr(ev.SeqNr())
+func (c counterAggregate) ApplyEvent(ev counterEvent) es.Aggregate[counterEvent] {
+	if e, ok := ev.(incrementedEvent); ok {
+		return counterAggregate{id: c.id, count: c.count + e.By}
 	}
 	return c
 }
 
-type incrementCmd struct{ id es.AggregateID }
+// blankCounter is the createBlank function passed to NewRepository.
+func blankCounter(id es.AggregateID) counterAggregate {
+	if cid, ok := id.(counterID); ok {
+		return counterAggregate{id: cid}
+	}
+	return counterAggregate{id: counterID{value: id.Value()}}
+}
 
-func (c incrementCmd) CommandTypeName() string     { return "Increment" }
-func (c incrementCmd) AggregateID() es.AggregateID { return c.id }
-
-// --- 共通ヘルパ ---
-
-func newTestRepo() *es.Repository[counter] {
-	return es.NewRepository[counter](
-		memory.New[counter](),
-		func(id es.AggregateID) counter { return newCounter(id) },
-		es.DefaultConfig(),
-	)
+// helper: build a Repository with a fresh memory store.
+// memory store は (de)serialize しないので serializer 不要。
+func newCounterRepo(t *testing.T, cfg es.Config) (es.Repository[counterAggregate, counterEvent], es.EventStore[counterAggregate, counterEvent]) {
+	t.Helper()
+	store := memory.New[counterAggregate, counterEvent]()
+	repo := es.NewRepository[counterAggregate, counterEvent](store, blankCounter, cfg)
+	return repo, store
 }
 
 func TestRepository_Construct(t *testing.T) {
-	r := newTestRepo()
-	if r == nil {
-		t.Fatal("nil repo")
+	repo, _ := newCounterRepo(t, es.DefaultConfig())
+	if repo == nil {
+		t.Fatal("expected non-nil Repository")
 	}
-	_ = context.Background
-	_ = errors.Is
 }
 
-func TestRepository_Load_NotFound(t *testing.T) {
-	r := newTestRepo()
-	id := counterID("c1")
-
-	_, err := r.Load(context.Background(), id)
+func TestRepository_Load_notFound(t *testing.T) {
+	repo, _ := newCounterRepo(t, es.DefaultConfig())
+	_, err := repo.Load(context.Background(), counterID{value: "missing"})
+	if err == nil {
+		t.Fatal("want error, got nil")
+	}
 	if !errors.Is(err, es.ErrAggregateNotFound) {
-		t.Errorf("expected ErrAggregateNotFound, got %v", err)
+		t.Errorf("got %v, want ErrAggregateNotFound", err)
 	}
 }
 
-func TestRepository_Store_FirstCommand(t *testing.T) {
-	r := newTestRepo()
-	id := counterID("c1")
-	c := newCounter(id)
+func TestRepository_Save_firstEventCreatesAggregate(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 100 // snapshot 回避
+	repo, store := newCounterRepo(t, cfg)
+	id := counterID{value: "1"}
 
-	updated, err := r.Store(context.Background(), incrementCmd{id: id}, c)
+	got, err := repo.Save(context.Background(), id, incrementCommand{By: 3})
 	if err != nil {
-		t.Fatalf("Store err: %v", err)
+		t.Fatalf("Save: %v", err)
 	}
-	if got, want := updated.value, 1; got != want {
-		t.Errorf("counter.value = %d, want %d", got, want)
+	if got.count != 3 {
+		t.Errorf("count: got %d, want 3", got.count)
 	}
-	if got, want := updated.SeqNr(), uint64(1); got != want {
-		t.Errorf("counter.SeqNr = %d, want %d", got, want)
+
+	stored, err := store.GetEventsSince(context.Background(), id, 0)
+	if err != nil {
+		t.Fatalf("GetEventsSince: %v", err)
+	}
+	if len(stored) != 1 {
+		t.Fatalf("len: got %d, want 1", len(stored))
+	}
+	if stored[0].SeqNr != 1 || !stored[0].IsCreated {
+		t.Errorf("metadata mismatch: %+v", stored[0])
+	}
+	if stored[0].EventID == "" {
+		t.Errorf("EventID empty")
+	}
+	if stored[0].Event.EventTypeName() != "Incremented" {
+		t.Errorf("EventTypeName: got %q", stored[0].Event.EventTypeName())
 	}
 }
 
-func TestRepository_Store_MismatchedAggregateID(t *testing.T) {
-	r := newTestRepo()
-	idA := counterID("a")
-	idB := counterID("b")
-	c := newCounter(idA)
+func TestRepository_Save_subsequentEvent(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 100
+	repo, store := newCounterRepo(t, cfg)
+	id := counterID{value: "2"}
 
-	_, err := r.Store(context.Background(), incrementCmd{id: idB}, c)
-	if !errors.Is(err, es.ErrAggregateIDMismatch) {
-		t.Errorf("expected ErrAggregateIDMismatch, got %v", err)
+	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	got, err := repo.Save(context.Background(), id, incrementCommand{By: 4})
+	if err != nil {
+		t.Fatalf("second: %v", err)
+	}
+	if got.count != 5 {
+		t.Errorf("count: got %d, want 5", got.count)
+	}
+
+	stored, _ := store.GetEventsSince(context.Background(), id, 0)
+	if len(stored) != 2 || stored[1].IsCreated || stored[1].SeqNr != 2 {
+		t.Errorf("metadata mismatch: %+v", stored[1])
 	}
 }
 
-func TestRepository_LoadAfterStore(t *testing.T) {
-	r := newTestRepo()
-	id := counterID("c1")
-	c := newCounter(id)
+func TestRepository_LoadAfterSave_replaysCorrectly(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 100
+	repo, _ := newCounterRepo(t, cfg)
+	id := counterID{value: "3"}
+
+	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 7}); err != nil {
+		t.Fatalf("Save 1: %v", err)
+	}
+	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 3}); err != nil {
+		t.Fatalf("Save 2: %v", err)
+	}
+
+	got, err := repo.Load(context.Background(), id)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.count != 10 {
+		t.Errorf("count: got %d, want 10", got.count)
+	}
+}
+
+func TestRepository_Save_triggersSnapshot(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 3
+	repo, store := newCounterRepo(t, cfg)
+	id := counterID{value: "snap"}
 
 	for i := 0; i < 3; i++ {
-		var err error
-		c, err = r.Store(context.Background(), incrementCmd{id: id}, c)
-		if err != nil {
-			t.Fatalf("Store err at i=%d: %v", i, err)
+		if _, err := repo.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
+			t.Fatalf("Save %d: %v", i, err)
 		}
 	}
 
-	loaded, err := r.Load(context.Background(), id)
+	snap, found, err := store.GetLatestSnapshot(context.Background(), id)
 	if err != nil {
-		t.Fatalf("Load err: %v", err)
-	}
-	if got, want := loaded.value, 3; got != want {
-		t.Errorf("loaded.value = %d, want %d", got, want)
-	}
-	if got, want := loaded.SeqNr(), uint64(3); got != want {
-		t.Errorf("loaded.SeqNr = %d, want %d", got, want)
-	}
-}
-
-func TestRepository_Store_TakesSnapshot(t *testing.T) {
-	store := memory.New[counter]()
-	r := es.NewRepository[counter](
-		store,
-		func(id es.AggregateID) counter { return newCounter(id) },
-		es.Config{SnapshotInterval: 3},
-	)
-	id := counterID("c1")
-	c := newCounter(id)
-
-	for i := 0; i < 3; i++ {
-		var err error
-		c, err = r.Store(context.Background(), incrementCmd{id: id}, c)
-		if err != nil {
-			t.Fatalf("Store err at i=%d: %v", i, err)
-		}
-	}
-
-	snap, found, err := store.GetLatestSnapshotByID(context.Background(), id)
-	if err != nil {
-		t.Fatalf("GetLatestSnapshotByID err: %v", err)
+		t.Fatalf("GetLatestSnapshot: %v", err)
 	}
 	if !found {
-		t.Fatal("expected snapshot to be saved at seqNr=3")
+		t.Fatal("snapshot not found, want present")
 	}
-	if snap.SeqNr() != 3 {
-		t.Errorf("snap.SeqNr() = %d, want 3", snap.SeqNr())
-	}
-	if snap.Version() != 1 {
-		t.Errorf("snap.Version() = %d, want 1", snap.Version())
-	}
-
-	loaded, err := r.Load(context.Background(), id)
-	if err != nil {
-		t.Fatalf("Load err: %v", err)
-	}
-	if loaded.value != 3 {
-		t.Errorf("loaded.value = %d, want 3", loaded.value)
+	if snap.SeqNr != 3 || snap.Version != 1 {
+		t.Errorf("snapshot: got %+v, want SeqNr=3 Version=1", snap)
 	}
 }
 
-func TestRepository_Store_OptimisticLockOnSnapshot(t *testing.T) {
-	store := memory.New[counter]()
-	r := es.NewRepository[counter](
-		store,
-		func(id es.AggregateID) counter { return newCounter(id) },
-		es.Config{SnapshotInterval: 1},
-	)
-	id := counterID("c1")
-	c := newCounter(id)
+func TestRepository_LoadAfterSnapshot_usesSnapshot(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 2
+	repo, _ := newCounterRepo(t, cfg)
+	id := counterID{value: "snapload"}
 
-	c, err := r.Store(context.Background(), incrementCmd{id: id}, c)
-	if err != nil {
-		t.Fatalf("first Store err: %v", err)
-	}
-
-	stale := c
-	c, err = r.Store(context.Background(), incrementCmd{id: id}, c)
-	if err != nil {
-		t.Fatalf("second Store err: %v", err)
-	}
-	_, err = r.Store(context.Background(), incrementCmd{id: id}, stale)
-	if !errors.Is(err, es.ErrOptimisticLock) {
-		t.Errorf("expected ErrOptimisticLock, got %v", err)
-	}
-}
-
-// リグレッションテスト: SnapshotInterval=5 で 6 回以上 Store した時、
-// snapshot 取得後の PersistEvent でバージョン管理が壊れないこと。
-func TestRepository_Store_BeyondSnapshotInterval(t *testing.T) {
-	r := newTestRepo() // SnapshotInterval=5 (DefaultConfig)
-	id := counterID("c1")
-	c := newCounter(id)
-
-	// 6 回 Store: 5 回目で snapshot、6 回目は通常の PersistEvent
-	for i := 0; i < 6; i++ {
-		var err error
-		c, err = r.Store(context.Background(), incrementCmd{id: id}, c)
-		if err != nil {
-			t.Fatalf("Store err at i=%d: %v", i, err)
+	for i := 0; i < 4; i++ {
+		if _, err := repo.Save(context.Background(), id, incrementCommand{By: 2}); err != nil {
+			t.Fatalf("Save %d: %v", i, err)
 		}
 	}
 
-	if got, want := c.value, 6; got != want {
-		t.Errorf("counter.value = %d, want %d", got, want)
-	}
-	if got, want := c.SeqNr(), uint64(6); got != want {
-		t.Errorf("counter.SeqNr = %d, want %d", got, want)
-	}
-
-	loaded, err := r.Load(context.Background(), id)
+	got, err := repo.Load(context.Background(), id)
 	if err != nil {
-		t.Fatalf("Load err: %v", err)
+		t.Fatalf("Load: %v", err)
 	}
-	if loaded.value != 6 {
-		t.Errorf("loaded.value = %d, want 6", loaded.value)
+	if got.count != 8 {
+		t.Errorf("count: got %d, want 8", got.count)
+	}
+}
+
+// lockFailingStore wraps an EventStore and forces ErrOptimisticLock from
+// PersistEventAndSnapshot. Used to verify Repository.Save propagates
+// store-level optimistic lock errors transparently.
+type lockFailingStore[T es.Aggregate[E], E es.Event] struct {
+	es.EventStore[T, E]
+}
+
+func (s *lockFailingStore[T, E]) PersistEventAndSnapshot(
+	_ context.Context,
+	ev es.StoredEvent[E],
+	_ es.StoredSnapshot[T],
+) error {
+	return es.NewOptimisticLockError(ev.Event.AggregateID().AsString(), 1, 99)
+}
+
+func TestRepository_Save_propagatesOptimisticLockError(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 1 // 必ず snapshot を取らせる
+	store := &lockFailingStore[counterAggregate, counterEvent]{
+		EventStore: memory.New[counterAggregate, counterEvent](),
+	}
+	repo := es.NewRepository[counterAggregate, counterEvent](store, blankCounter, cfg)
+
+	_, err := repo.Save(context.Background(), counterID{value: "lock"}, incrementCommand{By: 1})
+	if err == nil {
+		t.Fatal("want error, got nil")
+	}
+	if !errors.Is(err, es.ErrOptimisticLock) {
+		t.Errorf("got %v, want ErrOptimisticLock", err)
+	}
+}
+
+type unknownCmd struct{}
+
+func (unknownCmd) CommandTypeName() string { return "Unknown" }
+
+func TestRepository_Save_propagatesApplyCommandError(t *testing.T) {
+	repo, _ := newCounterRepo(t, es.DefaultConfig())
+	_, err := repo.Save(context.Background(), counterID{value: "err"}, unknownCmd{})
+	if err == nil {
+		t.Fatal("want error, got nil")
+	}
+	if !errors.Is(err, es.ErrUnknownCommand) {
+		t.Errorf("got %v, want ErrUnknownCommand", err)
 	}
 }

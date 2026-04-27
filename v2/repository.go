@@ -1,72 +1,124 @@
 package eventstore
 
-import "context"
+import (
+	"context"
+	"fmt"
+	"time"
+)
 
-// Repository[T] は集約 T の高レベルロード/保存 API です。
-// (de)serialize は EventStore[T] 実装側の責務。Repository は Aggregate を直接やり取りします。
-type Repository[T Aggregate] struct {
-	store       EventStore[T]
+// Repository は集約 T の高レベル Load / Save API。
+//
+// 利用側は domain ごとに `Repository[Visit, VisitEvent]` のように instantiate する。
+// 実装は library 内部の defaultRepository[T,E] が担う (NewRepository 経由で取得)。
+type Repository[T Aggregate[E], E Event] interface {
+	// Load は集約をロードする。snapshot があれば起点に、なければ blank 集約から
+	// イベントを replay。snapshot もイベントもなければ ErrAggregateNotFound。
+	Load(ctx context.Context, aggID AggregateID) (T, error)
+
+	// Save は aggID に対応する集約をロード (なければ blank) し、cmd を ApplyCommand
+	// で適用してイベントを生成、ApplyEvent で次状態に遷移後、永続化して新状態を返す。
+	// SnapshotInterval に達した seqNr では snapshot も同時に書く。
+	Save(ctx context.Context, aggID AggregateID, cmd Command) (T, error)
+}
+
+// defaultRepository は Repository interface の library 内部実装 (factory-sealed)。
+//
+// (de)serialize は EventStore[T,E] 実装側 (memory / dynamodb 等) の責務。
+// 本 Repository は domain 型のみを扱い、wire format には触れない。
+type defaultRepository[T Aggregate[E], E Event] struct {
+	store       EventStore[T, E]
 	createBlank func(AggregateID) T
 	config      Config
 }
 
-// NewRepository は Repository[T] を生成します。
-func NewRepository[T Aggregate](
-	store EventStore[T],
+// NewRepository は Repository[T, E] を生成する。
+//
+// createBlank は集約が未存在の状態 (Save の初回呼び出し) で使う初期 aggregate を返す関数。
+// 利用側で typed AggregateID と pure struct を組み合わせて定義する。
+//
+// (de)serialize の責務は store 側にある (dynamodb 等のコンストラクタで Serializer を受け取る)。
+func NewRepository[T Aggregate[E], E Event](
+	store EventStore[T, E],
 	createBlank func(AggregateID) T,
 	config Config,
-) *Repository[T] {
-	return &Repository[T]{
+) Repository[T, E] {
+	return &defaultRepository[T, E]{
 		store:       store,
 		createBlank: createBlank,
 		config:      config,
 	}
 }
 
-// Load は集約をロードします。スナップショットがあれば起点に、なければ空集約から
-// イベントを replay。スナップショットもイベントもない場合は ErrAggregateNotFound。
-func (r *Repository[T]) Load(ctx context.Context, id AggregateID) (T, error) {
-	var zero T
-
-	snap, found, err := r.store.GetLatestSnapshotByID(ctx, id)
+// loadInternal は snapshot + events から現状態を復元し、現 SeqNr / Version を返す。
+// notFound==true は snapshot もイベントも見つからなかった (集約未存在) を意味する。
+func (r *defaultRepository[T, E]) loadInternal(
+	ctx context.Context,
+	id AggregateID,
+) (agg T, seqNr, version uint64, notFound bool, err error) {
+	snap, found, err := r.store.GetLatestSnapshot(ctx, id)
 	if err != nil {
-		return zero, err
+		return agg, 0, 0, false, err
 	}
 
-	var agg T
-	var seqNr uint64
 	if found {
-		agg = snap
-		seqNr = snap.SeqNr()
+		agg = snap.Aggregate
+		seqNr = snap.SeqNr
+		version = snap.Version
 	} else {
 		agg = r.createBlank(id)
 		seqNr = 0
+		version = 0
 	}
 
-	events, err := r.store.GetEventsByIDSinceSeqNr(ctx, id, seqNr)
+	events, err := r.store.GetEventsSince(ctx, id, seqNr)
 	if err != nil {
-		return zero, err
+		return agg, 0, 0, false, err
 	}
 
 	if !found && len(events) == 0 {
-		return zero, NewAggregateNotFoundError(id.TypeName(), id.Value())
+		return agg, 0, 0, true, nil
 	}
 
-	for _, ev := range events {
-		agg = agg.ApplyEvent(ev).(T)
+	for _, stored := range events {
+		next, ok := agg.ApplyEvent(stored.Event).(T)
+		if !ok {
+			return agg, 0, 0, false, fmt.Errorf(
+				"%w: ApplyEvent returned a value that does not implement T",
+				ErrInvalidAggregate,
+			)
+		}
+		agg = next
+		seqNr = stored.SeqNr
+	}
+	return agg, seqNr, version, false, nil
+}
+
+// Load は集約をロードする。集約未存在の場合は ErrAggregateNotFound を返す。
+func (r *defaultRepository[T, E]) Load(ctx context.Context, aggID AggregateID) (T, error) {
+	agg, _, _, notFound, err := r.loadInternal(ctx, aggID)
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	if notFound {
+		var zero T
+		return zero, NewAggregateNotFoundError(aggID.TypeName(), aggID.Value())
 	}
 	return agg, nil
 }
 
-// Store はコマンドを集約に適用してイベントを生成・永続化し、新しい集約を返します。
-func (r *Repository[T]) Store(ctx context.Context, cmd Command, agg T) (T, error) {
+// Save は load → ApplyCommand → ApplyEvent → 永続化 を一括で行う。
+// 集約未存在でも blank で開始するため、creation 系コマンドの初回適用にも使える。
+func (r *defaultRepository[T, E]) Save(
+	ctx context.Context,
+	aggID AggregateID,
+	cmd Command,
+) (T, error) {
 	var zero T
 
-	if cmd.AggregateID().AsString() != agg.AggregateID().AsString() {
-		return zero, NewAggregateIDMismatchError(
-			cmd.AggregateID().AsString(),
-			agg.AggregateID().AsString(),
-		)
+	agg, currentSeqNr, currentVersion, _, err := r.loadInternal(ctx, aggID)
+	if err != nil {
+		return zero, err
 	}
 
 	ev, err := agg.ApplyCommand(cmd)
@@ -74,24 +126,56 @@ func (r *Repository[T]) Store(ctx context.Context, cmd Command, agg T) (T, error
 		return zero, err
 	}
 
-	nextSeqNr := agg.SeqNr() + 1
-	ev = ev.WithSeqNr(nextSeqNr)
-	nextAgg := agg.ApplyEvent(ev).(T)
-	nextAgg = nextAgg.WithSeqNr(nextSeqNr).(T)
+	next, ok := agg.ApplyEvent(ev).(T)
+	if !ok {
+		return zero, fmt.Errorf(
+			"%w: ApplyEvent returned a value that does not implement T",
+			ErrInvalidAggregate,
+		)
+	}
+
+	nextSeqNr := currentSeqNr + 1
+	now := time.Now().UTC()
+
+	eventID, err := generateEventID()
+	if err != nil {
+		return zero, err
+	}
+
+	stored := StoredEvent[E]{
+		Event:      ev,
+		EventID:    eventID,
+		SeqNr:      nextSeqNr,
+		IsCreated:  currentSeqNr == 0,
+		OccurredAt: now,
+		// TraceParent / TraceState は dynamodb 側で context から注入する。
+	}
 
 	if r.config.ShouldSnapshot(nextSeqNr) {
-		nextVersion := agg.Version() + 1
-		nextAgg = nextAgg.WithVersion(nextVersion).(T)
-		if err := r.store.PersistEventAndSnapshot(ctx, ev, nextAgg); err != nil {
+		snap := StoredSnapshot[T]{
+			Aggregate:  next,
+			SeqNr:      nextSeqNr,
+			Version:    currentVersion + 1,
+			OccurredAt: now,
+		}
+		if err := r.store.PersistEventAndSnapshot(ctx, stored, snap); err != nil {
 			return zero, err
 		}
 	} else {
-		// PersistEvent への version 引数は実装側で無視可。
-		// 楽観ロックは PersistEventAndSnapshot に集約。
-		if err := r.store.PersistEvent(ctx, ev, agg.Version()); err != nil {
+		// expectedVersion は EventStore で first-write 検出用 (== 0 で
+		// "この aggregate は新規であるべき" の意味)。currentSeqNr > 0 で
+		// snapshot 未取得 (currentVersion == 0) の場合、PersistEvent に 0 を
+		// 渡すと first-write 扱いで ErrDuplicateAggregate になる。それを避け
+		// るため non-zero (currentSeqNr) を渡す。値そのものは楽観ロックには
+		// 使われないので意味は問わない。
+		expectedVersion := currentVersion
+		if currentSeqNr > 0 && expectedVersion == 0 {
+			expectedVersion = currentSeqNr
+		}
+		if err := r.store.PersistEvent(ctx, stored, expectedVersion); err != nil {
 			return zero, err
 		}
 	}
 
-	return nextAgg, nil
+	return next, nil
 }

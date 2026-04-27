@@ -1,71 +1,94 @@
 package protoes_test
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
-	"time"
 
 	es "github.com/Hiroshi0900/eventstore/v2"
-	"github.com/Hiroshi0900/eventstore/v2/internal/aggregateid"
 	"github.com/Hiroshi0900/eventstore/v2/serialization/protoes"
 )
 
-func TestProtoEventSerializer_RoundTrip(t *testing.T) {
-	s := protoes.New()
-	id := aggregateid.New("Visit", "abc-123")
-	ts := time.Date(2026, 4, 27, 12, 34, 56, 0, time.UTC)
-	src := es.NewEvent(
-		"evt-1",
-		"VisitScheduled",
-		id,
-		[]byte(`{"foo":"bar"}`),
-		es.WithSeqNr(7),
-		es.WithIsCreated(true),
-		es.WithOccurredAt(ts),
-	)
+// テスト用 typed AggregateID。
+type sampleAggID struct {
+	value string
+}
 
-	data, err := s.Serialize(src)
+func (s sampleAggID) TypeName() string { return "Sample" }
+func (s sampleAggID) Value() string    { return s.value }
+func (s sampleAggID) AsString() string { return "Sample-" + s.value }
+
+// テスト用 Event interface (E)。
+type sampleEvent interface {
+	es.Event
+	isSample()
+}
+
+type sampleCreated struct {
+	id   sampleAggID
+	name string
+}
+
+func (e sampleCreated) EventTypeName() string       { return "SampleCreated" }
+func (e sampleCreated) AggregateID() es.AggregateID { return e.id }
+func (sampleCreated) isSample()                     {}
+
+// 簡易な encode / decode 関数 (実際には proto を使う想定だが、テストは JSON で代替)。
+type sampleCreatedWire struct {
+	IDValue string `json:"id_value"`
+	Name    string `json:"name"`
+}
+
+func encode(ev sampleEvent) ([]byte, error) {
+	switch e := ev.(type) {
+	case sampleCreated:
+		return json.Marshal(sampleCreatedWire{IDValue: e.id.value, Name: e.name})
+	}
+	return nil, es.NewSerializationError("event", errors.New("unknown event type"))
+}
+
+func decode(typeName string, data []byte) (sampleEvent, error) {
+	switch typeName {
+	case "SampleCreated":
+		var w sampleCreatedWire
+		if err := json.Unmarshal(data, &w); err != nil {
+			return nil, es.NewDeserializationError("event", err)
+		}
+		return sampleCreated{id: sampleAggID{value: w.IDValue}, name: w.Name}, nil
+	}
+	return nil, es.NewDeserializationError("event", errors.New("unknown event type: "+typeName))
+}
+
+func TestCodec_RoundTrip(t *testing.T) {
+	c := protoes.New[sampleEvent](encode, decode)
+	in := sampleCreated{id: sampleAggID{value: "abc"}, name: "hello"}
+
+	data, err := c.Serialize(in)
 	if err != nil {
-		t.Fatalf("Serialize err: %v", err)
+		t.Fatalf("Serialize: %v", err)
 	}
 
-	got, err := s.Deserialize(data)
+	got, err := c.Deserialize(in.EventTypeName(), data)
 	if err != nil {
-		t.Fatalf("Deserialize err: %v", err)
+		t.Fatalf("Deserialize: %v", err)
 	}
 
-	if got.EventID() != src.EventID() {
-		t.Errorf("EventID = %q, want %q", got.EventID(), src.EventID())
+	gc, ok := got.(sampleCreated)
+	if !ok {
+		t.Fatalf("got type %T, want sampleCreated", got)
 	}
-	if got.EventTypeName() != src.EventTypeName() {
-		t.Errorf("EventTypeName = %q, want %q", got.EventTypeName(), src.EventTypeName())
-	}
-	if got.AggregateID().AsString() != src.AggregateID().AsString() {
-		t.Errorf("AggregateID = %q, want %q", got.AggregateID().AsString(), src.AggregateID().AsString())
-	}
-	if got.SeqNr() != src.SeqNr() {
-		t.Errorf("SeqNr = %d, want %d", got.SeqNr(), src.SeqNr())
-	}
-	if got.IsCreated() != src.IsCreated() {
-		t.Errorf("IsCreated = %v, want %v", got.IsCreated(), src.IsCreated())
-	}
-	if !got.OccurredAt().Equal(ts) {
-		t.Errorf("OccurredAt = %v, want %v", got.OccurredAt(), ts)
-	}
-	if string(got.Payload()) != string(src.Payload()) {
-		t.Errorf("Payload = %q, want %q", got.Payload(), src.Payload())
+	if gc.id.value != in.id.value || gc.name != in.name {
+		t.Errorf("roundtrip mismatch: got %+v, want %+v", gc, in)
 	}
 }
 
-func TestProtoEventSerializer_DeserializeError(t *testing.T) {
-	s := protoes.New()
-	// Protobuf の wire format として明らかに不正なバイト列。
-	// tag=0 / wire type=7 はいずれも proto3 では invalid。
-	_, err := s.Deserialize([]byte{0xff, 0xff, 0xff, 0xff, 0xff})
+func TestCodec_DeserializeError(t *testing.T) {
+	c := protoes.New[sampleEvent](encode, decode)
+	_, err := c.Deserialize("Unknown", []byte(`{}`))
 	if err == nil {
-		t.Fatal("expected error for invalid protobuf data, got nil")
+		t.Fatal("want error for unknown type")
 	}
 	if !errors.Is(err, es.ErrDeserializationFailed) {
-		t.Errorf("expected ErrDeserializationFailed, got %v", err)
+		t.Errorf("got %v, want ErrDeserializationFailed", err)
 	}
 }

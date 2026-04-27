@@ -2,35 +2,22 @@ package eventstore
 
 import "context"
 
-// Config は EventStore / Repository の設定を保持します。
+// Config は Repository / EventStore の共通設定を保持する。
+//
+// DynamoDB 専用設定 (テーブル名・GSI 名・shard 数等) は v2/dynamodb.Config 側に
+// 集約されており、本 Config には Repository が直接使う SnapshotInterval のみが含まれる。
 type Config struct {
-	// SnapshotInterval はスナップショットを取る seqNr の間隔です。
-	// 0 を指定するとスナップショットは取られません。
+	// SnapshotInterval はスナップショットを取る seqNr の間隔。0 を指定すると
+	// スナップショットは取られない。
 	SnapshotInterval uint64
-
-	// JournalTableName / SnapshotTableName は DynamoDB 実装用のテーブル名です。
-	JournalTableName  string
-	SnapshotTableName string
-
-	// ShardCount は DynamoDB 実装の partition key sharding 数です。
-	ShardCount uint64
-
-	// KeepSnapshotCount は DynamoDB 実装で保持する古いスナップショット数。0 は全保持。
-	KeepSnapshotCount uint64
 }
 
-// DefaultConfig はデフォルト設定を返します。
+// DefaultConfig はデフォルト設定を返す (SnapshotInterval=5)。
 func DefaultConfig() Config {
-	return Config{
-		SnapshotInterval:  5,
-		JournalTableName:  "journal",
-		SnapshotTableName: "snapshot",
-		ShardCount:        1,
-		KeepSnapshotCount: 0,
-	}
+	return Config{SnapshotInterval: 5}
 }
 
-// ShouldSnapshot は seqNr においてスナップショットを取るべきかを返します。
+// ShouldSnapshot は seqNr においてスナップショットを取るべきかを返す。
 func (c Config) ShouldSnapshot(seqNr uint64) bool {
 	if c.SnapshotInterval == 0 {
 		return false
@@ -38,33 +25,27 @@ func (c Config) ShouldSnapshot(seqNr uint64) bool {
 	return seqNr%c.SnapshotInterval == 0
 }
 
-// EventStore[T] は集約 T の永続化抽象です。
+// EventStore は永続化抽象。Repository ↔ EventStore のやり取りは domain 型
+// (T Aggregate[E], E Event) で行われ、(de)serialize は EventStore 実装の責務。
 //
-// snapshot は Aggregate (T) を直接やり取りします。バイト列 payload との
-// (de)serialize は実装が責務として持ちます (memory は in-memory のため不要、
-// dynamodb は AggregateSerializer[T] をコンストラクタで受け取る)。
-type EventStore[T Aggregate] interface {
-	// GetLatestSnapshotByID は最新スナップショットを返します。
-	// 第 2 戻り値 found=false なら snapshot 未存在 (エラーではない)。
-	GetLatestSnapshotByID(ctx context.Context, id AggregateID) (T, bool, error)
+// memory store は in-memory で型をそのまま保持するので serializer を必要としない。
+// dynamodb store はコンストラクタで AggregateSerializer / EventSerializer を受け取り、
+// 内部で (de)serialize する。
+type EventStore[T Aggregate[E], E Event] interface {
+	// GetLatestSnapshot は最新 snapshot を返す。snapshot 未存在の場合は found=false を返す。
+	GetLatestSnapshot(ctx context.Context, id AggregateID) (snap StoredSnapshot[T], found bool, err error)
 
-	// GetEventsByIDSinceSeqNr は seqNr より大きい seqNr のイベントを昇順で返します。
-	GetEventsByIDSinceSeqNr(ctx context.Context, id AggregateID, seqNr uint64) ([]Event, error)
+	// GetEventsSince は seqNr より大きい seqNr の events を昇順で返す。
+	GetEventsSince(ctx context.Context, id AggregateID, seqNr uint64) ([]StoredEvent[E], error)
 
-	// PersistEvent はイベント単独を保存します (snapshot interval 外のケース)。
-	// version 引数は呼び出し側の context 共有用で実装は無視して構いません。
+	// PersistEvent は event 単独を保存する (snapshot interval 外のケース)。
+	// expectedVersion は呼び出し側 context 用で、実装は楽観ロックには使わない。
 	// 楽観ロックは PersistEventAndSnapshot に集約。
-	PersistEvent(ctx context.Context, event Event, version uint64) error
+	// 同一 (AggregateID, SeqNr) の重複保存は ErrDuplicateAggregate で拒否すること。
+	PersistEvent(ctx context.Context, ev StoredEvent[E], expectedVersion uint64) error
 
-	// PersistEventAndSnapshot はイベントと snapshot をアトミックに保存します。
-	// 楽観ロックは aggregate.Version() を起点とし、期待 version は aggregate.Version() - 1。
-	// aggregate.Version() == 1 の場合は初回作成扱い。
-	PersistEventAndSnapshot(ctx context.Context, event Event, aggregate T) error
-}
-
-// AggregateSerializer は集約 T のスナップショット用シリアライザです。
-// dynamodb など永続化実装で snapshot payload を組み立てる際に使います。
-type AggregateSerializer[T Aggregate] interface {
-	Serialize(T) ([]byte, error)
-	Deserialize([]byte) (T, error)
+	// PersistEventAndSnapshot は event と snapshot をアトミックに保存する。
+	// 楽観ロックは snap.Version を基準に、現行 snapshot version が snap.Version - 1 と一致しない
+	// 場合に ErrOptimisticLock を返す。snap.Version == 1 の場合は初回作成扱い (現行 snapshot 未存在を要求)。
+	PersistEventAndSnapshot(ctx context.Context, ev StoredEvent[E], snap StoredSnapshot[T]) error
 }
