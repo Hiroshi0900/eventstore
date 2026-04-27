@@ -36,11 +36,17 @@ func (e incrementedEvent) EventTypeName() string       { return "Incremented" }
 func (e incrementedEvent) AggregateID() es.AggregateID { return e.AggID }
 func (incrementedEvent) isCounterEvent()               {}
 
+type counterCommand interface {
+	es.Command
+	isCounterCommand()
+}
+
 type incrementCommand struct {
 	By int
 }
 
 func (incrementCommand) CommandTypeName() string { return "Increment" }
+func (incrementCommand) isCounterCommand()       {}
 
 // counterAggregate: pure struct, no embedded boilerplate, no SeqNr/Version。
 // 全メタは library の StoredEvent / StoredSnapshot に集約。
@@ -51,7 +57,7 @@ type counterAggregate struct {
 
 func (c counterAggregate) AggregateID() es.AggregateID { return c.id }
 
-func (c counterAggregate) ApplyCommand(cmd es.Command) (counterEvent, error) {
+func (c counterAggregate) ApplyCommand(cmd counterCommand) (counterEvent, error) {
 	switch x := cmd.(type) {
 	case incrementCommand:
 		return incrementedEvent{AggID: c.id, By: x.By}, nil
@@ -60,7 +66,7 @@ func (c counterAggregate) ApplyCommand(cmd es.Command) (counterEvent, error) {
 	}
 }
 
-func (c counterAggregate) ApplyEvent(ev counterEvent) es.Aggregate[counterEvent] {
+func (c counterAggregate) ApplyEvent(ev counterEvent) es.Aggregate[counterCommand, counterEvent] {
 	if e, ok := ev.(incrementedEvent); ok {
 		return counterAggregate{id: c.id, count: c.count + e.By}
 	}
@@ -77,10 +83,10 @@ func blankCounter(id es.AggregateID) counterAggregate {
 
 // helper: build a Repository with a fresh memory store.
 // memory store は (de)serialize しないので serializer 不要。
-func newCounterRepo(t *testing.T, cfg es.Config) (es.Repository[counterAggregate, counterEvent], es.EventStore[counterAggregate, counterEvent]) {
+func newCounterRepo(t *testing.T, cfg es.Config) (es.Repository[counterAggregate, counterCommand, counterEvent], es.EventStore[counterAggregate, counterCommand, counterEvent]) {
 	t.Helper()
-	store := memory.New[counterAggregate, counterEvent]()
-	repo := es.NewRepository[counterAggregate, counterEvent](store, blankCounter, cfg)
+	store := memory.New[counterAggregate, counterCommand, counterEvent]()
+	repo := es.NewRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
 	return repo, store
 }
 
@@ -227,11 +233,11 @@ func TestRepository_LoadAfterSnapshot_usesSnapshot(t *testing.T) {
 // lockFailingStore wraps an EventStore and forces ErrOptimisticLock from
 // PersistEventAndSnapshot. Used to verify Repository.Save propagates
 // store-level optimistic lock errors transparently.
-type lockFailingStore[T es.Aggregate[E], E es.Event] struct {
-	es.EventStore[T, E]
+type lockFailingStore[T es.Aggregate[C, E], C es.Command, E es.Event] struct {
+	es.EventStore[T, C, E]
 }
 
-func (s *lockFailingStore[T, E]) PersistEventAndSnapshot(
+func (s *lockFailingStore[T, C, E]) PersistEventAndSnapshot(
 	_ context.Context,
 	ev es.StoredEvent[E],
 	_ es.StoredSnapshot[T],
@@ -242,10 +248,10 @@ func (s *lockFailingStore[T, E]) PersistEventAndSnapshot(
 func TestRepository_Save_propagatesOptimisticLockError(t *testing.T) {
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 1 // 必ず snapshot を取らせる
-	store := &lockFailingStore[counterAggregate, counterEvent]{
-		EventStore: memory.New[counterAggregate, counterEvent](),
+	store := &lockFailingStore[counterAggregate, counterCommand, counterEvent]{
+		EventStore: memory.New[counterAggregate, counterCommand, counterEvent](),
 	}
-	repo := es.NewRepository[counterAggregate, counterEvent](store, blankCounter, cfg)
+	repo := es.NewRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
 
 	_, err := repo.Save(context.Background(), counterID{value: "lock"}, incrementCommand{By: 1})
 	if err == nil {
@@ -259,6 +265,7 @@ func TestRepository_Save_propagatesOptimisticLockError(t *testing.T) {
 type unknownCmd struct{}
 
 func (unknownCmd) CommandTypeName() string { return "Unknown" }
+func (unknownCmd) isCounterCommand()       {}
 
 func TestRepository_Save_propagatesApplyCommandError(t *testing.T) {
 	repo, _ := newCounterRepo(t, es.DefaultConfig())
