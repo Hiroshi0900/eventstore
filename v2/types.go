@@ -26,17 +26,18 @@ type (
 	}
 
 	// Aggregate は Event Sourcing における集約ルート。
-	// E は集約専用の Event 型（利用側で定義する domain Event interface）。
+	// C は集約専用の Command 型、E は集約専用の Event 型（いずれも利用側で定義する
+	// domain interface / union を想定）。
 	//
 	// メタ情報 (SeqNr / Version / 永続化メタ) を一切持たず、ApplyCommand /
 	// ApplyEvent で表現される業務状態遷移のみを定義する。
 	//
-	// ApplyEvent の戻り値が Aggregate[E] (interface) なので、状態遷移時に
+	// ApplyEvent の戻り値が Aggregate[C, E] (interface) なので、状態遷移時に
 	// 異なる具象型を返す state pattern が可能 (例: VisitScheduled → VisitCompleted)。
-	Aggregate[E Event] interface {
+	Aggregate[C Command, E Event] interface {
 		AggregateID() AggregateID
-		ApplyCommand(Command) (E, error)
-		ApplyEvent(E) Aggregate[E]
+		ApplyCommand(C) (E, error)
+		ApplyEvent(E) Aggregate[C, E]
 	}
 
 	// Command はドメインの意図を表す。

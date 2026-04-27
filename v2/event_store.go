@@ -26,12 +26,12 @@ func (c Config) ShouldSnapshot(seqNr uint64) bool {
 }
 
 // EventStore は永続化抽象。Repository ↔ EventStore のやり取りは domain 型
-// (T Aggregate[E], E Event) で行われ、(de)serialize は EventStore 実装の責務。
+// (T Aggregate[C, E], C Command, E Event) で行われ、(de)serialize は EventStore 実装の責務。
 //
 // memory store は in-memory で型をそのまま保持するので serializer を必要としない。
 // dynamodb store はコンストラクタで AggregateSerializer / EventSerializer を受け取り、
 // 内部で (de)serialize する。
-type EventStore[T Aggregate[E], E Event] interface {
+type EventStore[T Aggregate[C, E], C Command, E Event] interface {
 	// GetLatestSnapshot は最新 snapshot を返す。snapshot 未存在の場合は found=false を返す。
 	GetLatestSnapshot(ctx context.Context, id AggregateID) (snap StoredSnapshot[T], found bool, err error)
 
