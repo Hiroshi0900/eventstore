@@ -153,3 +153,93 @@ func TestRepository_Load_notFound(t *testing.T) {
 		t.Errorf("Load: want ErrAggregateNotFound, got %v", err)
 	}
 }
+
+func TestRepository_Save_firstEventCreatesAggregate(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 100 // 大きく取って snapshot を回避
+	repo, store := newCounterRepo(t, cfg)
+	id := es.NewAggregateID("Counter", "1")
+
+	got, err := repo.Save(context.Background(), id, incrementCommand{By: 3})
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if got.count != 3 {
+		t.Errorf("count: got %d, want 3", got.count)
+	}
+
+	// 永続化された Event を直接確認
+	envs, err := store.GetEventsSince(context.Background(), id, 0)
+	if err != nil {
+		t.Fatalf("GetEventsSince: %v", err)
+	}
+	if len(envs) != 1 {
+		t.Fatalf("event count: got %d, want 1", len(envs))
+	}
+	if envs[0].SeqNr != 1 {
+		t.Errorf("SeqNr: got %d, want 1", envs[0].SeqNr)
+	}
+	if !envs[0].IsCreated {
+		t.Errorf("IsCreated: got false, want true")
+	}
+	if envs[0].EventTypeName != "Incremented" {
+		t.Errorf("EventTypeName: got %q, want %q", envs[0].EventTypeName, "Incremented")
+	}
+	if envs[0].EventID == "" {
+		t.Errorf("EventID: empty")
+	}
+	if envs[0].OccurredAt.IsZero() {
+		t.Errorf("OccurredAt: zero")
+	}
+}
+
+func TestRepository_Save_subsequentEvent(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 100
+	repo, store := newCounterRepo(t, cfg)
+	id := es.NewAggregateID("Counter", "2")
+
+	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
+		t.Fatalf("first Save: %v", err)
+	}
+	got, err := repo.Save(context.Background(), id, incrementCommand{By: 4})
+	if err != nil {
+		t.Fatalf("second Save: %v", err)
+	}
+	if got.count != 5 {
+		t.Errorf("count: got %d, want 5", got.count)
+	}
+
+	envs, _ := store.GetEventsSince(context.Background(), id, 0)
+	if len(envs) != 2 {
+		t.Fatalf("event count: got %d, want 2", len(envs))
+	}
+	if envs[1].IsCreated {
+		t.Errorf("second event IsCreated: got true, want false")
+	}
+	if envs[1].SeqNr != 2 {
+		t.Errorf("second SeqNr: got %d, want 2", envs[1].SeqNr)
+	}
+}
+
+func TestRepository_LoadAfterSave_replaysCorrectly(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 100
+	repo, _ := newCounterRepo(t, cfg)
+	id := es.NewAggregateID("Counter", "3")
+
+	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 7}); err != nil {
+		t.Fatalf("Save 1: %v", err)
+	}
+	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 3}); err != nil {
+		t.Fatalf("Save 2: %v", err)
+	}
+
+	got, err := repo.Load(context.Background(), id)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.count != 10 {
+		t.Errorf("count: got %d, want 10", got.count)
+	}
+}

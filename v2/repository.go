@@ -113,12 +113,86 @@ func (r *DefaultRepository[T, E]) Load(ctx context.Context, id AggregateID) (T, 
 	return agg, nil
 }
 
-// Save is implemented in the next task.
-func (r *DefaultRepository[T, E]) Save(ctx context.Context, id AggregateID, cmd Command) (T, error) {
+// Save loads the aggregate (or starts blank), applies the command, persists
+// the resulting event, optionally creating a snapshot.
+func (r *DefaultRepository[T, E]) Save(
+	ctx context.Context,
+	id AggregateID,
+	cmd Command,
+) (T, error) {
 	var zero T
-	_ = ctx
-	_ = id
-	_ = cmd
-	_ = time.Now // ensure time package import is used in later tasks
-	return zero, fmt.Errorf("not implemented")
+
+	agg, currentSeqNr, currentVersion, _, err := r.loadInternal(ctx, id)
+	if err != nil {
+		return zero, err
+	}
+
+	ev, err := agg.ApplyCommand(cmd)
+	if err != nil {
+		return zero, err
+	}
+
+	next, ok := agg.ApplyEvent(ev).(T)
+	if !ok {
+		return zero, fmt.Errorf(
+			"%w: ApplyEvent returned a value that does not implement T",
+			ErrInvalidAggregate,
+		)
+	}
+
+	nextSeqNr := currentSeqNr + 1
+
+	payload, err := r.evSerializer.Serialize(ev)
+	if err != nil {
+		return zero, err
+	}
+
+	eventID, err := generateEventID()
+	if err != nil {
+		return zero, err
+	}
+
+	envelope := &EventEnvelope{
+		EventID:       eventID,
+		EventTypeName: ev.EventTypeName(),
+		AggregateID:   ev.AggregateID(),
+		SeqNr:         nextSeqNr,
+		IsCreated:     currentSeqNr == 0,
+		OccurredAt:    time.Now().UTC(),
+		Payload:       payload,
+		// TraceParent / TraceState are filled by DynamoDB store via context.
+	}
+
+	if r.config.ShouldSnapshot(nextSeqNr) {
+		snapPayload, err := r.aggSerializer.Serialize(next)
+		if err != nil {
+			return zero, err
+		}
+		snap := &SnapshotEnvelope{
+			AggregateID: ev.AggregateID(),
+			SeqNr:       nextSeqNr,
+			Version:     currentVersion + 1,
+			Payload:     snapPayload,
+			OccurredAt:  envelope.OccurredAt,
+		}
+		if err := r.store.PersistEventAndSnapshot(ctx, envelope, snap); err != nil {
+			return zero, err
+		}
+	} else {
+		// expectedVersion is used by EventStore for first-write detection
+		// (== 0 means "this aggregate must not exist yet"). Once any event has
+		// been persisted (currentSeqNr > 0) we must pass a non-zero value to
+		// bypass that check, even when no snapshot has been taken yet so
+		// currentVersion is still 0. The value itself is otherwise unused —
+		// optimistic locking is enforced by PersistEventAndSnapshot.
+		expectedVersion := currentVersion
+		if currentSeqNr > 0 && expectedVersion == 0 {
+			expectedVersion = currentSeqNr
+		}
+		if err := r.store.PersistEvent(ctx, envelope, expectedVersion); err != nil {
+			return zero, err
+		}
+	}
+
+	return next, nil
 }
