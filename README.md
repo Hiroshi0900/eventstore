@@ -36,7 +36,7 @@ go get github.com/Hiroshi0900/eventstore/v2
 - **State Pattern friendly** — `ApplyEvent(E) Aggregate[E]` lets different concrete state types represent different aggregate states (e.g. `VisitScheduled` → `VisitCompleted`).
 - **No boilerplate types** — the library does **not** ship a `BaseAggregate` / `BaseEvent` / `DefaultAggregateID`. User domains define their own typed `AggregateID`s and event/aggregate structs.
 - **Repository.Save(aggID, cmd)** — load → `ApplyCommand` → `ApplyEvent` → persist is a single Repository call. There is no separate "construct event then save" step.
-- **Two split serializers** — `AggregateSerializer[T,E]` for snapshots and `EventSerializer[E]` for events, both implemented by the user domain.
+- **Serialization owned by EventStore implementations** — `Repository[T,E]` works with domain types only; `(de)serialize` is the responsibility of the `EventStore[T,E]` implementation. memory store needs no serializer; dynamodb store takes `AggregateSerializer[T,E]` + `EventSerializer[E]` at construction.
 
 ### Define a typed AggregateID, Command, Event, Aggregate (no boilerplate)
 
@@ -109,7 +109,32 @@ func (c Counter) ApplyEvent(ev CounterEvent) es.Aggregate[CounterEvent] {
 }
 ```
 
-### Implement domain serializers
+### Use a Repository (in-memory)
+
+memory store は (de)serialize を行わないので serializer は不要。
+
+```go
+import (
+    es "github.com/Hiroshi0900/eventstore/v2"
+    esmem "github.com/Hiroshi0900/eventstore/v2/memory"
+)
+
+store := esmem.New[Counter, CounterEvent]() // returns es.EventStore[Counter, CounterEvent]
+repo := es.NewRepository[Counter, CounterEvent](store, NewBlankCounter, es.DefaultConfig())
+
+id := NewCounterID("c1")
+
+// Save loads (or creates blank) → ApplyCommand → ApplyEvent → persist.
+c, err := repo.Save(ctx, id, IncrementCmd{By: 1})
+
+// Load replays from the latest snapshot + subsequent events.
+loaded, err := repo.Load(ctx, id)
+```
+
+### Implement domain serializers (DynamoDB のみ必要)
+
+DynamoDB store は永続化前後で domain ↔ bytes の変換を行うため、利用側が
+`AggregateSerializer[T,E]` と `EventSerializer[E]` を実装して store に渡す。
 
 ```go
 // JSON wire format for snapshots and events.
@@ -156,32 +181,6 @@ func (CounterEventSerializer) Deserialize(typeName string, data []byte) (Counter
 }
 ```
 
-### Use a Repository (in-memory)
-
-```go
-import (
-    es "github.com/Hiroshi0900/eventstore/v2"
-    esmem "github.com/Hiroshi0900/eventstore/v2/memory"
-)
-
-store := esmem.New() // returns es.EventStore
-repo := es.NewRepository[Counter, CounterEvent](
-    store,
-    NewBlankCounter,
-    CounterAggregateSerializer{},
-    CounterEventSerializer{},
-    es.DefaultConfig(),
-)
-
-id := NewCounterID("c1")
-
-// Save loads (or creates blank) → ApplyCommand → ApplyEvent → persist.
-c, err := repo.Save(ctx, id, IncrementCmd{By: 1})
-
-// Load replays from the latest snapshot + subsequent events.
-loaded, err := repo.Load(ctx, id)
-```
-
 ### Production: DynamoDB
 
 ```go
@@ -190,14 +189,13 @@ import (
     esdb "github.com/Hiroshi0900/eventstore/v2/dynamodb"
 )
 
-store := esdb.New(dynamoClient, esdb.DefaultConfig()) // returns es.EventStore
-repo := es.NewRepository[Counter, CounterEvent](
-    store,
-    NewBlankCounter,
+store := esdb.New[Counter, CounterEvent](
+    dynamoClient,
+    esdb.DefaultConfig(),
     CounterAggregateSerializer{},
     CounterEventSerializer{},
-    es.DefaultConfig(),
 )
+repo := es.NewRepository[Counter, CounterEvent](store, NewBlankCounter, es.DefaultConfig())
 ```
 
 The DynamoDB store maintains two tables (`journal`, `snapshot`), uses

@@ -19,43 +19,59 @@ func (a memoryTestAggID) TypeName() string { return a.typeName }
 func (a memoryTestAggID) Value() string    { return a.value }
 func (a memoryTestAggID) AsString() string { return a.typeName + "-" + a.value }
 
-func newEnv(id es.AggregateID, seqNr uint64, isCreated bool) *es.EventEnvelope {
-	return &es.EventEnvelope{
-		EventID:       "ev-test",
-		EventTypeName: "Test",
-		AggregateID:   id,
-		SeqNr:         seqNr,
-		IsCreated:     isCreated,
-		OccurredAt:    time.Now().UTC(),
-		Payload:       []byte(`{}`),
+// stubEvent / stubAggregate: 最小限の Event / Aggregate 実装。
+type stubEvent struct {
+	aggID memoryTestAggID
+	name  string
+}
+
+func (e stubEvent) EventTypeName() string       { return e.name }
+func (e stubEvent) AggregateID() es.AggregateID { return e.aggID }
+
+type stubAggregate struct {
+	id memoryTestAggID
+}
+
+func (a stubAggregate) AggregateID() es.AggregateID            { return a.id }
+func (a stubAggregate) ApplyCommand(es.Command) (stubEvent, error) {
+	return stubEvent{}, es.ErrUnknownCommand
+}
+func (a stubAggregate) ApplyEvent(stubEvent) es.Aggregate[stubEvent] { return a }
+
+func newStored(id memoryTestAggID, seqNr uint64, isCreated bool) es.StoredEvent[stubEvent] {
+	return es.StoredEvent[stubEvent]{
+		Event:      stubEvent{aggID: id, name: "Test"},
+		EventID:    "ev-test",
+		SeqNr:      seqNr,
+		IsCreated:  isCreated,
+		OccurredAt: time.Now().UTC(),
 	}
 }
 
-func newSnap(id es.AggregateID, seqNr, version uint64) *es.SnapshotEnvelope {
-	return &es.SnapshotEnvelope{
-		AggregateID: id,
-		SeqNr:       seqNr,
-		Version:     version,
-		Payload:     []byte(`{"state":"ok"}`),
-		OccurredAt:  time.Now().UTC(),
+func newStoredSnap(id memoryTestAggID, seqNr, version uint64) es.StoredSnapshot[stubAggregate] {
+	return es.StoredSnapshot[stubAggregate]{
+		Aggregate:  stubAggregate{id: id},
+		SeqNr:      seqNr,
+		Version:    version,
+		OccurredAt: time.Now().UTC(),
 	}
 }
 
 func TestStore_GetLatestSnapshot_empty(t *testing.T) {
-	s := memory.New()
+	s := memory.New[stubAggregate, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
-	snap, err := s.GetLatestSnapshot(context.Background(), id)
+	_, found, err := s.GetLatestSnapshot(context.Background(), id)
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
-	if snap != nil {
-		t.Errorf("snap = %+v, want nil", snap)
+	if found {
+		t.Errorf("found = true, want false")
 	}
 }
 
 func TestStore_GetEventsSince_empty(t *testing.T) {
-	s := memory.New()
+	s := memory.New[stubAggregate, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
 	events, err := s.GetEventsSince(context.Background(), id, 0)
@@ -68,10 +84,10 @@ func TestStore_GetEventsSince_empty(t *testing.T) {
 }
 
 func TestStore_PersistEvent_persistsAndQueryable(t *testing.T) {
-	s := memory.New()
+	s := memory.New[stubAggregate, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
-	if err := s.PersistEvent(context.Background(), newEnv(id, 1, true), 0); err != nil {
+	if err := s.PersistEvent(context.Background(), newStored(id, 1, true), 0); err != nil {
 		t.Fatalf("PersistEvent: %v", err)
 	}
 
@@ -85,13 +101,13 @@ func TestStore_PersistEvent_persistsAndQueryable(t *testing.T) {
 }
 
 func TestStore_PersistEvent_duplicateSeqNr(t *testing.T) {
-	s := memory.New()
+	s := memory.New[stubAggregate, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
-	if err := s.PersistEvent(context.Background(), newEnv(id, 1, true), 0); err != nil {
+	if err := s.PersistEvent(context.Background(), newStored(id, 1, true), 0); err != nil {
 		t.Fatalf("first: %v", err)
 	}
-	err := s.PersistEvent(context.Background(), newEnv(id, 1, false), 0)
+	err := s.PersistEvent(context.Background(), newStored(id, 1, false), 0)
 	if err == nil {
 		t.Fatal("want error, got nil")
 	}
@@ -101,53 +117,53 @@ func TestStore_PersistEvent_duplicateSeqNr(t *testing.T) {
 }
 
 func TestStore_PersistEvent_initialOnExistingAggregate(t *testing.T) {
-	s := memory.New()
+	s := memory.New[stubAggregate, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
-	if err := s.PersistEvent(context.Background(), newEnv(id, 1, true), 0); err != nil {
+	if err := s.PersistEvent(context.Background(), newStored(id, 1, true), 0); err != nil {
 		t.Fatalf("first: %v", err)
 	}
-	err := s.PersistEvent(context.Background(), newEnv(id, 2, true), 0)
+	err := s.PersistEvent(context.Background(), newStored(id, 2, true), 0)
 	if !errors.Is(err, es.ErrDuplicateAggregate) {
 		t.Errorf("got %v, want ErrDuplicateAggregate", err)
 	}
 }
 
 func TestStore_PersistEventAndSnapshot_initialWrite(t *testing.T) {
-	s := memory.New()
+	s := memory.New[stubAggregate, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
-	ev := newEnv(id, 5, false)
-	snap := newSnap(id, 5, 1)
+	ev := newStored(id, 5, false)
+	snap := newStoredSnap(id, 5, 1)
 
 	if err := s.PersistEventAndSnapshot(context.Background(), ev, snap); err != nil {
 		t.Fatalf("PersistEventAndSnapshot: %v", err)
 	}
 
-	got, err := s.GetLatestSnapshot(context.Background(), id)
+	got, found, err := s.GetLatestSnapshot(context.Background(), id)
 	if err != nil {
 		t.Fatalf("GetLatestSnapshot: %v", err)
 	}
-	if got == nil || got.Version != 1 || got.SeqNr != 5 {
-		t.Errorf("snapshot mismatch: got %+v", got)
+	if !found || got.Version != 1 || got.SeqNr != 5 {
+		t.Errorf("snapshot mismatch: got %+v found=%v", got, found)
 	}
 }
 
 func TestStore_PersistEventAndSnapshot_optimisticLockFailure(t *testing.T) {
-	s := memory.New()
+	s := memory.New[stubAggregate, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
 	if err := s.PersistEventAndSnapshot(
-		context.Background(), newEnv(id, 5, false), newSnap(id, 5, 1)); err != nil {
+		context.Background(), newStored(id, 5, false), newStoredSnap(id, 5, 1)); err != nil {
 		t.Fatalf("first: %v", err)
 	}
 	if err := s.PersistEventAndSnapshot(
-		context.Background(), newEnv(id, 10, false), newSnap(id, 10, 2)); err != nil {
+		context.Background(), newStored(id, 10, false), newStoredSnap(id, 10, 2)); err != nil {
 		t.Fatalf("second: %v", err)
 	}
 	// stale writer commits Version=2 again (current is 2, expected=1 → mismatch)
 	err := s.PersistEventAndSnapshot(
-		context.Background(), newEnv(id, 11, false), newSnap(id, 11, 2))
+		context.Background(), newStored(id, 11, false), newStoredSnap(id, 11, 2))
 	if err == nil {
 		t.Fatal("want error, got nil")
 	}

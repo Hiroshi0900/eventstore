@@ -25,27 +25,27 @@ func (c Config) ShouldSnapshot(seqNr uint64) bool {
 	return seqNr%c.SnapshotInterval == 0
 }
 
-// EventStore は永続化抽象。Repository ↔ EventStore のやり取りはすべて
-// Envelope 経由で行われ、domain 型 (T Aggregate) は EventStore 層に露出しない。
+// EventStore は永続化抽象。Repository ↔ EventStore のやり取りは domain 型
+// (T Aggregate[E], E Event) で行われ、(de)serialize は EventStore 実装の責務。
 //
-// 実装側 (memory.New / dynamodb.New) は EventEnvelope と SnapshotEnvelope を
-// そのまま保存・復元する。Aggregate / Event の (de)serialize は Repository が
-// AggregateSerializer / EventSerializer 経由で行い、bytes が Envelope.Payload に格納される。
-type EventStore interface {
-	// GetLatestSnapshot は最新 snapshot envelope を返す。snapshot 未存在の場合は nil, nil を返す。
-	GetLatestSnapshot(ctx context.Context, id AggregateID) (*SnapshotEnvelope, error)
+// memory store は in-memory で型をそのまま保持するので serializer を必要としない。
+// dynamodb store はコンストラクタで AggregateSerializer / EventSerializer を受け取り、
+// 内部で (de)serialize する。
+type EventStore[T Aggregate[E], E Event] interface {
+	// GetLatestSnapshot は最新 snapshot を返す。snapshot 未存在の場合は found=false を返す。
+	GetLatestSnapshot(ctx context.Context, id AggregateID) (snap StoredSnapshot[T], found bool, err error)
 
-	// GetEventsSince は seqNr より大きい seqNr の event envelope を昇順で返す。
-	GetEventsSince(ctx context.Context, id AggregateID, seqNr uint64) ([]*EventEnvelope, error)
+	// GetEventsSince は seqNr より大きい seqNr の events を昇順で返す。
+	GetEventsSince(ctx context.Context, id AggregateID, seqNr uint64) ([]StoredEvent[E], error)
 
-	// PersistEvent は event envelope 単独を保存する (snapshot interval 外のケース)。
+	// PersistEvent は event 単独を保存する (snapshot interval 外のケース)。
 	// expectedVersion は呼び出し側 context 用で、実装は楽観ロックには使わない。
 	// 楽観ロックは PersistEventAndSnapshot に集約。
 	// 同一 (AggregateID, SeqNr) の重複保存は ErrDuplicateAggregate で拒否すること。
-	PersistEvent(ctx context.Context, ev *EventEnvelope, expectedVersion uint64) error
+	PersistEvent(ctx context.Context, ev StoredEvent[E], expectedVersion uint64) error
 
-	// PersistEventAndSnapshot は event envelope と snapshot envelope をアトミックに保存する。
+	// PersistEventAndSnapshot は event と snapshot をアトミックに保存する。
 	// 楽観ロックは snap.Version を基準に、現行 snapshot version が snap.Version - 1 と一致しない
 	// 場合に ErrOptimisticLock を返す。snap.Version == 1 の場合は初回作成扱い (現行 snapshot 未存在を要求)。
-	PersistEventAndSnapshot(ctx context.Context, ev *EventEnvelope, snap *SnapshotEnvelope) error
+	PersistEventAndSnapshot(ctx context.Context, ev StoredEvent[E], snap StoredSnapshot[T]) error
 }

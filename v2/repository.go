@@ -22,31 +22,30 @@ type Repository[T Aggregate[E], E Event] interface {
 }
 
 // defaultRepository は Repository interface の library 内部実装 (factory-sealed)。
+//
+// (de)serialize は EventStore[T,E] 実装側 (memory / dynamodb 等) の責務。
+// 本 Repository は domain 型のみを扱い、wire format には触れない。
 type defaultRepository[T Aggregate[E], E Event] struct {
-	store         EventStore
-	createBlank   func(AggregateID) T
-	aggSerializer AggregateSerializer[T, E]
-	evSerializer  EventSerializer[E]
-	config        Config
+	store       EventStore[T, E]
+	createBlank func(AggregateID) T
+	config      Config
 }
 
 // NewRepository は Repository[T, E] を生成する。
 //
 // createBlank は集約が未存在の状態 (Save の初回呼び出し) で使う初期 aggregate を返す関数。
 // 利用側で typed AggregateID と pure struct を組み合わせて定義する。
+//
+// (de)serialize の責務は store 側にある (dynamodb 等のコンストラクタで Serializer を受け取る)。
 func NewRepository[T Aggregate[E], E Event](
-	store EventStore,
+	store EventStore[T, E],
 	createBlank func(AggregateID) T,
-	aggSerializer AggregateSerializer[T, E],
-	evSerializer EventSerializer[E],
 	config Config,
 ) Repository[T, E] {
 	return &defaultRepository[T, E]{
-		store:         store,
-		createBlank:   createBlank,
-		aggSerializer: aggSerializer,
-		evSerializer:  evSerializer,
-		config:        config,
+		store:       store,
+		createBlank: createBlank,
+		config:      config,
 	}
 }
 
@@ -56,16 +55,13 @@ func (r *defaultRepository[T, E]) loadInternal(
 	ctx context.Context,
 	id AggregateID,
 ) (agg T, seqNr, version uint64, notFound bool, err error) {
-	snap, err := r.store.GetLatestSnapshot(ctx, id)
+	snap, found, err := r.store.GetLatestSnapshot(ctx, id)
 	if err != nil {
 		return agg, 0, 0, false, err
 	}
 
-	if snap != nil {
-		agg, err = r.aggSerializer.Deserialize(snap.Payload)
-		if err != nil {
-			return agg, 0, 0, false, err
-		}
+	if found {
+		agg = snap.Aggregate
 		seqNr = snap.SeqNr
 		version = snap.Version
 	} else {
@@ -79,16 +75,12 @@ func (r *defaultRepository[T, E]) loadInternal(
 		return agg, 0, 0, false, err
 	}
 
-	if snap == nil && len(events) == 0 {
+	if !found && len(events) == 0 {
 		return agg, 0, 0, true, nil
 	}
 
-	for _, env := range events {
-		ev, err := r.evSerializer.Deserialize(env.EventTypeName, env.Payload)
-		if err != nil {
-			return agg, 0, 0, false, err
-		}
-		next, ok := agg.ApplyEvent(ev).(T)
+	for _, stored := range events {
+		next, ok := agg.ApplyEvent(stored.Event).(T)
 		if !ok {
 			return agg, 0, 0, false, fmt.Errorf(
 				"%w: ApplyEvent returned a value that does not implement T",
@@ -96,7 +88,7 @@ func (r *defaultRepository[T, E]) loadInternal(
 			)
 		}
 		agg = next
-		seqNr = env.SeqNr
+		seqNr = stored.SeqNr
 	}
 	return agg, seqNr, version, false, nil
 }
@@ -143,41 +135,30 @@ func (r *defaultRepository[T, E]) Save(
 	}
 
 	nextSeqNr := currentSeqNr + 1
-
-	payload, err := r.evSerializer.Serialize(ev)
-	if err != nil {
-		return zero, err
-	}
+	now := time.Now().UTC()
 
 	eventID, err := generateEventID()
 	if err != nil {
 		return zero, err
 	}
 
-	envelope := &EventEnvelope{
-		EventID:       eventID,
-		EventTypeName: ev.EventTypeName(),
-		AggregateID:   ev.AggregateID(),
-		SeqNr:         nextSeqNr,
-		IsCreated:     currentSeqNr == 0,
-		OccurredAt:    time.Now().UTC(),
-		Payload:       payload,
+	stored := StoredEvent[E]{
+		Event:      ev,
+		EventID:    eventID,
+		SeqNr:      nextSeqNr,
+		IsCreated:  currentSeqNr == 0,
+		OccurredAt: now,
 		// TraceParent / TraceState は dynamodb 側で context から注入する。
 	}
 
 	if r.config.ShouldSnapshot(nextSeqNr) {
-		snapPayload, err := r.aggSerializer.Serialize(next)
-		if err != nil {
-			return zero, err
+		snap := StoredSnapshot[T]{
+			Aggregate:  next,
+			SeqNr:      nextSeqNr,
+			Version:    currentVersion + 1,
+			OccurredAt: now,
 		}
-		snap := &SnapshotEnvelope{
-			AggregateID: ev.AggregateID(),
-			SeqNr:       nextSeqNr,
-			Version:     currentVersion + 1,
-			Payload:     snapPayload,
-			OccurredAt:  envelope.OccurredAt,
-		}
-		if err := r.store.PersistEventAndSnapshot(ctx, envelope, snap); err != nil {
+		if err := r.store.PersistEventAndSnapshot(ctx, stored, snap); err != nil {
 			return zero, err
 		}
 	} else {
@@ -191,7 +172,7 @@ func (r *defaultRepository[T, E]) Save(
 		if currentSeqNr > 0 && expectedVersion == 0 {
 			expectedVersion = currentSeqNr
 		}
-		if err := r.store.PersistEvent(ctx, envelope, expectedVersion); err != nil {
+		if err := r.store.PersistEvent(ctx, stored, expectedVersion); err != nil {
 			return zero, err
 		}
 	}

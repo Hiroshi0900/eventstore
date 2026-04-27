@@ -6,11 +6,11 @@ import (
 
 	awsdynamo "github.com/aws/aws-sdk-go-v2/service/dynamodb"
 
+	es "github.com/Hiroshi0900/eventstore/v2"
 	v2dynamo "github.com/Hiroshi0900/eventstore/v2/dynamodb"
 )
 
 // fakeClient は dynamodb.Client interface を満たす最小実装。
-// 各メソッドはゼロ値を返すのみ（構築テスト用）。
 type fakeClient struct{}
 
 func (fakeClient) GetItem(ctx context.Context, params *awsdynamo.GetItemInput, optFns ...func(*awsdynamo.Options)) (*awsdynamo.GetItemOutput, error) {
@@ -37,15 +37,53 @@ func (fakeClient) DescribeTable(ctx context.Context, params *awsdynamo.DescribeT
 	return &awsdynamo.DescribeTableOutput{}, nil
 }
 
+// stub types for generic instantiation.
+type ddbTestAggID struct{ value string }
+
+func (a ddbTestAggID) TypeName() string { return "T" }
+func (a ddbTestAggID) Value() string    { return a.value }
+func (a ddbTestAggID) AsString() string { return "T-" + a.value }
+
+type ddbStubEvent struct{ aggID ddbTestAggID }
+
+func (e ddbStubEvent) EventTypeName() string       { return "Stub" }
+func (e ddbStubEvent) AggregateID() es.AggregateID { return e.aggID }
+
+type ddbStubAggregate struct{ id ddbTestAggID }
+
+func (a ddbStubAggregate) AggregateID() es.AggregateID                  { return a.id }
+func (a ddbStubAggregate) ApplyCommand(es.Command) (ddbStubEvent, error) { return ddbStubEvent{}, es.ErrUnknownCommand }
+func (a ddbStubAggregate) ApplyEvent(ddbStubEvent) es.Aggregate[ddbStubEvent] { return a }
+
+type ddbStubAggSer struct{}
+
+func (ddbStubAggSer) Serialize(ddbStubAggregate) ([]byte, error)   { return nil, nil }
+func (ddbStubAggSer) Deserialize([]byte) (ddbStubAggregate, error) { return ddbStubAggregate{}, nil }
+
+type ddbStubEvSer struct{}
+
+func (ddbStubEvSer) Serialize(ddbStubEvent) ([]byte, error)               { return nil, nil }
+func (ddbStubEvSer) Deserialize(string, []byte) (ddbStubEvent, error)     { return ddbStubEvent{}, nil }
+
 func TestNew_Construct(t *testing.T) {
-	store := v2dynamo.New(fakeClient{}, v2dynamo.DefaultConfig())
+	store := v2dynamo.New[ddbStubAggregate, ddbStubEvent](
+		fakeClient{},
+		v2dynamo.DefaultConfig(),
+		ddbStubAggSer{},
+		ddbStubEvSer{},
+	)
 	if store == nil {
 		t.Fatal("expected non-nil EventStore")
 	}
 }
 
 func TestNewWithTables_Construct(t *testing.T) {
-	mgr := v2dynamo.NewWithTables(fakeClient{}, v2dynamo.DefaultConfig())
+	mgr := v2dynamo.NewWithTables[ddbStubAggregate, ddbStubEvent](
+		fakeClient{},
+		v2dynamo.DefaultConfig(),
+		ddbStubAggSer{},
+		ddbStubEvSer{},
+	)
 	if mgr == nil {
 		t.Fatal("expected non-nil TableManager")
 	}

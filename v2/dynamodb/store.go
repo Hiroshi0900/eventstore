@@ -48,22 +48,34 @@ func DefaultConfig() Config {
 	}
 }
 
-// store is the DynamoDB-backed EventStore implementation.
-// concrete type は非公開で、外部からは New() が返す es.EventStore interface 経由でのみ操作する。
-type store struct {
+// store is the DynamoDB-backed EventStore[T, E] implementation.
+// concrete type は非公開で、外部からは New() が返す es.EventStore[T, E] interface 経由でのみ操作する。
+//
+// AggregateSerializer / EventSerializer は構築時に注入され、attribute marshal/unmarshal で
+// domain 型 ↔ bytes の変換に使われる。Repository 層には serialize の責務が漏れない設計。
+type store[T es.Aggregate[E], E es.Event] struct {
 	client      Client
 	keyResolver *keyresolver.Resolver
 	config      Config
+	aggSer      es.AggregateSerializer[T, E]
+	evSer       es.EventSerializer[E]
 }
 
-// New は DynamoDB-backed EventStore を生成する。
-// CreateTables / WaitForTables を呼びたい場合は型アサーション (`*TableManager`) を経由する必要があるため、
-// テーブル管理は別途 NewWithTables を提供する (下記)。
-func New(client Client, config Config) es.EventStore {
-	return &store{
+// New は DynamoDB-backed EventStore[T, E] を生成する。
+//
+// aggSer / evSer は snapshot / event payload の (de)serialize に使われる。
+func New[T es.Aggregate[E], E es.Event](
+	client Client,
+	config Config,
+	aggSer es.AggregateSerializer[T, E],
+	evSer es.EventSerializer[E],
+) es.EventStore[T, E] {
+	return &store[T, E]{
 		client:      client,
 		keyResolver: keyresolver.New(keyresolver.Config{ShardCount: config.ShardCount}),
 		config:      config,
+		aggSer:      aggSer,
+		evSer:       evSer,
 	}
 }
 
@@ -74,16 +86,23 @@ type TableManager interface {
 	WaitForTables(ctx context.Context) error
 }
 
-// NewWithTables は EventStore + TableManager の機能を併せ持つオブジェクトを返す。
+// NewWithTables は EventStore[T, E] + TableManager の機能を併せ持つオブジェクトを返す。
 // テーブル管理が必要なテスト・デプロイ初期化スクリプト等で使う。
-func NewWithTables(client Client, config Config) interface {
-	es.EventStore
+func NewWithTables[T es.Aggregate[E], E es.Event](
+	client Client,
+	config Config,
+	aggSer es.AggregateSerializer[T, E],
+	evSer es.EventSerializer[E],
+) interface {
+	es.EventStore[T, E]
 	TableManager
 } {
-	return &store{
+	return &store[T, E]{
 		client:      client,
 		keyResolver: keyresolver.New(keyresolver.Config{ShardCount: config.ShardCount}),
 		config:      config,
+		aggSer:      aggSer,
+		evSer:       evSer,
 	}
 }
 
@@ -103,8 +122,9 @@ const (
 	colTracestate  = "tracestate"
 )
 
-// GetLatestSnapshot returns the latest snapshot envelope or nil.
-func (s *store) GetLatestSnapshot(ctx context.Context, id es.AggregateID) (*es.SnapshotEnvelope, error) {
+// GetLatestSnapshot returns the latest snapshot or found=false.
+func (s *store[T, E]) GetLatestSnapshot(ctx context.Context, id es.AggregateID) (es.StoredSnapshot[T], bool, error) {
+	var zero es.StoredSnapshot[T]
 	keys := s.keyResolver.ResolveSnapshotKeys(id)
 	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName: aws.String(s.config.SnapshotTableName),
@@ -114,16 +134,38 @@ func (s *store) GetLatestSnapshot(ctx context.Context, id es.AggregateID) (*es.S
 		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("get snapshot: %w", err)
+		return zero, false, fmt.Errorf("get snapshot: %w", err)
 	}
 	if out.Item == nil {
-		return nil, nil
+		return zero, false, nil
 	}
-	return s.unmarshalSnapshot(out.Item, id)
+
+	seqNr, err := getN(out.Item, colSeqNr)
+	if err != nil {
+		return zero, false, err
+	}
+	version, err := getN(out.Item, colVersion)
+	if err != nil {
+		return zero, false, err
+	}
+	payload, _ := getB(out.Item, colPayload)
+	occurred, _ := getN(out.Item, colOccurred)
+
+	agg, err := s.aggSer.Deserialize(payload)
+	if err != nil {
+		return zero, false, err
+	}
+	return es.StoredSnapshot[T]{
+		Aggregate: agg,
+		SeqNr:     seqNr,
+		Version:   version,
+		// #nosec G115 -- UnixMilli は実用範囲で int64 に収まる
+		OccurredAt: time.UnixMilli(int64(occurred)).UTC(),
+	}, true, nil
 }
 
 // GetEventsSince queries the journal GSI for events with SeqNr > seqNr.
-func (s *store) GetEventsSince(ctx context.Context, id es.AggregateID, seqNr uint64) ([]*es.EventEnvelope, error) {
+func (s *store[T, E]) GetEventsSince(ctx context.Context, id es.AggregateID, seqNr uint64) ([]es.StoredEvent[E], error) {
 	aidKey := s.keyResolver.ResolveAggregateIDKey(id)
 	out, err := s.client.Query(ctx, &dynamodb.QueryInput{
 		TableName:              aws.String(s.config.JournalTableName),
@@ -142,22 +184,25 @@ func (s *store) GetEventsSince(ctx context.Context, id es.AggregateID, seqNr uin
 	if err != nil {
 		return nil, fmt.Errorf("query events: %w", err)
 	}
-	envs := make([]*es.EventEnvelope, 0, len(out.Items))
+	stored := make([]es.StoredEvent[E], 0, len(out.Items))
 	for _, item := range out.Items {
-		ev, err := s.unmarshalEvent(item, id)
+		ev, err := s.unmarshalEvent(item)
 		if err != nil {
 			return nil, err
 		}
-		envs = append(envs, ev)
+		stored = append(stored, ev)
 	}
-	return envs, nil
+	return stored, nil
 }
 
-// PersistEvent writes a single event envelope. ConditionExpression は同一 (pkey, skey) の重複保存を拒否し、
+// PersistEvent writes a single event. ConditionExpression は同一 (pkey, skey) の重複保存を拒否し、
 // ConditionalCheckFailed を ErrDuplicateAggregate にマッピングする。
-func (s *store) PersistEvent(ctx context.Context, ev *es.EventEnvelope, _ uint64) error {
-	item := s.marshalEvent(ctx, ev)
-	_, err := s.client.PutItem(ctx, &dynamodb.PutItemInput{
+func (s *store[T, E]) PersistEvent(ctx context.Context, ev es.StoredEvent[E], _ uint64) error {
+	item, err := s.marshalEvent(ctx, ev)
+	if err != nil {
+		return err
+	}
+	_, err = s.client.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:           aws.String(s.config.JournalTableName),
 		Item:                item,
 		ConditionExpression: aws.String("attribute_not_exists(#pk)"),
@@ -168,7 +213,7 @@ func (s *store) PersistEvent(ctx context.Context, ev *es.EventEnvelope, _ uint64
 	if err != nil {
 		var ccfe *types.ConditionalCheckFailedException
 		if errors.As(err, &ccfe) {
-			return es.NewDuplicateAggregateError(ev.AggregateID.AsString())
+			return es.NewDuplicateAggregateError(ev.Event.AggregateID().AsString())
 		}
 		return fmt.Errorf("put event: %w", err)
 	}
@@ -177,9 +222,15 @@ func (s *store) PersistEvent(ctx context.Context, ev *es.EventEnvelope, _ uint64
 
 // PersistEventAndSnapshot writes both event and snapshot atomically using TransactWriteItems.
 // snapshot put has a Version condition for optimistic locking.
-func (s *store) PersistEventAndSnapshot(ctx context.Context, ev *es.EventEnvelope, snap *es.SnapshotEnvelope) error {
-	eventItem := s.marshalEvent(ctx, ev)
-	snapshotItem := s.marshalSnapshot(snap)
+func (s *store[T, E]) PersistEventAndSnapshot(ctx context.Context, ev es.StoredEvent[E], snap es.StoredSnapshot[T]) error {
+	eventItem, err := s.marshalEvent(ctx, ev)
+	if err != nil {
+		return err
+	}
+	snapshotItem, err := s.marshalSnapshot(snap)
+	if err != nil {
+		return err
+	}
 
 	expected := snap.Version - 1
 	condExpr := "attribute_not_exists(#version) OR #version = :expected"
@@ -187,7 +238,7 @@ func (s *store) PersistEventAndSnapshot(ctx context.Context, ev *es.EventEnvelop
 		condExpr = "attribute_not_exists(#version)"
 	}
 
-	_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+	_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
 		TransactItems: []types.TransactWriteItem{
 			{
 				Put: &types.Put{
@@ -212,7 +263,7 @@ func (s *store) PersistEventAndSnapshot(ctx context.Context, ev *es.EventEnvelop
 	})
 	if err != nil {
 		if isConditionalCheckFailureInTransaction(err) {
-			return es.NewOptimisticLockError(ev.AggregateID.AsString(), expected, 0)
+			return es.NewOptimisticLockError(ev.Event.AggregateID().AsString(), expected, 0)
 		}
 		return fmt.Errorf("transact write: %w", err)
 	}
@@ -248,8 +299,12 @@ func isTableAlreadyExistsError(err error) bool {
 
 // --- attribute marshal / unmarshal ---
 
-func (s *store) marshalEvent(ctx context.Context, ev *es.EventEnvelope) map[string]types.AttributeValue {
-	keys := s.keyResolver.ResolveEventKeys(ev.AggregateID, ev.SeqNr)
+func (s *store[T, E]) marshalEvent(ctx context.Context, ev es.StoredEvent[E]) (map[string]types.AttributeValue, error) {
+	payload, err := s.evSer.Serialize(ev.Event)
+	if err != nil {
+		return nil, err
+	}
+	keys := s.keyResolver.ResolveEventKeys(ev.Event.AggregateID(), ev.SeqNr)
 	carrier := propagation.MapCarrier{}
 	otel.GetTextMapPropagator().Inject(ctx, carrier)
 
@@ -258,9 +313,9 @@ func (s *store) marshalEvent(ctx context.Context, ev *es.EventEnvelope) map[stri
 		colSKey:      &types.AttributeValueMemberS{Value: keys.SortKey},
 		colAid:       &types.AttributeValueMemberS{Value: keys.AggregateIDKey},
 		colSeqNr:     &types.AttributeValueMemberN{Value: strconv.FormatUint(ev.SeqNr, 10)},
-		colPayload:   &types.AttributeValueMemberB{Value: ev.Payload},
+		colPayload:   &types.AttributeValueMemberB{Value: payload},
 		colOccurred:  &types.AttributeValueMemberN{Value: strconv.FormatInt(ev.OccurredAt.UnixMilli(), 10)},
-		colTypeName:  &types.AttributeValueMemberS{Value: ev.EventTypeName},
+		colTypeName:  &types.AttributeValueMemberS{Value: ev.Event.EventTypeName()},
 		colEventID:   &types.AttributeValueMemberS{Value: ev.EventID},
 		colIsCreated: &types.AttributeValueMemberBOOL{Value: ev.IsCreated},
 	}
@@ -270,30 +325,35 @@ func (s *store) marshalEvent(ctx context.Context, ev *es.EventEnvelope) map[stri
 	if ts := carrier.Get("tracestate"); ts != "" {
 		item[colTracestate] = &types.AttributeValueMemberS{Value: ts}
 	}
-	return item
+	return item, nil
 }
 
-func (s *store) marshalSnapshot(snap *es.SnapshotEnvelope) map[string]types.AttributeValue {
-	keys := s.keyResolver.ResolveSnapshotKeys(snap.AggregateID)
+func (s *store[T, E]) marshalSnapshot(snap es.StoredSnapshot[T]) (map[string]types.AttributeValue, error) {
+	payload, err := s.aggSer.Serialize(snap.Aggregate)
+	if err != nil {
+		return nil, err
+	}
+	keys := s.keyResolver.ResolveSnapshotKeys(snap.Aggregate.AggregateID())
 	return map[string]types.AttributeValue{
 		colPKey:     &types.AttributeValueMemberS{Value: keys.PartitionKey},
 		colSKey:     &types.AttributeValueMemberS{Value: keys.SortKey},
 		colAid:      &types.AttributeValueMemberS{Value: keys.AggregateIDKey},
 		colSeqNr:    &types.AttributeValueMemberN{Value: strconv.FormatUint(snap.SeqNr, 10)},
 		colVersion:  &types.AttributeValueMemberN{Value: strconv.FormatUint(snap.Version, 10)},
-		colPayload:  &types.AttributeValueMemberB{Value: snap.Payload},
+		colPayload:  &types.AttributeValueMemberB{Value: payload},
 		colOccurred: &types.AttributeValueMemberN{Value: strconv.FormatInt(snap.OccurredAt.UnixMilli(), 10)},
-	}
+	}, nil
 }
 
-func (s *store) unmarshalEvent(item map[string]types.AttributeValue, fallbackID es.AggregateID) (*es.EventEnvelope, error) {
+func (s *store[T, E]) unmarshalEvent(item map[string]types.AttributeValue) (es.StoredEvent[E], error) {
+	var zero es.StoredEvent[E]
 	seqNr, err := getN(item, colSeqNr)
 	if err != nil {
-		return nil, err
+		return zero, err
 	}
 	occurred, err := getN(item, colOccurred)
 	if err != nil {
-		return nil, err
+		return zero, err
 	}
 	payload, _ := getB(item, colPayload)
 	typeName, _ := getS(item, colTypeName)
@@ -302,39 +362,20 @@ func (s *store) unmarshalEvent(item map[string]types.AttributeValue, fallbackID 
 	traceparent, _ := getS(item, colTraceparent)
 	tracestate, _ := getS(item, colTracestate)
 
-	return &es.EventEnvelope{
-		EventID:       eventID,
-		EventTypeName: typeName,
-		AggregateID:   fallbackID,
-		SeqNr:         seqNr,
-		IsCreated:     isCreated,
+	ev, err := s.evSer.Deserialize(typeName, payload)
+	if err != nil {
+		return zero, err
+	}
+
+	return es.StoredEvent[E]{
+		Event:     ev,
+		EventID:   eventID,
+		SeqNr:     seqNr,
+		IsCreated: isCreated,
 		// #nosec G115 -- UnixMilli は実用範囲で int64 に収まる
 		OccurredAt:  time.UnixMilli(int64(occurred)).UTC(),
-		Payload:     payload,
 		TraceParent: traceparent,
 		TraceState:  tracestate,
-	}, nil
-}
-
-func (s *store) unmarshalSnapshot(item map[string]types.AttributeValue, fallbackID es.AggregateID) (*es.SnapshotEnvelope, error) {
-	seqNr, err := getN(item, colSeqNr)
-	if err != nil {
-		return nil, err
-	}
-	version, err := getN(item, colVersion)
-	if err != nil {
-		return nil, err
-	}
-	payload, _ := getB(item, colPayload)
-	occurred, _ := getN(item, colOccurred)
-
-	return &es.SnapshotEnvelope{
-		AggregateID: fallbackID,
-		SeqNr:       seqNr,
-		Version:     version,
-		Payload:     payload,
-		// #nosec G115
-		OccurredAt: time.UnixMilli(int64(occurred)).UTC(),
 	}, nil
 }
 
@@ -372,7 +413,7 @@ func getN(item map[string]types.AttributeValue, key string) (uint64, error) {
 }
 
 // CreateTables creates the journal and snapshot tables (for testing/setup).
-func (s *store) CreateTables(ctx context.Context) error {
+func (s *store[T, E]) CreateTables(ctx context.Context) error {
 	_, err := s.client.CreateTable(ctx, &dynamodb.CreateTableInput{
 		TableName: aws.String(s.config.JournalTableName),
 		KeySchema: []types.KeySchemaElement{
@@ -432,7 +473,7 @@ func (s *store) CreateTables(ctx context.Context) error {
 }
 
 // WaitForTables waits until both tables are active.
-func (s *store) WaitForTables(ctx context.Context) error {
+func (s *store[T, E]) WaitForTables(ctx context.Context) error {
 	waiter := dynamodb.NewTableExistsWaiter(s.client)
 	maxWaitTime := 5 * time.Minute
 
