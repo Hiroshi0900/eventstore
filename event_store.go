@@ -5,6 +5,8 @@ import (
 )
 
 // EventStore provides operations for persisting and retrieving events and snapshots.
+//
+// Deprecated: use github.com/Hiroshi0900/eventstore/v2.EventStore instead.
 type EventStore interface {
 	// GetLatestSnapshotByID retrieves the latest snapshot for the given aggregate ID.
 	// Returns nil if no snapshot exists.
@@ -24,6 +26,8 @@ type EventStore interface {
 }
 
 // EventStoreConfig holds the configuration for the event store.
+//
+// Deprecated: use github.com/Hiroshi0900/eventstore/v2.Config instead.
 type EventStoreConfig struct {
 	// SnapshotInterval determines the number of events between snapshots.
 	// Default is 5 (one snapshot every 5 events).
@@ -44,6 +48,8 @@ type EventStoreConfig struct {
 }
 
 // DefaultEventStoreConfig returns the default configuration.
+//
+// Deprecated: use github.com/Hiroshi0900/eventstore/v2.DefaultConfig instead.
 func DefaultEventStoreConfig() EventStoreConfig {
 	return EventStoreConfig{
 		SnapshotInterval:  5,
@@ -63,6 +69,8 @@ func (c EventStoreConfig) ShouldSnapshot(seqNr uint64) bool {
 }
 
 // Repository provides a high-level abstraction over EventStore for aggregate operations.
+//
+// Deprecated: use github.com/Hiroshi0900/eventstore/v2.Repository[T,E] instead.
 type Repository[T Aggregate] interface {
 	// FindByID loads an aggregate by ID.
 	// Returns ErrAggregateNotFound if the aggregate does not exist.
@@ -73,6 +81,9 @@ type Repository[T Aggregate] interface {
 }
 
 // AggregateFactory creates aggregates from events.
+//
+// Deprecated: v2 replaces this with createBlank function + AggregateSerializer/EventSerializer interfaces.
+// See github.com/Hiroshi0900/eventstore/v2.
 type AggregateFactory[T Aggregate] interface {
 	// Create creates a new empty aggregate with the given ID.
 	Create(id AggregateID) T
@@ -88,6 +99,8 @@ type AggregateFactory[T Aggregate] interface {
 }
 
 // DefaultRepository is a generic repository implementation.
+//
+// Deprecated: use github.com/Hiroshi0900/eventstore/v2.DefaultRepository[T,E] instead.
 type DefaultRepository[T Aggregate] struct {
 	store      EventStore
 	factory    AggregateFactory[T]
@@ -96,6 +109,8 @@ type DefaultRepository[T Aggregate] struct {
 }
 
 // NewRepository creates a new DefaultRepository.
+//
+// Deprecated: use github.com/Hiroshi0900/eventstore/v2.NewRepository instead.
 func NewRepository[T Aggregate](
 	store EventStore,
 	factory AggregateFactory[T],

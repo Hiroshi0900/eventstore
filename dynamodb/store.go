@@ -20,6 +20,8 @@ import (
 
 // Client is the interface for the DynamoDB client.
 // Used to enable mocking in tests.
+//
+// Deprecated: use github.com/Hiroshi0900/eventstore/v2/dynamodb.Client instead.
 type Client interface {
 	GetItem(ctx context.Context, params *dynamodb.GetItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error)
 	Query(ctx context.Context, params *dynamodb.QueryInput, optFns ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error)
@@ -30,6 +32,8 @@ type Client interface {
 }
 
 // Store is the DynamoDB-backed EventStore implementation.
+//
+// Deprecated: use github.com/Hiroshi0900/eventstore/v2/dynamodb.Store instead.
 type Store struct {
 	client      Client
 	keyResolver *keyresolver.Resolver
@@ -37,6 +41,8 @@ type Store struct {
 }
 
 // Config holds the DynamoDB event store configuration.
+//
+// Deprecated: use github.com/Hiroshi0900/eventstore/v2/dynamodb.Config instead.
 type Config struct {
 	JournalTableName  string
 	SnapshotTableName string
@@ -46,6 +52,8 @@ type Config struct {
 }
 
 // DefaultConfig returns the default configuration.
+//
+// Deprecated: use github.com/Hiroshi0900/eventstore/v2/dynamodb.DefaultConfig instead.
 func DefaultConfig() Config {
 	return Config{
 		JournalTableName:  "journal",
@@ -57,6 +65,8 @@ func DefaultConfig() Config {
 }
 
 // New creates a new DynamoDB event store.
+//
+// Deprecated: use github.com/Hiroshi0900/eventstore/v2/dynamodb.New instead.
 func New(client Client, config Config) *Store {
 	return &Store{
 		client:      client,

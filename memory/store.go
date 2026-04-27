@@ -10,6 +10,8 @@ import (
 )
 
 // Store is an in-memory EventStore implementation for testing.
+//
+// Deprecated: use github.com/Hiroshi0900/eventstore/v2/memory.Store instead.
 type Store struct {
 	mu        sync.RWMutex
 	events    map[string][]es.Event       // aggregateId -> events
@@ -18,6 +20,8 @@ type Store struct {
 }
 
 // New creates a new in-memory event store.
+//
+// Deprecated: use github.com/Hiroshi0900/eventstore/v2/memory.New instead.
 func New() *Store {
 	return &Store{
 		events:    make(map[string][]es.Event),

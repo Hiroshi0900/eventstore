@@ -9,6 +9,8 @@ import (
 
 // AggregateID represents the unique identifier of an aggregate.
 // It combines a type name (e.g. "MemorialSetting") with a unique value (e.g. a ULID).
+//
+// Deprecated: use github.com/Hiroshi0900/eventstore/v2 instead.
 type AggregateID interface {
 	// GetTypeName returns the type name of the aggregate (e.g. "MemorialSetting").
 	GetTypeName() string
@@ -19,12 +21,16 @@ type AggregateID interface {
 }
 
 // DefaultAggregateID is the default implementation of AggregateID.
+//
+// Deprecated: use github.com/Hiroshi0900/eventstore/v2 instead.
 type DefaultAggregateID struct {
 	typeName string
 	value    string
 }
 
 // NewAggregateId creates a new DefaultAggregateID.
+//
+// Deprecated: use github.com/Hiroshi0900/eventstore/v2.NewAggregateID instead.
 func NewAggregateId(typeName, value string) *DefaultAggregateID {
 	return &DefaultAggregateID{
 		typeName: typeName,
@@ -46,6 +52,8 @@ func (id *DefaultAggregateID) AsString() string {
 
 // Event represents a domain event that has occurred.
 // Events are immutable and represent facts about what happened in the past.
+//
+// Deprecated: use github.com/Hiroshi0900/eventstore/v2 instead.
 type Event interface {
 	// GetID returns the unique identifier of this event.
 	GetID() string
@@ -96,6 +104,8 @@ func WithOccurredAtUnixMilli(unixMilli uint64) EventOption {
 }
 
 // DefaultEvent is the default implementation of Event.
+//
+// Deprecated: use github.com/Hiroshi0900/eventstore/v2 instead.
 type DefaultEvent struct {
 	id          string
 	typeName    string
@@ -107,6 +117,8 @@ type DefaultEvent struct {
 }
 
 // NewEvent creates a new DefaultEvent.
+//
+// Deprecated: use github.com/Hiroshi0900/eventstore/v2 instead.
 func NewEvent(
 	id string,
 	typeName string,
@@ -160,6 +172,8 @@ func (e *DefaultEvent) GetPayload() []byte {
 
 // Aggregate represents an event-sourced aggregate root.
 // It holds version information for optimistic locking.
+//
+// Deprecated: use github.com/Hiroshi0900/eventstore/v2.Aggregate[E] instead.
 type Aggregate interface {
 	// GetId returns the unique identifier of the aggregate.
 	GetId() AggregateID
