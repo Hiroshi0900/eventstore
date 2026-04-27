@@ -108,3 +108,67 @@ func errorsIs(err, target error) bool {
 	}
 	return err == target
 }
+
+func newSnapshotEnvelope(id es.AggregateID, seqNr, version uint64) *es.SnapshotEnvelope {
+	return &es.SnapshotEnvelope{
+		AggregateID: id,
+		SeqNr:       seqNr,
+		Version:     version,
+		Payload:     []byte(`{"state":"ok"}`),
+		OccurredAt:  time.Now(),
+	}
+}
+
+func TestStore_PersistEventAndSnapshot_initialWrite(t *testing.T) {
+	store := memory.New()
+	id := es.NewAggregateID("Visit", "x")
+
+	ev := newEventEnvelope(t, id, 5, false)
+	snap := newSnapshotEnvelope(id, 5, 1)
+
+	if err := store.PersistEventAndSnapshot(context.Background(), ev, snap); err != nil {
+		t.Fatalf("PersistEventAndSnapshot: %v", err)
+	}
+
+	got, err := store.GetLatestSnapshot(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetLatestSnapshot: %v", err)
+	}
+	if got == nil || got.Version != 1 || got.SeqNr != 5 {
+		t.Errorf("snapshot mismatch: got %+v", got)
+	}
+}
+
+func TestStore_PersistEventAndSnapshot_optimisticLockFailure(t *testing.T) {
+	store := memory.New()
+	id := es.NewAggregateID("Visit", "x")
+
+	if err := store.PersistEventAndSnapshot(
+		context.Background(),
+		newEventEnvelope(t, id, 5, false),
+		newSnapshotEnvelope(id, 5, 1),
+	); err != nil {
+		t.Fatalf("first persist: %v", err)
+	}
+	// Concurrent caller still thinks the version is 1, computes Version=2,
+	// but another writer already moved the version to 2 below.
+	if err := store.PersistEventAndSnapshot(
+		context.Background(),
+		newEventEnvelope(t, id, 10, false),
+		newSnapshotEnvelope(id, 10, 2),
+	); err != nil {
+		t.Fatalf("second persist: %v", err)
+	}
+	// Now a stale writer attempts to commit Version=2 again.
+	err := store.PersistEventAndSnapshot(
+		context.Background(),
+		newEventEnvelope(t, id, 11, false),
+		newSnapshotEnvelope(id, 11, 2),
+	)
+	if err == nil {
+		t.Fatalf("want ErrOptimisticLock, got nil")
+	}
+	if !errorsIs(err, es.ErrOptimisticLock) {
+		t.Errorf("got %v, want ErrOptimisticLock", err)
+	}
+}

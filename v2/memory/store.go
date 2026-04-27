@@ -72,7 +72,37 @@ func (s *Store) PersistEvent(_ context.Context, ev *es.EventEnvelope, expectedVe
 	return nil
 }
 
-// PersistEventAndSnapshot is implemented in subsequent tasks.
-func (s *Store) PersistEventAndSnapshot(_ context.Context, _ *es.EventEnvelope, _ *es.SnapshotEnvelope) error {
-	panic("not implemented")
+// PersistEventAndSnapshot appends an event AND updates the snapshot atomically.
+// The snapshot's Version field acts as the optimistic lock: the caller is
+// expected to pass Version = currentSnapshotVersion + 1. The operation fails
+// with ErrOptimisticLock if the stored snapshot's Version is not snap.Version - 1.
+// (For initial writes there is no stored snapshot; snap.Version must be 1.)
+func (s *Store) PersistEventAndSnapshot(
+	_ context.Context,
+	ev *es.EventEnvelope,
+	snap *es.SnapshotEnvelope,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := ev.AggregateID.AsString()
+
+	expected := snap.Version - 1
+	current := uint64(0)
+	if existing := s.snapshots[key]; existing != nil {
+		current = existing.Version
+	}
+	if current != expected {
+		return es.NewOptimisticLockError(key, expected, current)
+	}
+
+	for _, existing := range s.events[key] {
+		if existing.SeqNr == ev.SeqNr {
+			return es.NewDuplicateAggregateError(key)
+		}
+	}
+
+	s.events[key] = append(s.events[key], ev)
+	s.snapshots[key] = snap
+	return nil
 }
