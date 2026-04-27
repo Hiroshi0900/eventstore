@@ -29,81 +29,130 @@ go get github.com/Hiroshi0900/eventstore/v2
 | `github.com/Hiroshi0900/eventstore/v2/dynamodb` | DynamoDB-backed `EventStore` implementation |
 | `github.com/Hiroshi0900/eventstore/v2/memory` | In-memory `EventStore` implementation (for testing) |
 
-### Key changes from v1
+### Key design points
 
-- **Generic `EventStore[T]`** — type-safe Store/Repository pair; snapshots round-trip as `Aggregate` values, not byte payloads
-- **`Command` abstraction** — domain intent is a first-class type passed to `Repository.Store`
-- **`ApplyCommand` / `ApplyEvent` on the aggregate** — the aggregate decides which event to emit and how to evolve its state
-- **State Pattern friendly** — `ApplyEvent` returns `Aggregate` (interface), so different concrete types can represent different aggregate states
-- **`BaseAggregate` / `BaseEvent`** — embeddable types that supply common boilerplate (AggregateID/SeqNr/Version accessors, etc.)
-- **No `Get` prefix on accessors** — `id.TypeName()`, `event.EventID()`, `aggregate.Version()`, etc.
-- **`OccurredAt` is `time.Time`** (stored as Unix milliseconds on the wire)
-- **`EventSerializer`** — JSON and Protobuf implementations are provided for serializing whole `Event` values
+- **Pure domain interfaces** — `Aggregate[E Event]`, `Event`, `Command` carry only business information. Storage metadata (`SeqNr`, `Version`, `EventID`, `OccurredAt`, `IsCreated`, `Payload bytes`) lives in the library-side `EventEnvelope` / `SnapshotEnvelope`.
+- **Generic `Aggregate[E Event]`** — the aggregate type and its event type are linked at the type system level; `ApplyCommand` returns the concrete `E`.
+- **State Pattern friendly** — `ApplyEvent(E) Aggregate[E]` lets different concrete state types represent different aggregate states (e.g. `VisitScheduled` → `VisitCompleted`).
+- **No boilerplate types** — the library does **not** ship a `BaseAggregate` / `BaseEvent` / `DefaultAggregateID`. User domains define their own typed `AggregateID`s and event/aggregate structs.
+- **Repository.Save(aggID, cmd)** — load → `ApplyCommand` → `ApplyEvent` → persist is a single Repository call. There is no separate "construct event then save" step.
+- **Two split serializers** — `AggregateSerializer[T,E]` for snapshots and `EventSerializer[E]` for events, both implemented by the user domain.
 
-### Define a Command and an Aggregate (with `BaseAggregate`)
+### Define a typed AggregateID, Command, Event, Aggregate (no boilerplate)
 
 ```go
 import (
     es "github.com/Hiroshi0900/eventstore/v2"
 )
 
-// --- AggregateID (typed per domain) ---
+// --- typed AggregateID ---
 
-type CounterID string
+type CounterID struct{ value string }
+
+func NewCounterID(v string) CounterID { return CounterID{value: v} }
 
 func (id CounterID) TypeName() string { return "Counter" }
-func (id CounterID) Value() string    { return string(id) }
-func (id CounterID) AsString() string { return "Counter-" + string(id) }
+func (id CounterID) Value() string    { return id.value }
+func (id CounterID) AsString() string { return "Counter-" + id.value }
 
-// --- Command ---
+// --- Command (CommandTypeName のみ。AggregateID は Repository.Save の引数で渡す) ---
 
-type IncrementCmd struct{ ID es.AggregateID }
+type IncrementCmd struct{ By int }
 
-func (c IncrementCmd) CommandTypeName() string     { return "Increment" }
-func (c IncrementCmd) AggregateID() es.AggregateID { return c.ID }
+func (IncrementCmd) CommandTypeName() string { return "Increment" }
 
-// --- Aggregate (embeds BaseAggregate to skip ID/SeqNr/Version boilerplate) ---
+// --- Domain Event interface + concrete event ---
+
+type CounterEvent interface {
+    es.Event
+    isCounterEvent()
+}
+
+type IncrementedEvent struct {
+    AggID CounterID
+    By    int
+}
+
+func (e IncrementedEvent) EventTypeName() string       { return "Incremented" }
+func (e IncrementedEvent) AggregateID() es.AggregateID { return e.AggID }
+func (IncrementedEvent) isCounterEvent()               {}
+
+// --- Aggregate (pure struct, no embed, no SeqNr/Version) ---
 
 type Counter struct {
-    es.BaseAggregate
-    value int
+    id    CounterID
+    count int
 }
 
-func NewCounter(id es.AggregateID) Counter {
-    return Counter{BaseAggregate: es.NewBaseAggregate(id, 0, 0)}
+func NewBlankCounter(id es.AggregateID) Counter {
+    if cid, ok := id.(CounterID); ok {
+        return Counter{id: cid}
+    }
+    return Counter{id: CounterID{value: id.Value()}}
 }
 
-// Aggregate interface's WithSeqNr / WithVersion return Aggregate, so override.
-func (c Counter) WithSeqNr(s uint64) es.Aggregate {
-    c.BaseAggregate = c.BaseAggregate.WithSeqNr(s)
-    return c
-}
-func (c Counter) WithVersion(v uint64) es.Aggregate {
-    c.BaseAggregate = c.BaseAggregate.WithVersion(v)
-    return c
-}
+func (c Counter) AggregateID() es.AggregateID { return c.id }
 
-func (c Counter) ApplyCommand(cmd es.Command) (es.Event, error) {
-    switch cmd.(type) {
+func (c Counter) ApplyCommand(cmd es.Command) (CounterEvent, error) {
+    switch x := cmd.(type) {
     case IncrementCmd:
-        return es.NewEvent(
-            "evt-"+cmd.AggregateID().AsString(),
-            "Incremented",
-            cmd.AggregateID(),
-            nil,
-            es.WithIsCreated(c.SeqNr() == 0),
-        ), nil
-    default:
-        return nil, es.ErrUnknownCommand
+        return IncrementedEvent{AggID: c.id, By: x.By}, nil
     }
+    return nil, es.ErrUnknownCommand
 }
 
-func (c Counter) ApplyEvent(ev es.Event) es.Aggregate {
-    if ev.EventTypeName() == "Incremented" {
-        c.value++
-        c.BaseAggregate = c.BaseAggregate.WithSeqNr(ev.SeqNr())
+func (c Counter) ApplyEvent(ev CounterEvent) es.Aggregate[CounterEvent] {
+    if e, ok := ev.(IncrementedEvent); ok {
+        return Counter{id: c.id, count: c.count + e.By}
     }
     return c
+}
+```
+
+### Implement domain serializers
+
+```go
+// JSON wire format for snapshots and events.
+type counterSnapshot struct {
+    Value string `json:"value"`
+    Count int    `json:"count"`
+}
+
+type CounterAggregateSerializer struct{}
+
+func (CounterAggregateSerializer) Serialize(c Counter) ([]byte, error) {
+    return json.Marshal(counterSnapshot{Value: c.id.value, Count: c.count})
+}
+func (CounterAggregateSerializer) Deserialize(data []byte) (Counter, error) {
+    var s counterSnapshot
+    if err := json.Unmarshal(data, &s); err != nil {
+        return Counter{}, es.NewDeserializationError("aggregate", err)
+    }
+    return Counter{id: CounterID{value: s.Value}, count: s.Count}, nil
+}
+
+type incrementedWire struct {
+    IDValue string `json:"id_value"`
+    By      int    `json:"by"`
+}
+
+type CounterEventSerializer struct{}
+
+func (CounterEventSerializer) Serialize(ev CounterEvent) ([]byte, error) {
+    if e, ok := ev.(IncrementedEvent); ok {
+        return json.Marshal(incrementedWire{IDValue: e.AggID.value, By: e.By})
+    }
+    return nil, es.NewSerializationError("event", errors.New("unknown event type"))
+}
+func (CounterEventSerializer) Deserialize(typeName string, data []byte) (CounterEvent, error) {
+    if typeName == "Incremented" {
+        var w incrementedWire
+        if err := json.Unmarshal(data, &w); err != nil {
+            return nil, es.NewDeserializationError("event", err)
+        }
+        return IncrementedEvent{AggID: CounterID{value: w.IDValue}, By: w.By}, nil
+    }
+    return nil, es.NewDeserializationError("event", errors.New("unknown event type: "+typeName))
 }
 ```
 
@@ -115,15 +164,19 @@ import (
     esmem "github.com/Hiroshi0900/eventstore/v2/memory"
 )
 
-// memory.Store keeps Aggregate values in-memory; no serializer needed.
-store := esmem.New[Counter]()
-repo := es.NewRepository[Counter](store, NewCounter, es.DefaultConfig())
+store := esmem.New() // returns es.EventStore
+repo := es.NewRepository[Counter, CounterEvent](
+    store,
+    NewBlankCounter,
+    CounterAggregateSerializer{},
+    CounterEventSerializer{},
+    es.DefaultConfig(),
+)
 
-id := CounterID("c1")
-c := NewCounter(id)
+id := NewCounterID("c1")
 
-// Apply a command and persist the resulting event.
-c, err := repo.Store(ctx, IncrementCmd{ID: id}, c)
+// Save loads (or creates blank) → ApplyCommand → ApplyEvent → persist.
+c, err := repo.Save(ctx, id, IncrementCmd{By: 1})
 
 // Load replays from the latest snapshot + subsequent events.
 loaded, err := repo.Load(ctx, id)
@@ -137,14 +190,14 @@ import (
     esdb "github.com/Hiroshi0900/eventstore/v2/dynamodb"
 )
 
-// dynamodb.Store needs an AggregateSerializer[T] to (de)serialize the snapshot
-// payload. JSON/Protobuf serializers can be reused, or roll your own.
-type counterSerializer struct{}
-func (counterSerializer) Serialize(c Counter) ([]byte, error)   { /* json/proto */ }
-func (counterSerializer) Deserialize([]byte) (Counter, error)   { /* json/proto */ }
-
-store := esdb.New[Counter](dynamoClient, esdb.DefaultConfig(), counterSerializer{})
-repo := es.NewRepository[Counter](store, NewCounter, es.DefaultConfig())
+store := esdb.New(dynamoClient, esdb.DefaultConfig()) // returns es.EventStore
+repo := es.NewRepository[Counter, CounterEvent](
+    store,
+    NewBlankCounter,
+    CounterAggregateSerializer{},
+    CounterEventSerializer{},
+    es.DefaultConfig(),
+)
 ```
 
 The DynamoDB store maintains two tables (`journal`, `snapshot`), uses
