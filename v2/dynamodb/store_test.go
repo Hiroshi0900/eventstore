@@ -49,11 +49,25 @@ type ddbStubEvent struct{ aggID ddbTestAggID }
 func (e ddbStubEvent) EventTypeName() string       { return "Stub" }
 func (e ddbStubEvent) AggregateID() es.AggregateID { return e.aggID }
 
+type ddbStubCommand interface {
+	es.Command
+	isDDBStubCommand()
+}
+
+type ddbCreateStubCommand struct{}
+
+func (ddbCreateStubCommand) CommandTypeName() string { return "CreateStub" }
+func (ddbCreateStubCommand) isDDBStubCommand()       {}
+
 type ddbStubAggregate struct{ id ddbTestAggID }
 
-func (a ddbStubAggregate) AggregateID() es.AggregateID                  { return a.id }
-func (a ddbStubAggregate) ApplyCommand(es.Command) (ddbStubEvent, error) { return ddbStubEvent{}, es.ErrUnknownCommand }
-func (a ddbStubAggregate) ApplyEvent(ddbStubEvent) es.Aggregate[ddbStubEvent] { return a }
+func (a ddbStubAggregate) AggregateID() es.AggregateID { return a.id }
+func (a ddbStubAggregate) ApplyCommand(ddbStubCommand) (ddbStubEvent, error) {
+	return ddbStubEvent{}, es.ErrUnknownCommand
+}
+func (a ddbStubAggregate) ApplyEvent(ddbStubEvent) es.Aggregate[ddbStubCommand, ddbStubEvent] {
+	return a
+}
 
 type ddbStubAggSer struct{}
 
@@ -66,7 +80,7 @@ func (ddbStubEvSer) Serialize(ddbStubEvent) ([]byte, error)               { retu
 func (ddbStubEvSer) Deserialize(string, []byte) (ddbStubEvent, error)     { return ddbStubEvent{}, nil }
 
 func TestNew_Construct(t *testing.T) {
-	store := v2dynamo.New[ddbStubAggregate, ddbStubEvent](
+	store := v2dynamo.New[ddbStubAggregate, ddbStubCommand, ddbStubEvent](
 		fakeClient{},
 		v2dynamo.DefaultConfig(),
 		ddbStubAggSer{},
@@ -78,7 +92,7 @@ func TestNew_Construct(t *testing.T) {
 }
 
 func TestNewWithTables_Construct(t *testing.T) {
-	mgr := v2dynamo.NewWithTables[ddbStubAggregate, ddbStubEvent](
+	mgr := v2dynamo.NewWithTables[ddbStubAggregate, ddbStubCommand, ddbStubEvent](
 		fakeClient{},
 		v2dynamo.DefaultConfig(),
 		ddbStubAggSer{},
