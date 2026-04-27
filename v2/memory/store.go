@@ -47,10 +47,32 @@ func (s *Store) GetEventsSince(_ context.Context, id es.AggregateID, seqNr uint6
 	return out, nil
 }
 
-// PersistEvent and PersistEventAndSnapshot are implemented in subsequent tasks.
-func (s *Store) PersistEvent(_ context.Context, _ *es.EventEnvelope, _ uint64) error {
-	panic("not implemented")
+// PersistEvent appends a single event. expectedVersion==0 indicates "first
+// write" and the operation fails with ErrDuplicateAggregate if events already
+// exist for the aggregate. expectedVersion>0 has no effect (optimistic locking
+// is performed only by PersistEventAndSnapshot).
+// Duplicate (aggregateID, seqNr) entries are rejected.
+func (s *Store) PersistEvent(_ context.Context, ev *es.EventEnvelope, expectedVersion uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := ev.AggregateID.AsString()
+
+	if expectedVersion == 0 && len(s.events[key]) > 0 {
+		return es.NewDuplicateAggregateError(key)
+	}
+
+	for _, existing := range s.events[key] {
+		if existing.SeqNr == ev.SeqNr {
+			return es.NewDuplicateAggregateError(key)
+		}
+	}
+
+	s.events[key] = append(s.events[key], ev)
+	return nil
 }
+
+// PersistEventAndSnapshot is implemented in subsequent tasks.
 func (s *Store) PersistEventAndSnapshot(_ context.Context, _ *es.EventEnvelope, _ *es.SnapshotEnvelope) error {
 	panic("not implemented")
 }
