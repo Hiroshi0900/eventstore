@@ -19,7 +19,17 @@ func (a memoryTestAggID) TypeName() string { return a.typeName }
 func (a memoryTestAggID) Value() string    { return a.value }
 func (a memoryTestAggID) AsString() string { return a.typeName + "-" + a.value }
 
-// stubEvent / stubAggregate: 最小限の Event / Aggregate 実装。
+// stubEvent / stubAggregate: 最小限の Event / Command / Aggregate 実装。
+type stubCommand interface {
+	es.Command
+	isStubCommand()
+}
+
+type createStubCommand struct{}
+
+func (createStubCommand) CommandTypeName() string { return "CreateStub" }
+func (createStubCommand) isStubCommand()          {}
+
 type stubEvent struct {
 	aggID memoryTestAggID
 	name  string
@@ -32,11 +42,11 @@ type stubAggregate struct {
 	id memoryTestAggID
 }
 
-func (a stubAggregate) AggregateID() es.AggregateID            { return a.id }
-func (a stubAggregate) ApplyCommand(es.Command) (stubEvent, error) {
+func (a stubAggregate) AggregateID() es.AggregateID { return a.id }
+func (a stubAggregate) ApplyCommand(stubCommand) (stubEvent, error) {
 	return stubEvent{}, es.ErrUnknownCommand
 }
-func (a stubAggregate) ApplyEvent(stubEvent) es.Aggregate[stubEvent] { return a }
+func (a stubAggregate) ApplyEvent(stubEvent) es.Aggregate[stubCommand, stubEvent] { return a }
 
 func newStored(id memoryTestAggID, seqNr uint64, isCreated bool) es.StoredEvent[stubEvent] {
 	return es.StoredEvent[stubEvent]{
@@ -58,7 +68,7 @@ func newStoredSnap(id memoryTestAggID, seqNr, version uint64) es.StoredSnapshot[
 }
 
 func TestStore_GetLatestSnapshot_empty(t *testing.T) {
-	s := memory.New[stubAggregate, stubEvent]()
+	s := memory.New[stubAggregate, stubCommand, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
 	_, found, err := s.GetLatestSnapshot(context.Background(), id)
@@ -71,7 +81,7 @@ func TestStore_GetLatestSnapshot_empty(t *testing.T) {
 }
 
 func TestStore_GetEventsSince_empty(t *testing.T) {
-	s := memory.New[stubAggregate, stubEvent]()
+	s := memory.New[stubAggregate, stubCommand, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
 	events, err := s.GetEventsSince(context.Background(), id, 0)
@@ -84,7 +94,7 @@ func TestStore_GetEventsSince_empty(t *testing.T) {
 }
 
 func TestStore_PersistEvent_persistsAndQueryable(t *testing.T) {
-	s := memory.New[stubAggregate, stubEvent]()
+	s := memory.New[stubAggregate, stubCommand, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
 	if err := s.PersistEvent(context.Background(), newStored(id, 1, true), 0); err != nil {
@@ -101,7 +111,7 @@ func TestStore_PersistEvent_persistsAndQueryable(t *testing.T) {
 }
 
 func TestStore_PersistEvent_duplicateSeqNr(t *testing.T) {
-	s := memory.New[stubAggregate, stubEvent]()
+	s := memory.New[stubAggregate, stubCommand, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
 	if err := s.PersistEvent(context.Background(), newStored(id, 1, true), 0); err != nil {
@@ -117,7 +127,7 @@ func TestStore_PersistEvent_duplicateSeqNr(t *testing.T) {
 }
 
 func TestStore_PersistEvent_initialOnExistingAggregate(t *testing.T) {
-	s := memory.New[stubAggregate, stubEvent]()
+	s := memory.New[stubAggregate, stubCommand, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
 	if err := s.PersistEvent(context.Background(), newStored(id, 1, true), 0); err != nil {
@@ -130,7 +140,7 @@ func TestStore_PersistEvent_initialOnExistingAggregate(t *testing.T) {
 }
 
 func TestStore_PersistEventAndSnapshot_initialWrite(t *testing.T) {
-	s := memory.New[stubAggregate, stubEvent]()
+	s := memory.New[stubAggregate, stubCommand, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
 	ev := newStored(id, 5, false)
@@ -150,7 +160,7 @@ func TestStore_PersistEventAndSnapshot_initialWrite(t *testing.T) {
 }
 
 func TestStore_PersistEventAndSnapshot_optimisticLockFailure(t *testing.T) {
-	s := memory.New[stubAggregate, stubEvent]()
+	s := memory.New[stubAggregate, stubCommand, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
 	if err := s.PersistEventAndSnapshot(

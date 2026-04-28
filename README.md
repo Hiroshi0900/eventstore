@@ -17,19 +17,85 @@ go get github.com/Hiroshi0900/eventstore
 | `github.com/Hiroshi0900/eventstore/dynamodb` | DynamoDB-backed `EventStore` implementation |
 | `github.com/Hiroshi0900/eventstore/memory` | In-memory `EventStore` implementation |
 
+## Overview
+
+- `Aggregate[C Command, E Event]`, `Event`, `Command` はドメイン情報だけを持つ
+- 保存用メタデータは `StoredEvent` / `StoredSnapshot` に集約
+- `Repository.Save(aggID, cmd)` で load → apply → persist を一括実行
+- serializer は `EventStore` 実装側で扱う
+- `ApplyEvent(E) Aggregate[C, E]` により State Pattern に対応
+
+## Quick Start
+
+```go
+import (
+    es "github.com/Hiroshi0900/eventstore"
+    esmem "github.com/Hiroshi0900/eventstore/memory"
+)
+
+type CounterID struct{ value string }
+
+func (id CounterID) TypeName() string { return "Counter" }
+func (id CounterID) Value() string    { return id.value }
+func (id CounterID) AsString() string { return "Counter-" + id.value }
+
+type CounterCommand interface {
+    es.Command
+    isCounterCommand()
+}
+
+type IncrementCmd struct{ By int }
+
+func (IncrementCmd) CommandTypeName() string { return "Increment" }
+func (IncrementCmd) isCounterCommand()       {}
+
+type CounterEvent interface {
+    es.Event
+    isCounterEvent()
+}
+
+type IncrementedEvent struct {
+    AggID CounterID
+    By    int
+}
+
+func (e IncrementedEvent) EventTypeName() string       { return "Incremented" }
+func (e IncrementedEvent) AggregateID() es.AggregateID { return e.AggID }
+func (IncrementedEvent) isCounterEvent()               {}
+
+type Counter struct {
+    id    CounterID
+    count int
+}
+
+func NewBlankCounter(id es.AggregateID) Counter {
+    return Counter{id: CounterID{value: id.Value()}}
+}
+
+func (c Counter) AggregateID() es.AggregateID { return c.id }
+
+func (c Counter) ApplyCommand(cmd CounterCommand) (CounterEvent, error) {
+    switch x := cmd.(type) {
+    case IncrementCmd:
+        return IncrementedEvent{AggID: c.id, By: x.By}, nil
+    }
+    return nil, es.ErrUnknownCommand
+}
+
+func (c Counter) ApplyEvent(ev CounterEvent) es.Aggregate[CounterCommand, CounterEvent] {
+    if e, ok := ev.(IncrementedEvent); ok {
+        return Counter{id: c.id, count: c.count + e.By}
+    }
+    return c
+}
+
+store := esmem.New[Counter, CounterCommand, CounterEvent]()
+repo := es.NewRepository[Counter, CounterCommand, CounterEvent](store, NewBlankCounter, es.DefaultConfig())
+```
+
 ## Development
 
 実装本体は repo root にあります。`go test ./...` を root からそのまま実行できます。
-
-## Overview
-
-- `Aggregate[E Event]`, `Event`, `Command` はドメイン情報だけを持つ
-- 保存用メタデータは `EventEnvelope` / `SnapshotEnvelope` に集約
-- `Repository.Save(aggID, cmd)` で load → apply → persist を一括実行
-- serializer は `EventStore` 実装側で扱う
-- `ApplyEvent(E) Aggregate[E]` により State Pattern に対応
-
-詳細な使い方と API は root 配下のコードとテストを参照してください。
 
 ## License
 

@@ -26,17 +26,18 @@ type (
 	}
 
 	// Aggregate は Event Sourcing における集約ルート。
-	// E は集約専用の Event 型（利用側で定義する domain Event interface）。
+	// C は集約専用の Command 型、E は集約専用の Event 型（いずれも利用側で定義する
+	// domain interface / union を想定）。
 	//
 	// メタ情報 (SeqNr / Version / 永続化メタ) を一切持たず、ApplyCommand /
 	// ApplyEvent で表現される業務状態遷移のみを定義する。
 	//
-	// ApplyEvent の戻り値が Aggregate[E] (interface) なので、状態遷移時に
+	// ApplyEvent の戻り値が Aggregate[C, E] (interface) なので、状態遷移時に
 	// 異なる具象型を返す state pattern が可能 (例: VisitScheduled → VisitCompleted)。
-	Aggregate[E Event] interface {
+	Aggregate[C Command, E Event] interface {
 		AggregateID() AggregateID
-		ApplyCommand(Command) (E, error)
-		ApplyEvent(E) Aggregate[E]
+		ApplyCommand(C) (E, error)
+		ApplyEvent(E) Aggregate[C, E]
 	}
 
 	// Command はドメインの意図を表す。
@@ -73,8 +74,12 @@ type StoredEvent[E Event] struct {
 
 // StoredSnapshot は domain Aggregate に library-side のメタ情報を付与した型。
 // Repository ↔ EventStore 間でやり取りされる。
-type StoredSnapshot[T any] struct {
-	Aggregate  T
+//
+// A は使用サイト (EventStore[A Aggregate[C, E], ...] / Repository[A Aggregate[C, E], ...])
+// で既に Aggregate[C, E] に制約されているため、本構造体自体は any を採用して
+// 型パラメータ爆発 (A, C, E の 3 個) を避けている。
+type StoredSnapshot[A any] struct {
+	Aggregate  A
 	SeqNr      uint64
 	Version    uint64
 	OccurredAt time.Time
