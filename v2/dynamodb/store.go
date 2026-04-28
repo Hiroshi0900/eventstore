@@ -48,29 +48,29 @@ func DefaultConfig() Config {
 	}
 }
 
-// store is the DynamoDB-backed EventStore[T, E] implementation.
-// concrete type は非公開で、外部からは New() が返す es.EventStore[T, E] interface 経由でのみ操作する。
+// store is the DynamoDB-backed EventStore[A, C, E] implementation.
+// concrete type は非公開で、外部からは New() が返す es.EventStore[A, C, E] interface 経由でのみ操作する。
 //
 // AggregateSerializer / EventSerializer は構築時に注入され、attribute marshal/unmarshal で
 // domain 型 ↔ bytes の変換に使われる。Repository 層には serialize の責務が漏れない設計。
-type store[T es.Aggregate[E], E es.Event] struct {
+type store[A es.Aggregate[C, E], C es.Command, E es.Event] struct {
 	client      Client
 	keyResolver *keyresolver.Resolver
 	config      Config
-	aggSer      es.AggregateSerializer[T, E]
+	aggSer      es.AggregateSerializer[A, C, E]
 	evSer       es.EventSerializer[E]
 }
 
-// New は DynamoDB-backed EventStore[T, E] を生成する。
+// New は DynamoDB-backed EventStore[A, C, E] を生成する。
 //
 // aggSer / evSer は snapshot / event payload の (de)serialize に使われる。
-func New[T es.Aggregate[E], E es.Event](
+func New[A es.Aggregate[C, E], C es.Command, E es.Event](
 	client Client,
 	config Config,
-	aggSer es.AggregateSerializer[T, E],
+	aggSer es.AggregateSerializer[A, C, E],
 	evSer es.EventSerializer[E],
-) es.EventStore[T, E] {
-	return &store[T, E]{
+) es.EventStore[A, C, E] {
+	return &store[A, C, E]{
 		client:      client,
 		keyResolver: keyresolver.New(keyresolver.Config{ShardCount: config.ShardCount}),
 		config:      config,
@@ -86,18 +86,18 @@ type TableManager interface {
 	WaitForTables(ctx context.Context) error
 }
 
-// NewWithTables は EventStore[T, E] + TableManager の機能を併せ持つオブジェクトを返す。
+// NewWithTables は EventStore[A, C, E] + TableManager の機能を併せ持つオブジェクトを返す。
 // テーブル管理が必要なテスト・デプロイ初期化スクリプト等で使う。
-func NewWithTables[T es.Aggregate[E], E es.Event](
+func NewWithTables[A es.Aggregate[C, E], C es.Command, E es.Event](
 	client Client,
 	config Config,
-	aggSer es.AggregateSerializer[T, E],
+	aggSer es.AggregateSerializer[A, C, E],
 	evSer es.EventSerializer[E],
 ) interface {
-	es.EventStore[T, E]
+	es.EventStore[A, C, E]
 	TableManager
 } {
-	return &store[T, E]{
+	return &store[A, C, E]{
 		client:      client,
 		keyResolver: keyresolver.New(keyresolver.Config{ShardCount: config.ShardCount}),
 		config:      config,
@@ -123,8 +123,8 @@ const (
 )
 
 // GetLatestSnapshot returns the latest snapshot or found=false.
-func (s *store[T, E]) GetLatestSnapshot(ctx context.Context, id es.AggregateID) (es.StoredSnapshot[T], bool, error) {
-	var zero es.StoredSnapshot[T]
+func (s *store[A, C, E]) GetLatestSnapshot(ctx context.Context, id es.AggregateID) (es.StoredSnapshot[A], bool, error) {
+	var zero es.StoredSnapshot[A]
 	keys := s.keyResolver.ResolveSnapshotKeys(id)
 	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName: aws.String(s.config.SnapshotTableName),
@@ -155,7 +155,7 @@ func (s *store[T, E]) GetLatestSnapshot(ctx context.Context, id es.AggregateID) 
 	if err != nil {
 		return zero, false, err
 	}
-	return es.StoredSnapshot[T]{
+	return es.StoredSnapshot[A]{
 		Aggregate: agg,
 		SeqNr:     seqNr,
 		Version:   version,
@@ -165,7 +165,7 @@ func (s *store[T, E]) GetLatestSnapshot(ctx context.Context, id es.AggregateID) 
 }
 
 // GetEventsSince queries the journal GSI for events with SeqNr > seqNr.
-func (s *store[T, E]) GetEventsSince(ctx context.Context, id es.AggregateID, seqNr uint64) ([]es.StoredEvent[E], error) {
+func (s *store[A, C, E]) GetEventsSince(ctx context.Context, id es.AggregateID, seqNr uint64) ([]es.StoredEvent[E], error) {
 	aidKey := s.keyResolver.ResolveAggregateIDKey(id)
 	out, err := s.client.Query(ctx, &dynamodb.QueryInput{
 		TableName:              aws.String(s.config.JournalTableName),
@@ -197,7 +197,7 @@ func (s *store[T, E]) GetEventsSince(ctx context.Context, id es.AggregateID, seq
 
 // PersistEvent writes a single event. ConditionExpression は同一 (pkey, skey) の重複保存を拒否し、
 // ConditionalCheckFailed を ErrDuplicateAggregate にマッピングする。
-func (s *store[T, E]) PersistEvent(ctx context.Context, ev es.StoredEvent[E], _ uint64) error {
+func (s *store[A, C, E]) PersistEvent(ctx context.Context, ev es.StoredEvent[E], _ uint64) error {
 	item, err := s.marshalEvent(ctx, ev)
 	if err != nil {
 		return err
@@ -222,7 +222,7 @@ func (s *store[T, E]) PersistEvent(ctx context.Context, ev es.StoredEvent[E], _ 
 
 // PersistEventAndSnapshot writes both event and snapshot atomically using TransactWriteItems.
 // snapshot put has a Version condition for optimistic locking.
-func (s *store[T, E]) PersistEventAndSnapshot(ctx context.Context, ev es.StoredEvent[E], snap es.StoredSnapshot[T]) error {
+func (s *store[A, C, E]) PersistEventAndSnapshot(ctx context.Context, ev es.StoredEvent[E], snap es.StoredSnapshot[A]) error {
 	eventItem, err := s.marshalEvent(ctx, ev)
 	if err != nil {
 		return err
@@ -299,7 +299,7 @@ func isTableAlreadyExistsError(err error) bool {
 
 // --- attribute marshal / unmarshal ---
 
-func (s *store[T, E]) marshalEvent(ctx context.Context, ev es.StoredEvent[E]) (map[string]types.AttributeValue, error) {
+func (s *store[A, C, E]) marshalEvent(ctx context.Context, ev es.StoredEvent[E]) (map[string]types.AttributeValue, error) {
 	payload, err := s.evSer.Serialize(ev.Event)
 	if err != nil {
 		return nil, err
@@ -328,7 +328,7 @@ func (s *store[T, E]) marshalEvent(ctx context.Context, ev es.StoredEvent[E]) (m
 	return item, nil
 }
 
-func (s *store[T, E]) marshalSnapshot(snap es.StoredSnapshot[T]) (map[string]types.AttributeValue, error) {
+func (s *store[A, C, E]) marshalSnapshot(snap es.StoredSnapshot[A]) (map[string]types.AttributeValue, error) {
 	payload, err := s.aggSer.Serialize(snap.Aggregate)
 	if err != nil {
 		return nil, err
@@ -345,7 +345,7 @@ func (s *store[T, E]) marshalSnapshot(snap es.StoredSnapshot[T]) (map[string]typ
 	}, nil
 }
 
-func (s *store[T, E]) unmarshalEvent(item map[string]types.AttributeValue) (es.StoredEvent[E], error) {
+func (s *store[A, C, E]) unmarshalEvent(item map[string]types.AttributeValue) (es.StoredEvent[E], error) {
 	var zero es.StoredEvent[E]
 	seqNr, err := getN(item, colSeqNr)
 	if err != nil {
@@ -413,7 +413,7 @@ func getN(item map[string]types.AttributeValue, key string) (uint64, error) {
 }
 
 // CreateTables creates the journal and snapshot tables (for testing/setup).
-func (s *store[T, E]) CreateTables(ctx context.Context) error {
+func (s *store[A, C, E]) CreateTables(ctx context.Context) error {
 	_, err := s.client.CreateTable(ctx, &dynamodb.CreateTableInput{
 		TableName: aws.String(s.config.JournalTableName),
 		KeySchema: []types.KeySchemaElement{
@@ -473,7 +473,7 @@ func (s *store[T, E]) CreateTables(ctx context.Context) error {
 }
 
 // WaitForTables waits until both tables are active.
-func (s *store[T, E]) WaitForTables(ctx context.Context) error {
+func (s *store[A, C, E]) WaitForTables(ctx context.Context) error {
 	waiter := dynamodb.NewTableExistsWaiter(s.client)
 	maxWaitTime := 5 * time.Minute
 

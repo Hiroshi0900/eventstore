@@ -31,12 +31,12 @@ go get github.com/Hiroshi0900/eventstore/v2
 
 ### Key design points
 
-- **Pure domain interfaces** — `Aggregate[E Event]`, `Event`, `Command` carry only business information. Storage metadata (`SeqNr`, `Version`, `EventID`, `OccurredAt`, `IsCreated`, `Payload bytes`) lives in the library-side `EventEnvelope` / `SnapshotEnvelope`.
-- **Generic `Aggregate[E Event]`** — the aggregate type and its event type are linked at the type system level; `ApplyCommand` returns the concrete `E`.
-- **State Pattern friendly** — `ApplyEvent(E) Aggregate[E]` lets different concrete state types represent different aggregate states (e.g. `VisitScheduled` → `VisitCompleted`).
+- **Pure domain interfaces** — `Aggregate[C Command, E Event]`, `Event`, `Command` carry only business information. Storage metadata (`SeqNr`, `Version`, `EventID`, `OccurredAt`, `IsCreated`, trace context) lives in the library-side `StoredEvent` / `StoredSnapshot`, while serialized payload bytes remain internal to `EventStore` implementations.
+- **Generic `Aggregate[C Command, E Event]`** — the command type and event type are linked at the type system level; `ApplyCommand` accepts the concrete `C` and returns the concrete `E`.
+- **State Pattern friendly** — `ApplyEvent(E) Aggregate[C, E]` lets different concrete state types represent different aggregate states (e.g. `VisitScheduled` → `VisitCompleted`).
 - **No boilerplate types** — the library does **not** ship a `BaseAggregate` / `BaseEvent` / `DefaultAggregateID`. User domains define their own typed `AggregateID`s and event/aggregate structs.
 - **Repository.Save(aggID, cmd)** — load → `ApplyCommand` → `ApplyEvent` → persist is a single Repository call. There is no separate "construct event then save" step.
-- **Serialization owned by EventStore implementations** — `Repository[T,E]` works with domain types only; `(de)serialize` is the responsibility of the `EventStore[T,E]` implementation. memory store needs no serializer; dynamodb store takes `AggregateSerializer[T,E]` + `EventSerializer[E]` at construction.
+- **Serialization owned by EventStore implementations** — `Repository[T, C, E]` works with domain types only; `(de)serialize` is the responsibility of the `EventStore[T, C, E]` implementation. memory store needs no serializer; dynamodb store takes `AggregateSerializer[T, C, E]` + `EventSerializer[E]` at construction.
 
 ### Define a typed AggregateID, Command, Event, Aggregate (no boilerplate)
 
@@ -55,11 +55,17 @@ func (id CounterID) TypeName() string { return "Counter" }
 func (id CounterID) Value() string    { return id.value }
 func (id CounterID) AsString() string { return "Counter-" + id.value }
 
-// --- Command (CommandTypeName のみ。AggregateID は Repository.Save の引数で渡す) ---
+// --- Domain Command interface + concrete command ---
+
+type CounterCommand interface {
+    es.Command
+    isCounterCommand()
+}
 
 type IncrementCmd struct{ By int }
 
 func (IncrementCmd) CommandTypeName() string { return "Increment" }
+func (IncrementCmd) isCounterCommand()       {}
 
 // --- Domain Event interface + concrete event ---
 
@@ -93,7 +99,7 @@ func NewBlankCounter(id es.AggregateID) Counter {
 
 func (c Counter) AggregateID() es.AggregateID { return c.id }
 
-func (c Counter) ApplyCommand(cmd es.Command) (CounterEvent, error) {
+func (c Counter) ApplyCommand(cmd CounterCommand) (CounterEvent, error) {
     switch x := cmd.(type) {
     case IncrementCmd:
         return IncrementedEvent{AggID: c.id, By: x.By}, nil
@@ -101,7 +107,7 @@ func (c Counter) ApplyCommand(cmd es.Command) (CounterEvent, error) {
     return nil, es.ErrUnknownCommand
 }
 
-func (c Counter) ApplyEvent(ev CounterEvent) es.Aggregate[CounterEvent] {
+func (c Counter) ApplyEvent(ev CounterEvent) es.Aggregate[CounterCommand, CounterEvent] {
     if e, ok := ev.(IncrementedEvent); ok {
         return Counter{id: c.id, count: c.count + e.By}
     }
@@ -119,8 +125,8 @@ import (
     esmem "github.com/Hiroshi0900/eventstore/v2/memory"
 )
 
-store := esmem.New[Counter, CounterEvent]() // returns es.EventStore[Counter, CounterEvent]
-repo := es.NewRepository[Counter, CounterEvent](store, NewBlankCounter, es.DefaultConfig())
+store := esmem.New[Counter, CounterCommand, CounterEvent]() // returns es.EventStore[Counter, CounterCommand, CounterEvent]
+repo := es.NewRepository[Counter, CounterCommand, CounterEvent](store, NewBlankCounter, es.DefaultConfig())
 
 id := NewCounterID("c1")
 
@@ -134,7 +140,7 @@ loaded, err := repo.Load(ctx, id)
 ### Implement domain serializers (DynamoDB のみ必要)
 
 DynamoDB store は永続化前後で domain ↔ bytes の変換を行うため、利用側が
-`AggregateSerializer[T,E]` と `EventSerializer[E]` を実装して store に渡す。
+`AggregateSerializer[T, C, E]` と `EventSerializer[E]` を実装して store に渡す。
 
 ```go
 // JSON wire format for snapshots and events.
@@ -189,13 +195,13 @@ import (
     esdb "github.com/Hiroshi0900/eventstore/v2/dynamodb"
 )
 
-store := esdb.New[Counter, CounterEvent](
+store := esdb.New[Counter, CounterCommand, CounterEvent](
     dynamoClient,
     esdb.DefaultConfig(),
     CounterAggregateSerializer{},
     CounterEventSerializer{},
 )
-repo := es.NewRepository[Counter, CounterEvent](store, NewBlankCounter, es.DefaultConfig())
+repo := es.NewRepository[Counter, CounterCommand, CounterEvent](store, NewBlankCounter, es.DefaultConfig())
 ```
 
 The DynamoDB store maintains two tables (`journal`, `snapshot`), uses

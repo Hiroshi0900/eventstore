@@ -6,43 +6,43 @@ import (
 	"time"
 )
 
-// Repository は集約 T の高レベル Load / Save API。
+// Repository は集約 A の高レベル Load / Save API。
 //
-// 利用側は domain ごとに `Repository[Visit, VisitEvent]` のように instantiate する。
-// 実装は library 内部の defaultRepository[T,E] が担う (NewRepository 経由で取得)。
-type Repository[T Aggregate[E], E Event] interface {
+// 利用側は domain ごとに `Repository[Visit, VisitCommand, VisitEvent]` のように instantiate する。
+// 実装は library 内部の defaultRepository[A,C,E] が担う (NewRepository 経由で取得)。
+type Repository[A Aggregate[C, E], C Command, E Event] interface {
 	// Load は集約をロードする。snapshot があれば起点に、なければ blank 集約から
 	// イベントを replay。snapshot もイベントもなければ ErrAggregateNotFound。
-	Load(ctx context.Context, aggID AggregateID) (T, error)
+	Load(ctx context.Context, aggID AggregateID) (A, error)
 
 	// Save は aggID に対応する集約をロード (なければ blank) し、cmd を ApplyCommand
 	// で適用してイベントを生成、ApplyEvent で次状態に遷移後、永続化して新状態を返す。
 	// SnapshotInterval に達した seqNr では snapshot も同時に書く。
-	Save(ctx context.Context, aggID AggregateID, cmd Command) (T, error)
+	Save(ctx context.Context, aggID AggregateID, cmd C) (A, error)
 }
 
 // defaultRepository は Repository interface の library 内部実装 (factory-sealed)。
 //
-// (de)serialize は EventStore[T,E] 実装側 (memory / dynamodb 等) の責務。
+// (de)serialize は EventStore[A,C,E] 実装側 (memory / dynamodb 等) の責務。
 // 本 Repository は domain 型のみを扱い、wire format には触れない。
-type defaultRepository[T Aggregate[E], E Event] struct {
-	store       EventStore[T, E]
-	createBlank func(AggregateID) T
+type defaultRepository[A Aggregate[C, E], C Command, E Event] struct {
+	store       EventStore[A, C, E]
+	createBlank func(AggregateID) A
 	config      Config
 }
 
-// NewRepository は Repository[T, E] を生成する。
+// NewRepository は Repository[A, C, E] を生成する。
 //
 // createBlank は集約が未存在の状態 (Save の初回呼び出し) で使う初期 aggregate を返す関数。
 // 利用側で typed AggregateID と pure struct を組み合わせて定義する。
 //
 // (de)serialize の責務は store 側にある (dynamodb 等のコンストラクタで Serializer を受け取る)。
-func NewRepository[T Aggregate[E], E Event](
-	store EventStore[T, E],
-	createBlank func(AggregateID) T,
+func NewRepository[A Aggregate[C, E], C Command, E Event](
+	store EventStore[A, C, E],
+	createBlank func(AggregateID) A,
 	config Config,
-) Repository[T, E] {
-	return &defaultRepository[T, E]{
+) Repository[A, C, E] {
+	return &defaultRepository[A, C, E]{
 		store:       store,
 		createBlank: createBlank,
 		config:      config,
@@ -51,10 +51,10 @@ func NewRepository[T Aggregate[E], E Event](
 
 // loadInternal は snapshot + events から現状態を復元し、現 SeqNr / Version を返す。
 // notFound==true は snapshot もイベントも見つからなかった (集約未存在) を意味する。
-func (r *defaultRepository[T, E]) loadInternal(
+func (r *defaultRepository[A, C, E]) loadInternal(
 	ctx context.Context,
 	id AggregateID,
-) (agg T, seqNr, version uint64, notFound bool, err error) {
+) (agg A, seqNr, version uint64, notFound bool, err error) {
 	snap, found, err := r.store.GetLatestSnapshot(ctx, id)
 	if err != nil {
 		return agg, 0, 0, false, err
@@ -80,10 +80,10 @@ func (r *defaultRepository[T, E]) loadInternal(
 	}
 
 	for _, stored := range events {
-		next, ok := agg.ApplyEvent(stored.Event).(T)
+		next, ok := agg.ApplyEvent(stored.Event).(A)
 		if !ok {
 			return agg, 0, 0, false, fmt.Errorf(
-				"%w: ApplyEvent returned a value that does not implement T",
+				"%w: ApplyEvent returned a value that does not implement A",
 				ErrInvalidAggregate,
 			)
 		}
@@ -94,14 +94,14 @@ func (r *defaultRepository[T, E]) loadInternal(
 }
 
 // Load は集約をロードする。集約未存在の場合は ErrAggregateNotFound を返す。
-func (r *defaultRepository[T, E]) Load(ctx context.Context, aggID AggregateID) (T, error) {
+func (r *defaultRepository[A, C, E]) Load(ctx context.Context, aggID AggregateID) (A, error) {
 	agg, _, _, notFound, err := r.loadInternal(ctx, aggID)
 	if err != nil {
-		var zero T
+		var zero A
 		return zero, err
 	}
 	if notFound {
-		var zero T
+		var zero A
 		return zero, NewAggregateNotFoundError(aggID.TypeName(), aggID.Value())
 	}
 	return agg, nil
@@ -109,12 +109,12 @@ func (r *defaultRepository[T, E]) Load(ctx context.Context, aggID AggregateID) (
 
 // Save は load → ApplyCommand → ApplyEvent → 永続化 を一括で行う。
 // 集約未存在でも blank で開始するため、creation 系コマンドの初回適用にも使える。
-func (r *defaultRepository[T, E]) Save(
+func (r *defaultRepository[A, C, E]) Save(
 	ctx context.Context,
 	aggID AggregateID,
-	cmd Command,
-) (T, error) {
-	var zero T
+	cmd C,
+) (A, error) {
+	var zero A
 
 	agg, currentSeqNr, currentVersion, _, err := r.loadInternal(ctx, aggID)
 	if err != nil {
@@ -126,10 +126,10 @@ func (r *defaultRepository[T, E]) Save(
 		return zero, err
 	}
 
-	next, ok := agg.ApplyEvent(ev).(T)
+	next, ok := agg.ApplyEvent(ev).(A)
 	if !ok {
 		return zero, fmt.Errorf(
-			"%w: ApplyEvent returned a value that does not implement T",
+			"%w: ApplyEvent returned a value that does not implement A",
 			ErrInvalidAggregate,
 		)
 	}
@@ -152,7 +152,7 @@ func (r *defaultRepository[T, E]) Save(
 	}
 
 	if r.config.ShouldSnapshot(nextSeqNr) {
-		snap := StoredSnapshot[T]{
+		snap := StoredSnapshot[A]{
 			Aggregate:  next,
 			SeqNr:      nextSeqNr,
 			Version:    currentVersion + 1,
