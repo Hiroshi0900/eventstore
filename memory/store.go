@@ -6,7 +6,7 @@ import (
 	"sort"
 	"sync"
 
-	es "github.com/Hiroshi0900/eventstore/v2"
+	es "github.com/Hiroshi0900/eventstore"
 )
 
 // store is an in-memory EventStore implementation. concrete type は非公開で、

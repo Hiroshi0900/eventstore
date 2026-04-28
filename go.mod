@@ -1,4 +1,4 @@
-module github.com/Hiroshi0900/eventstore/v2
+module github.com/Hiroshi0900/eventstore
 
 go 1.25
 

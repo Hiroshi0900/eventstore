@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	es "github.com/Hiroshi0900/eventstore/v2"
-	"github.com/Hiroshi0900/eventstore/v2/memory"
+	es "github.com/Hiroshi0900/eventstore"
+	"github.com/Hiroshi0900/eventstore/memory"
 )
 
 // memoryTestAggID is a typed AggregateID local to the memory tests.

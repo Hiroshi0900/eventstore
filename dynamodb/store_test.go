@@ -6,8 +6,8 @@ import (
 
 	awsdynamo "github.com/aws/aws-sdk-go-v2/service/dynamodb"
 
-	es "github.com/Hiroshi0900/eventstore/v2"
-	v2dynamo "github.com/Hiroshi0900/eventstore/v2/dynamodb"
+	es "github.com/Hiroshi0900/eventstore"
+	v2dynamo "github.com/Hiroshi0900/eventstore/dynamodb"
 )
 
 // fakeClient は dynamodb.Client interface を満たす最小実装。

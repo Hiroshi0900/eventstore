@@ -1,8 +1,8 @@
 syntax = "proto3";
 
-package eventstore.v2;
+package eventstore;
 
-option go_package = "github.com/Hiroshi0900/eventstore/v2/serialization/protoes;protoes";
+option go_package = "github.com/Hiroshi0900/eventstore/serialization/protoes;protoes";
 
 // EventEnvelope is the wire-format Protobuf representation of an Event.
 // Mirrors the JSON envelope used by JSONEventSerializer.

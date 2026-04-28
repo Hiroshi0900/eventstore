@@ -14,8 +14,8 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 
-	es "github.com/Hiroshi0900/eventstore/v2"
-	"github.com/Hiroshi0900/eventstore/v2/internal/keyresolver"
+	es "github.com/Hiroshi0900/eventstore"
+	"github.com/Hiroshi0900/eventstore/internal/keyresolver"
 )
 
 // Client は DynamoDB クライアントの subset interface (テストの mock 用)。

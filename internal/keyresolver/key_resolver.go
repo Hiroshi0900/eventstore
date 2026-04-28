@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"hash/fnv"
 
-	es "github.com/Hiroshi0900/eventstore/v2"
+	es "github.com/Hiroshi0900/eventstore"
 )
 
 // KeyComponents holds the resolved key components for an event.

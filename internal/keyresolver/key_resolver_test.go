@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	es "github.com/Hiroshi0900/eventstore/v2"
+	es "github.com/Hiroshi0900/eventstore"
 )
 
 // testAggID は keyresolver のテスト内部で使う typed AggregateID 実装。

@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	es "github.com/Hiroshi0900/eventstore/v2"
-	"github.com/Hiroshi0900/eventstore/v2/memory"
+	es "github.com/Hiroshi0900/eventstore"
+	"github.com/Hiroshi0900/eventstore/memory"
 )
 
 // === counter ドメイン (テスト用、pure struct + typed AggregateID) ===
