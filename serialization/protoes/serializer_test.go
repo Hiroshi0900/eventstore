@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	es "github.com/Hiroshi0900/eventstore/v2"
-	"github.com/Hiroshi0900/eventstore/v2/serialization/protoes"
+	es "github.com/Hiroshi0900/eventstore"
+	"github.com/Hiroshi0900/eventstore/serialization/protoes"
 )
 
 // テスト用 typed AggregateID。

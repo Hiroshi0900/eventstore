@@ -50,19 +50,19 @@ func NewDefault() *Resolver {
 
 // ResolvePartitionKey generates the partition key for sharding.
 func (r *Resolver) ResolvePartitionKey(id es.AggregateID) string {
-	shardID := r.computeShardID(id.GetValue())
-	return fmt.Sprintf("%s-%d", id.GetTypeName(), shardID)
+	shardID := r.computeShardID(id.Value())
+	return fmt.Sprintf("%s-%d", id.TypeName(), shardID)
 }
 
 // ResolveSortKeyForEvent generates the sort key for an event.
 func (r *Resolver) ResolveSortKeyForEvent(id es.AggregateID, seqNr uint64) string {
-	return fmt.Sprintf("%s-%s-%020d", id.GetTypeName(), id.GetValue(), seqNr)
+	return fmt.Sprintf("%s-%s-%020d", id.TypeName(), id.Value(), seqNr)
 }
 
 // ResolveSortKeyForSnapshot generates the sort key for a snapshot.
 func (r *Resolver) ResolveSortKeyForSnapshot(id es.AggregateID) string {
 	// Snapshots use sequence number 0 to indicate "latest".
-	return fmt.Sprintf("%s-%s-0", id.GetTypeName(), id.GetValue())
+	return fmt.Sprintf("%s-%s-0", id.TypeName(), id.Value())
 }
 
 // ResolveAggregateIDKey generates the aggregate ID key for GSI queries.

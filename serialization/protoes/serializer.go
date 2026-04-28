@@ -17,7 +17,7 @@
 package protoes
 
 import (
-	es "github.com/Hiroshi0900/eventstore/v2"
+	es "github.com/Hiroshi0900/eventstore"
 )
 
 // Codec は利用側が定義した encode / decode 関数で構成される EventSerializer[E] 実装。

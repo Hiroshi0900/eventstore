@@ -1,249 +1,99 @@
-// Package eventsourcing provides a lightweight library for event sourcing.
-// It uses DynamoDB as the event store and supports event-sourced aggregates.
-package eventsourcing
+// Package eventstore は Event Sourcing を実現するためのライブラリです (v2)。
+//
+// ドメイン側の Aggregate / Event / Command interface はビジネス情報のみを
+// 持ち、SeqNr / Version / EventID / OccurredAt / IsCreated 等の永続化メタ
+// 情報は library 側の StoredEvent / StoredSnapshot に集約される。これにより
+// 利用側は「業務概念としての state と振る舞い」のみを実装すればよい。
+package eventstore
 
 import (
-	"fmt"
+	"crypto/rand"
+	"encoding/hex"
 	"time"
 )
 
-// AggregateID represents the unique identifier of an aggregate.
-// It combines a type name (e.g. "MemorialSetting") with a unique value (e.g. a ULID).
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-type AggregateID interface {
-	// GetTypeName returns the type name of the aggregate (e.g. "MemorialSetting").
-	GetTypeName() string
-	// GetValue returns the unique value of the aggregate ID.
-	GetValue() string
-	// AsString returns the full string representation: "{TypeName}-{Value}".
-	AsString() string
-}
+// === Domain interfaces ===
 
-// DefaultAggregateID is the default implementation of AggregateID.
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-type DefaultAggregateID struct {
-	typeName string
-	value    string
-}
-
-// NewAggregateId creates a new DefaultAggregateID.
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-func NewAggregateId(typeName, value string) *DefaultAggregateID {
-	return &DefaultAggregateID{
-		typeName: typeName,
-		value:    value,
+// 主要なドメインインターフェース。具象型はすべて利用側で定義する想定で、
+// library は default 実装 (DefaultAggregateID, BaseAggregate 等) を提供しない。
+type (
+	// AggregateID は集約の識別子を表す。利用側は domain ごとに typed な
+	// 実装を定義する (例: type VisitID struct{...} で TypeName/Value/AsString を実装)。
+	AggregateID interface {
+		TypeName() string
+		Value() string
+		AsString() string
 	}
-}
 
-// GetTypeName returns the type name of the aggregate.
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-func (id *DefaultAggregateID) GetTypeName() string {
-	return id.typeName
-}
-
-// GetValue returns the unique value of the aggregate ID.
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-func (id *DefaultAggregateID) GetValue() string {
-	return id.value
-}
-
-// AsString returns the full string representation of the aggregate ID.
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-func (id *DefaultAggregateID) AsString() string {
-	return fmt.Sprintf("%s-%s", id.typeName, id.value)
-}
-
-// Event represents a domain event that has occurred.
-// Events are immutable and represent facts about what happened in the past.
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-type Event interface {
-	// GetID returns the unique identifier of this event.
-	GetID() string
-	// GetTypeName returns the type name of this event (e.g. "SettingCreated").
-	GetTypeName() string
-	// GetAggregateId returns the aggregate this event belongs to.
-	GetAggregateId() AggregateID
-	// GetSeqNr returns the sequence number of this event within the aggregate.
-	GetSeqNr() uint64
-	// IsCreated returns whether this is a creation event (the first event).
-	IsCreated() bool
-	// GetOccurredAt returns the timestamp when this event occurred (Unix milliseconds).
-	GetOccurredAt() uint64
-	// GetPayload returns the event payload as a byte slice.
-	GetPayload() []byte
-}
-
-// EventOption is a functional option for configuring an event.
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-type EventOption func(*DefaultEvent)
-
-// WithSeqNr sets the sequence number of the event.
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-func WithSeqNr(seqNr uint64) EventOption {
-	return func(e *DefaultEvent) {
-		e.seqNr = seqNr
+	// Aggregate は Event Sourcing における集約ルート。
+	// C は集約専用の Command 型、E は集約専用の Event 型（いずれも利用側で定義する
+	// domain interface / union を想定）。
+	//
+	// メタ情報 (SeqNr / Version / 永続化メタ) を一切持たず、ApplyCommand /
+	// ApplyEvent で表現される業務状態遷移のみを定義する。
+	//
+	// ApplyEvent の戻り値が Aggregate[C, E] (interface) なので、状態遷移時に
+	// 異なる具象型を返す state pattern が可能 (例: VisitScheduled → VisitCompleted)。
+	Aggregate[C Command, E Event] interface {
+		AggregateID() AggregateID
+		ApplyCommand(C) (E, error)
+		ApplyEvent(E) Aggregate[C, E]
 	}
-}
 
-// WithIsCreated sets whether this is a creation event.
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-func WithIsCreated(isCreated bool) EventOption {
-	return func(e *DefaultEvent) {
-		e.isCreated = isCreated
+	// Command はドメインの意図を表す。
+	// AggregateID は持たない (Repository.Save が aggID を別引数で受け取るため冗長)。
+	Command interface {
+		CommandTypeName() string
 	}
-}
 
-// WithOccurredAt sets the occurred-at timestamp.
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-func WithOccurredAt(t time.Time) EventOption {
-	return func(e *DefaultEvent) {
-		// #nosec G115 -- UnixMilli assumes time is after 1970
-		e.occurredAt = uint64(t.UnixMilli())
+	// Event は過去に発生した不変のドメインイベント。
+	// EventTypeName は EventSerializer の dispatch / OTel span name / 監査用。
+	// 永続化メタ (EventID / SeqNr / IsCreated / OccurredAt) は StoredEvent に集約される。
+	Event interface {
+		EventTypeName() string
+		AggregateID() AggregateID
 	}
+)
+
+// === Stored* (library-side metadata + domain values) ===
+
+// StoredEvent は domain Event に library-side のメタ情報を付与した型。
+// Repository ↔ EventStore 間でやり取りされる。
+//
+// EventStore 実装は domain 型を直接扱い、必要なら自身で (de)serialize する。
+// Repository 層には serialize の概念が漏れない設計。
+type StoredEvent[E Event] struct {
+	Event       E
+	EventID     string
+	SeqNr       uint64
+	IsCreated   bool
+	OccurredAt  time.Time
+	TraceParent string
+	TraceState  string
 }
 
-// WithOccurredAtUnixMilli sets the occurred-at timestamp as Unix milliseconds.
+// StoredSnapshot は domain Aggregate に library-side のメタ情報を付与した型。
+// Repository ↔ EventStore 間でやり取りされる。
 //
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-func WithOccurredAtUnixMilli(unixMilli uint64) EventOption {
-	return func(e *DefaultEvent) {
-		e.occurredAt = unixMilli
+// A は使用サイト (EventStore[A Aggregate[C, E], ...] / Repository[A Aggregate[C, E], ...])
+// で既に Aggregate[C, E] に制約されているため、本構造体自体は any を採用して
+// 型パラメータ爆発 (A, C, E の 3 個) を避けている。
+type StoredSnapshot[A any] struct {
+	Aggregate  A
+	SeqNr      uint64
+	Version    uint64
+	OccurredAt time.Time
+}
+
+// === Internal helpers ===
+
+// generateEventID は 16 random bytes から 32-char hex string を生成する。
+// StoredEvent.EventID の発行に Repository から呼ばれる。実用上 ULID/UUIDv4
+// と同等の一意性を持つ。
+func generateEventID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
 	}
-}
-
-// DefaultEvent is the default implementation of Event.
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-type DefaultEvent struct {
-	id          string
-	typeName    string
-	aggregateId AggregateID
-	seqNr       uint64
-	isCreated   bool
-	occurredAt  uint64
-	payload     []byte
-}
-
-// NewEvent creates a new DefaultEvent.
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-func NewEvent(
-	id string,
-	typeName string,
-	aggregateId AggregateID,
-	payload []byte,
-	opts ...EventOption,
-) *DefaultEvent {
-	e := &DefaultEvent{
-		id:          id,
-		typeName:    typeName,
-		aggregateId: aggregateId,
-		seqNr:       1, // default; should be set explicitly
-		isCreated:   false,
-		// #nosec G115 -- UnixMilli assumes time is after 1970
-		occurredAt: uint64(time.Now().UnixMilli()),
-		payload:    payload,
-	}
-	for _, opt := range opts {
-		opt(e)
-	}
-	return e
-}
-
-// GetID returns the unique identifier of this event.
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-func (e *DefaultEvent) GetID() string {
-	return e.id
-}
-
-// GetTypeName returns the type name of this event.
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-func (e *DefaultEvent) GetTypeName() string {
-	return e.typeName
-}
-
-// GetAggregateId returns the aggregate this event belongs to.
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-func (e *DefaultEvent) GetAggregateId() AggregateID {
-	return e.aggregateId
-}
-
-// GetSeqNr returns the sequence number of this event within the aggregate.
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-func (e *DefaultEvent) GetSeqNr() uint64 {
-	return e.seqNr
-}
-
-// IsCreated returns whether this is a creation event.
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-func (e *DefaultEvent) IsCreated() bool {
-	return e.isCreated
-}
-
-// GetOccurredAt returns the timestamp when this event occurred.
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-func (e *DefaultEvent) GetOccurredAt() uint64 {
-	return e.occurredAt
-}
-
-// GetPayload returns the event payload as a byte slice.
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-func (e *DefaultEvent) GetPayload() []byte {
-	return e.payload
-}
-
-// Aggregate represents an event-sourced aggregate root.
-// It holds version information for optimistic locking.
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-type Aggregate interface {
-	// GetId returns the unique identifier of the aggregate.
-	GetId() AggregateID
-	// GetSeqNr returns the current sequence number (event count).
-	GetSeqNr() uint64
-	// GetVersion returns the version for optimistic locking.
-	GetVersion() uint64
-	// WithVersion returns a new aggregate with the given version.
-	WithVersion(version uint64) Aggregate
-	// WithSeqNr returns a new aggregate with the given sequence number.
-	WithSeqNr(seqNr uint64) Aggregate
-}
-
-// AggregateResult represents the result of loading an aggregate from the store.
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-type AggregateResult struct {
-	// Aggregate is the loaded aggregate, or nil if not found.
-	Aggregate Aggregate
-	// SeqNr is the sequence number from the snapshot.
-	SeqNr uint64
-	// Version is the version from the snapshot.
-	Version uint64
-}
-
-// SnapshotData holds serialized snapshot data.
-//
-// Deprecated: Use github.com/Hiroshi0900/eventstore/v2 instead.
-type SnapshotData struct {
-	Payload []byte
-	SeqNr   uint64
-	Version uint64
+	return hex.EncodeToString(b[:]), nil
 }
