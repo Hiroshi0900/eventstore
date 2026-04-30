@@ -166,17 +166,27 @@ func (s *store[A, C, E]) GetLatestSnapshot(ctx context.Context, id es.AggregateI
 
 // LoadStreamAfter returns events with SeqNr > seqNr using a strongly consistent primary-table query.
 func (s *store[A, C, E]) LoadStreamAfter(ctx context.Context, id es.AggregateID, seqNr uint64) ([]es.StoredEvent[E], error) {
-	keys := s.keyResolver.ResolveEventKeys(id, seqNr)
+	if seqNr == ^uint64(0) {
+		return nil, nil
+	}
+
+	pkey := s.keyResolver.ResolvePartitionKey(id)
+	skeyFrom := s.keyResolver.ResolveSortKeyForEvent(id, seqNr+1)
+	// Event sort keys are zero-padded decimal suffixes, so prefix+"~" is an
+	// inclusive upper bound that stays within one aggregate's keyspace.
+	skeyTo := fmt.Sprintf("%s-%s-~", id.TypeName(), id.Value())
+
 	out, err := s.client.Query(ctx, &dynamodb.QueryInput{
 		TableName: aws.String(s.config.JournalTableName),
-		KeyConditionExpression: aws.String("#pk = :pk AND #sk > :sk"),
+		KeyConditionExpression: aws.String("#pk = :pk AND #sk BETWEEN :sk_from AND :sk_to"),
 		ExpressionAttributeNames: map[string]string{
 			"#pk": colPKey,
 			"#sk": colSKey,
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk": &types.AttributeValueMemberS{Value: keys.PartitionKey},
-			":sk": &types.AttributeValueMemberS{Value: keys.SortKey},
+			":pk":      &types.AttributeValueMemberS{Value: pkey},
+			":sk_from": &types.AttributeValueMemberS{Value: skeyFrom},
+			":sk_to":   &types.AttributeValueMemberS{Value: skeyTo},
 		},
 		ConsistentRead:   aws.Bool(true),
 		ScanIndexForward: aws.Bool(true),

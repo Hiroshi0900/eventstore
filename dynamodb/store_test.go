@@ -6,6 +6,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsdynamo "github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	awsdynamotypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	es "github.com/Hiroshi0900/eventstore"
 	v2dynamo "github.com/Hiroshi0900/eventstore/dynamodb"
@@ -135,5 +136,30 @@ func TestLoadStreamAfter_UsesPrimaryTableConsistentRead(t *testing.T) {
 	}
 	if client.lastQuery.ConsistentRead == nil || !aws.ToBool(client.lastQuery.ConsistentRead) {
 		t.Fatal("ConsistentRead = false, want true")
+	}
+	if got := aws.ToString(client.lastQuery.KeyConditionExpression); got != "#pk = :pk AND #sk BETWEEN :sk_from AND :sk_to" {
+		t.Fatalf("KeyConditionExpression = %q, want aggregate-scoped BETWEEN query", got)
+	}
+	from, ok := client.lastQuery.ExpressionAttributeValues[":sk_from"]
+	if !ok {
+		t.Fatal("expected :sk_from attribute value")
+	}
+	fromS, ok := from.(*awsdynamotypes.AttributeValueMemberS)
+	if !ok {
+		t.Fatalf(":sk_from type = %T, want string", from)
+	}
+	if fromS.Value != "T-1-00000000000000000001" {
+		t.Fatalf(":sk_from = %q, want %q", fromS.Value, "T-1-00000000000000000001")
+	}
+	to, ok := client.lastQuery.ExpressionAttributeValues[":sk_to"]
+	if !ok {
+		t.Fatal("expected :sk_to attribute value")
+	}
+	toS, ok := to.(*awsdynamotypes.AttributeValueMemberS)
+	if !ok {
+		t.Fatalf(":sk_to type = %T, want string", to)
+	}
+	if toS.Value != "T-1-~" {
+		t.Fatalf(":sk_to = %q, want %q", toS.Value, "T-1-~")
 	}
 }
