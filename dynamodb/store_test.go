@@ -137,29 +137,32 @@ func TestLoadStreamAfter_UsesPrimaryTableConsistentRead(t *testing.T) {
 	if client.lastQuery.ConsistentRead == nil || !aws.ToBool(client.lastQuery.ConsistentRead) {
 		t.Fatal("ConsistentRead = false, want true")
 	}
-	if got := aws.ToString(client.lastQuery.KeyConditionExpression); got != "#pk = :pk AND #sk BETWEEN :sk_from AND :sk_to" {
-		t.Fatalf("KeyConditionExpression = %q, want aggregate-scoped BETWEEN query", got)
+	if got := aws.ToString(client.lastQuery.KeyConditionExpression); got != "#pk = :pk AND #sk > :sk" {
+		t.Fatalf("KeyConditionExpression = %q, want primary-table lower-bound query", got)
 	}
-	from, ok := client.lastQuery.ExpressionAttributeValues[":sk_from"]
+	if got := aws.ToString(client.lastQuery.FilterExpression); got != "#aid = :aid" {
+		t.Fatalf("FilterExpression = %q, want exact aggregate filter", got)
+	}
+	from, ok := client.lastQuery.ExpressionAttributeValues[":sk"]
 	if !ok {
-		t.Fatal("expected :sk_from attribute value")
+		t.Fatal("expected :sk attribute value")
 	}
 	fromS, ok := from.(*awsdynamotypes.AttributeValueMemberS)
 	if !ok {
-		t.Fatalf(":sk_from type = %T, want string", from)
+		t.Fatalf(":sk type = %T, want string", from)
 	}
 	if fromS.Value != "T-1-00000000000000000001" {
-		t.Fatalf(":sk_from = %q, want %q", fromS.Value, "T-1-00000000000000000001")
+		t.Fatalf(":sk = %q, want %q", fromS.Value, "T-1-00000000000000000001")
 	}
-	to, ok := client.lastQuery.ExpressionAttributeValues[":sk_to"]
+	aid, ok := client.lastQuery.ExpressionAttributeValues[":aid"]
 	if !ok {
-		t.Fatal("expected :sk_to attribute value")
+		t.Fatal("expected :aid attribute value")
 	}
-	toS, ok := to.(*awsdynamotypes.AttributeValueMemberS)
+	aidS, ok := aid.(*awsdynamotypes.AttributeValueMemberS)
 	if !ok {
-		t.Fatalf(":sk_to type = %T, want string", to)
+		t.Fatalf(":aid type = %T, want string", aid)
 	}
-	if toS.Value != "T-1-~" {
-		t.Fatalf(":sk_to = %q, want %q", toS.Value, "T-1-~")
+	if aidS.Value != "T-1" {
+		t.Fatalf(":aid = %q, want %q", aidS.Value, "T-1")
 	}
 }

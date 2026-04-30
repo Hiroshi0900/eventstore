@@ -170,23 +170,21 @@ func (s *store[A, C, E]) LoadStreamAfter(ctx context.Context, id es.AggregateID,
 		return nil, nil
 	}
 
-	pkey := s.keyResolver.ResolvePartitionKey(id)
-	skeyFrom := s.keyResolver.ResolveSortKeyForEvent(id, seqNr+1)
-	// Event sort keys are zero-padded decimal suffixes, so prefix+"~" is an
-	// inclusive upper bound that stays within one aggregate's keyspace.
-	skeyTo := fmt.Sprintf("%s-%s-~", id.TypeName(), id.Value())
+	keys := s.keyResolver.ResolveEventKeys(id, seqNr+1)
 
 	out, err := s.client.Query(ctx, &dynamodb.QueryInput{
 		TableName: aws.String(s.config.JournalTableName),
-		KeyConditionExpression: aws.String("#pk = :pk AND #sk BETWEEN :sk_from AND :sk_to"),
+		KeyConditionExpression: aws.String("#pk = :pk AND #sk > :sk"),
+		FilterExpression:       aws.String("#aid = :aid"),
 		ExpressionAttributeNames: map[string]string{
-			"#pk": colPKey,
-			"#sk": colSKey,
+			"#pk":  colPKey,
+			"#sk":  colSKey,
+			"#aid": colAid,
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk":      &types.AttributeValueMemberS{Value: pkey},
-			":sk_from": &types.AttributeValueMemberS{Value: skeyFrom},
-			":sk_to":   &types.AttributeValueMemberS{Value: skeyTo},
+			":pk":  &types.AttributeValueMemberS{Value: keys.PartitionKey},
+			":sk":  &types.AttributeValueMemberS{Value: keys.SortKey},
+			":aid": &types.AttributeValueMemberS{Value: keys.AggregateIDKey},
 		},
 		ConsistentRead:   aws.Bool(true),
 		ScanIndexForward: aws.Bool(true),
