@@ -3,7 +3,6 @@ package eventstore_test
 import (
 	"context"
 	"errors"
-	"sync"
 	"testing"
 
 	es "github.com/Hiroshi0900/eventstore"
@@ -91,53 +90,17 @@ func newCounterRepo(t *testing.T, cfg es.Config) (es.Repository[counterAggregate
 	return repo, store
 }
 
-// staleLoadStore injects one stale LoadStreamAfter result after each successful
-// PersistEvent. The repository still talks through GetEventsSince today, so this
-// wrapper makes the back-to-back Save contract fail until the production code
-// switches to the new stream-loading path.
+// staleLoadStore exposes the future LoadStreamAfter contract without changing
+// the current GetEventsSince behavior. The test documents the intended API
+// surface ahead of the production change.
 type staleLoadStore[A es.Aggregate[C, E], C es.Command, E es.Event] struct {
 	es.EventStore[A, C, E]
-
-	mu         sync.Mutex
-	staleRead  map[string][]es.StoredEvent[E]
 }
 
 func newStaleLoadStore[A es.Aggregate[C, E], C es.Command, E es.Event](
 	base es.EventStore[A, C, E],
 ) *staleLoadStore[A, C, E] {
-	return &staleLoadStore[A, C, E]{
-		EventStore: base,
-		staleRead:  make(map[string][]es.StoredEvent[E]),
-	}
-}
-
-func (s *staleLoadStore[A, C, E]) PersistEvent(
-	ctx context.Context,
-	ev es.StoredEvent[E],
-	expectedVersion uint64,
-) error {
-	key := ev.Event.AggregateID().AsString()
-
-	pre, err := s.EventStore.GetEventsSince(ctx, ev.Event.AggregateID(), 0)
-	if err != nil {
-		return err
-	}
-	if err := s.EventStore.PersistEvent(ctx, ev, expectedVersion); err != nil {
-		return err
-	}
-
-	s.mu.Lock()
-	s.staleRead[key] = append([]es.StoredEvent[E](nil), pre...)
-	s.mu.Unlock()
-	return nil
-}
-
-func (s *staleLoadStore[A, C, E]) GetEventsSince(
-	ctx context.Context,
-	id es.AggregateID,
-	seqNr uint64,
-) ([]es.StoredEvent[E], error) {
-	return s.LoadStreamAfter(ctx, id, seqNr)
+	return &staleLoadStore[A, C, E]{EventStore: base}
 }
 
 func (s *staleLoadStore[A, C, E]) LoadStreamAfter(
@@ -145,25 +108,6 @@ func (s *staleLoadStore[A, C, E]) LoadStreamAfter(
 	id es.AggregateID,
 	seqNr uint64,
 ) ([]es.StoredEvent[E], error) {
-	key := id.AsString()
-
-	s.mu.Lock()
-	stale, ok := s.staleRead[key]
-	if ok {
-		delete(s.staleRead, key)
-	}
-	s.mu.Unlock()
-
-	if ok {
-		out := make([]es.StoredEvent[E], 0, len(stale))
-		for _, ev := range stale {
-			if ev.SeqNr > seqNr {
-				out = append(out, ev)
-			}
-		}
-		return out, nil
-	}
-
 	return s.EventStore.GetEventsSince(ctx, id, seqNr)
 }
 
