@@ -3,6 +3,7 @@ package eventstore_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	es "github.com/Hiroshi0900/eventstore"
@@ -88,6 +89,104 @@ func newCounterRepo(t *testing.T, cfg es.Config) (es.Repository[counterAggregate
 	store := memory.New[counterAggregate, counterCommand, counterEvent]()
 	repo := es.NewRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
 	return repo, store
+}
+
+// staleLoadStore injects one stale LoadStreamAfter result after each successful
+// PersistEvent. The repository still talks through GetEventsSince today, so this
+// wrapper makes the back-to-back Save contract fail until the production code
+// switches to the new stream-loading path.
+type staleLoadStore[A es.Aggregate[C, E], C es.Command, E es.Event] struct {
+	es.EventStore[A, C, E]
+
+	mu         sync.Mutex
+	staleRead  map[string][]es.StoredEvent[E]
+}
+
+func newStaleLoadStore[A es.Aggregate[C, E], C es.Command, E es.Event](
+	base es.EventStore[A, C, E],
+) *staleLoadStore[A, C, E] {
+	return &staleLoadStore[A, C, E]{
+		EventStore: base,
+		staleRead:  make(map[string][]es.StoredEvent[E]),
+	}
+}
+
+func (s *staleLoadStore[A, C, E]) PersistEvent(
+	ctx context.Context,
+	ev es.StoredEvent[E],
+	expectedVersion uint64,
+) error {
+	key := ev.Event.AggregateID().AsString()
+
+	pre, err := s.EventStore.GetEventsSince(ctx, ev.Event.AggregateID(), 0)
+	if err != nil {
+		return err
+	}
+	if err := s.EventStore.PersistEvent(ctx, ev, expectedVersion); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	s.staleRead[key] = append([]es.StoredEvent[E](nil), pre...)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *staleLoadStore[A, C, E]) GetEventsSince(
+	ctx context.Context,
+	id es.AggregateID,
+	seqNr uint64,
+) ([]es.StoredEvent[E], error) {
+	return s.LoadStreamAfter(ctx, id, seqNr)
+}
+
+func (s *staleLoadStore[A, C, E]) LoadStreamAfter(
+	ctx context.Context,
+	id es.AggregateID,
+	seqNr uint64,
+) ([]es.StoredEvent[E], error) {
+	key := id.AsString()
+
+	s.mu.Lock()
+	stale, ok := s.staleRead[key]
+	if ok {
+		delete(s.staleRead, key)
+	}
+	s.mu.Unlock()
+
+	if ok {
+		out := make([]es.StoredEvent[E], 0, len(stale))
+		for _, ev := range stale {
+			if ev.SeqNr > seqNr {
+				out = append(out, ev)
+			}
+		}
+		return out, nil
+	}
+
+	return s.EventStore.GetEventsSince(ctx, id, seqNr)
+}
+
+func TestRepository_Save_backToBackUsesStoreReconstructionContract(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 100
+
+	base := memory.New[counterAggregate, counterCommand, counterEvent]()
+	store := newStaleLoadStore[counterAggregate, counterCommand, counterEvent](base)
+	repo := es.NewRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
+	id := counterID{value: "contract"}
+
+	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
+		t.Fatalf("first Save: %v", err)
+	}
+
+	got, err := repo.Save(context.Background(), id, incrementCommand{By: 1})
+	if err != nil {
+		t.Fatalf("second Save: %v", err)
+	}
+	if got.count != 2 {
+		t.Fatalf("count: got %d, want 2", got.count)
+	}
 }
 
 func TestRepository_Construct(t *testing.T) {

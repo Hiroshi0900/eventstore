@@ -80,11 +80,11 @@ func TestStore_GetLatestSnapshot_empty(t *testing.T) {
 	}
 }
 
-func TestStore_GetEventsSince_empty(t *testing.T) {
+func TestStore_LoadStreamAfter_empty(t *testing.T) {
 	s := memory.New[stubAggregate, stubCommand, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
-	events, err := s.GetEventsSince(context.Background(), id, 0)
+	events, err := s.LoadStreamAfter(context.Background(), id, 0)
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
