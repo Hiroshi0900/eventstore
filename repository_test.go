@@ -3,7 +3,6 @@ package eventstore_test
 import (
 	"context"
 	"errors"
-	"sync"
 	"testing"
 
 	es "github.com/Hiroshi0900/eventstore"
@@ -91,26 +90,25 @@ func newCounterRepo(t *testing.T, cfg es.Config) (es.Repository[counterAggregate
 	return repo, store
 }
 
-// staleLoadStore exposes the future LoadStreamAfter contract without changing
-// the current GetEventsSince behavior. The next LoadStreamAfter after each
-// successful PersistEvent returns the cached pre-write stream once.
-type staleLoadStore[A es.Aggregate[C, E], C es.Command, E es.Event] struct {
+// futureLoadStreamStore is a deliberate TDD red fake for the future
+// LoadStreamAfter API. It does not protect the current Repository.Save path;
+// it only models the contract we want after the production rename.
+type futureLoadStreamStore[A es.Aggregate[C, E], C es.Command, E es.Event] struct {
 	es.EventStore[A, C, E]
 
-	mu        sync.Mutex
 	staleRead map[string][]es.StoredEvent[E]
 }
 
-func newStaleLoadStore[A es.Aggregate[C, E], C es.Command, E es.Event](
+func newFutureLoadStreamStore[A es.Aggregate[C, E], C es.Command, E es.Event](
 	base es.EventStore[A, C, E],
-) *staleLoadStore[A, C, E] {
-	return &staleLoadStore[A, C, E]{
+) *futureLoadStreamStore[A, C, E] {
+	return &futureLoadStreamStore[A, C, E]{
 		EventStore: base,
 		staleRead:  make(map[string][]es.StoredEvent[E]),
 	}
 }
 
-func (s *staleLoadStore[A, C, E]) PersistEvent(
+func (s *futureLoadStreamStore[A, C, E]) PersistEvent(
 	ctx context.Context,
 	ev es.StoredEvent[E],
 	expectedVersion uint64,
@@ -125,25 +123,21 @@ func (s *staleLoadStore[A, C, E]) PersistEvent(
 		return err
 	}
 
-	s.mu.Lock()
 	s.staleRead[key] = append([]es.StoredEvent[E](nil), pre...)
-	s.mu.Unlock()
 	return nil
 }
 
-func (s *staleLoadStore[A, C, E]) LoadStreamAfter(
+func (s *futureLoadStreamStore[A, C, E]) LoadStreamAfter(
 	ctx context.Context,
 	id es.AggregateID,
 	seqNr uint64,
 ) ([]es.StoredEvent[E], error) {
 	key := id.AsString()
 
-	s.mu.Lock()
 	stale, ok := s.staleRead[key]
 	if ok {
 		delete(s.staleRead, key)
 	}
-	s.mu.Unlock()
 
 	if ok {
 		out := make([]es.StoredEvent[E], 0, len(stale))
@@ -165,13 +159,15 @@ type counterLoadStreamStore interface {
 func requireCounterLoadStreamStore(counterLoadStreamStore) {}
 
 func TestRepository_Save_backToBackUsesStoreReconstructionContract(t *testing.T) {
+	// Deliberate TDD red gate: this should not compile until the production
+	// EventStore API grows LoadStreamAfter and memory.New implements it.
 	requireCounterLoadStreamStore(memory.New[counterAggregate, counterCommand, counterEvent]())
 
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 100
 
 	base := memory.New[counterAggregate, counterCommand, counterEvent]()
-	store := newStaleLoadStore[counterAggregate, counterCommand, counterEvent](base)
+	store := newFutureLoadStreamStore[counterAggregate, counterCommand, counterEvent](base)
 	repo := es.NewRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
 	id := counterID{value: "contract"}
 
