@@ -172,8 +172,7 @@ func (s *store[A, C, E]) LoadStreamAfter(ctx context.Context, id es.AggregateID,
 
 	// #sk > :sk を使うので、下限は "直前の番号" ではなく seqNr 自身に合わせる。
 	keys := s.keyResolver.ResolveEventKeys(id, seqNr)
-
-	out, err := s.client.Query(ctx, &dynamodb.QueryInput{
+	query := &dynamodb.QueryInput{
 		TableName: aws.String(s.config.JournalTableName),
 		KeyConditionExpression: aws.String("#pk = :pk AND #sk > :sk"),
 		FilterExpression:       aws.String("#aid = :aid"),
@@ -189,17 +188,24 @@ func (s *store[A, C, E]) LoadStreamAfter(ctx context.Context, id es.AggregateID,
 		},
 		ConsistentRead:   aws.Bool(true),
 		ScanIndexForward: aws.Bool(true),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("query events: %w", err)
 	}
-	stored := make([]es.StoredEvent[E], 0, len(out.Items))
-	for _, item := range out.Items {
-		ev, err := s.unmarshalEvent(item)
+	stored := make([]es.StoredEvent[E], 0)
+	for {
+		out, err := s.client.Query(ctx, query)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("query events: %w", err)
 		}
-		stored = append(stored, ev)
+		for _, item := range out.Items {
+			ev, err := s.unmarshalEvent(item)
+			if err != nil {
+				return nil, err
+			}
+			stored = append(stored, ev)
+		}
+		if len(out.LastEvaluatedKey) == 0 {
+			break
+		}
+		query.ExclusiveStartKey = out.LastEvaluatedKey
 	}
 	return stored, nil
 }

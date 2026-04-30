@@ -3,6 +3,7 @@ package dynamodb_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsdynamo "github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -47,6 +48,23 @@ type capturingClient struct {
 func (c *capturingClient) Query(ctx context.Context, params *awsdynamo.QueryInput, optFns ...func(*awsdynamo.Options)) (*awsdynamo.QueryOutput, error) {
 	c.lastQuery = params
 	return &awsdynamo.QueryOutput{}, nil
+}
+
+type paginatedClient struct {
+	fakeClient
+	queryInputs []*awsdynamo.QueryInput
+	queryPages  []*awsdynamo.QueryOutput
+}
+
+func (c *paginatedClient) Query(ctx context.Context, params *awsdynamo.QueryInput, optFns ...func(*awsdynamo.Options)) (*awsdynamo.QueryOutput, error) {
+	copied := *params
+	c.queryInputs = append(c.queryInputs, &copied)
+	if len(c.queryPages) == 0 {
+		return &awsdynamo.QueryOutput{}, nil
+	}
+	page := c.queryPages[0]
+	c.queryPages = c.queryPages[1:]
+	return page, nil
 }
 
 // stub types for generic instantiation.
@@ -203,5 +221,62 @@ func TestLoadStreamAfter_UsesSeqNrAsLowerBound(t *testing.T) {
 				t.Fatalf(":sk = %q, want %q", fromS.Value, tc.wantSk)
 			}
 		})
+	}
+}
+
+func TestLoadStreamAfter_PaginatesPrimaryTableQuery(t *testing.T) {
+	client := &paginatedClient{
+		queryPages: []*awsdynamo.QueryOutput{
+			{
+				LastEvaluatedKey: map[string]awsdynamotypes.AttributeValue{
+					"pkey": &awsdynamotypes.AttributeValueMemberS{Value: "T-0"},
+					"skey": &awsdynamotypes.AttributeValueMemberS{Value: "T-other-00000000000000000099"},
+				},
+			},
+			{
+				Items: []map[string]awsdynamotypes.AttributeValue{
+					{
+						"seq_nr":      &awsdynamotypes.AttributeValueMemberN{Value: "2"},
+						"occurred_at": &awsdynamotypes.AttributeValueMemberN{Value: "1714521600000"},
+						"payload":     &awsdynamotypes.AttributeValueMemberB{Value: []byte("payload")},
+						"type_name":   &awsdynamotypes.AttributeValueMemberS{Value: "Stub"},
+						"event_id":    &awsdynamotypes.AttributeValueMemberS{Value: "evt-2"},
+						"is_created":  &awsdynamotypes.AttributeValueMemberBOOL{Value: false},
+					},
+				},
+			},
+		},
+	}
+	store := v2dynamo.New[ddbStubAggregate, ddbStubCommand, ddbStubEvent](
+		client,
+		v2dynamo.DefaultConfig(),
+		ddbStubAggSer{},
+		ddbStubEvSer{},
+	)
+
+	events, err := store.LoadStreamAfter(context.Background(), ddbTestAggID{value: "1"}, 1)
+	if err != nil {
+		t.Fatalf("LoadStreamAfter: %v", err)
+	}
+	if len(client.queryInputs) != 2 {
+		t.Fatalf("Query calls = %d, want 2", len(client.queryInputs))
+	}
+	if client.queryInputs[0].ExclusiveStartKey != nil {
+		t.Fatal("first query ExclusiveStartKey = non-nil, want nil")
+	}
+	if client.queryInputs[1].ExclusiveStartKey == nil {
+		t.Fatal("second query ExclusiveStartKey = nil, want LastEvaluatedKey from previous page")
+	}
+	if len(events) != 1 {
+		t.Fatalf("len(events) = %d, want 1", len(events))
+	}
+	if events[0].SeqNr != 2 {
+		t.Fatalf("events[0].SeqNr = %d, want 2", events[0].SeqNr)
+	}
+	if events[0].EventID != "evt-2" {
+		t.Fatalf("events[0].EventID = %q, want %q", events[0].EventID, "evt-2")
+	}
+	if !events[0].OccurredAt.Equal(time.UnixMilli(1714521600000).UTC()) {
+		t.Fatalf("events[0].OccurredAt = %s, want %s", events[0].OccurredAt, time.UnixMilli(1714521600000).UTC())
 	}
 }
