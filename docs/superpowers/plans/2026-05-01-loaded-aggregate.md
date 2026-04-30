@@ -48,13 +48,13 @@ func (s *countingStore) LoadStreamAfter(
 Append this test to `repository_test.go` after the existing `Save`-path tests:
 
 ```go
-func TestRepository_SaveLoaded_reusesLoadedContextWithoutReplay(t *testing.T) {
+func TestCommandRepository_SaveLoaded_reusesLoadedContextWithoutReplay(t *testing.T) {
     cfg := es.DefaultConfig()
     cfg.SnapshotInterval = 100
 
     base := memory.New[counterAggregate, counterCommand, counterEvent]()
     store := newCountingStore(base)
-    repo := es.NewRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
+    repo := es.NewCommandRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
     id := counterID{value: "loaded"}
 
     loaded, err := repo.LoadForCommand(context.Background(), id)
@@ -90,8 +90,8 @@ func TestRepository_SaveLoaded_reusesLoadedContextWithoutReplay(t *testing.T) {
 Append this test immediately after the previous one:
 
 ```go
-func TestRepository_LoadForCommand_notFound(t *testing.T) {
-    repo, _ := newCounterRepo(t, es.DefaultConfig())
+func TestCommandRepository_LoadForCommand_notFound(t *testing.T) {
+    repo, _ := newCounterCommandRepo(t, es.DefaultConfig())
 
     _, err := repo.LoadForCommand(context.Background(), counterID{value: "missing"})
     if err == nil {
@@ -110,10 +110,10 @@ func TestRepository_LoadForCommand_notFound(t *testing.T) {
 Run:
 
 ```sh
-go test ./... -run 'TestRepository_(SaveLoaded_reusesLoadedContextWithoutReplay|LoadForCommand_notFound)$'
+go test ./... -run 'TestCommandRepository_(SaveLoaded_reusesLoadedContextWithoutReplay|LoadForCommand_notFound)$'
 ```
 
-Expected: compile failure because `Repository` does not yet expose `LoadForCommand`, `SaveLoaded`, or `LoadedAggregate`.
+Expected: compile failure because `CommandRepository` / `NewCommandRepository` and `LoadedAggregate` do not yet exist.
 
 - [ ] **Step 5: Commit the failing tests**
 
@@ -145,7 +145,7 @@ func (l LoadedAggregate[A, C, E]) Aggregate() A {
 }
 ```
 
-Then extend `Repository` with:
+Then add `CommandRepository` with:
 
 ```go
 LoadForCommand(ctx context.Context, aggID AggregateID) (LoadedAggregate[A, C, E], error)
@@ -299,11 +299,11 @@ git commit -m "feat: add loaded aggregate repository API"
 Append this test to `repository_test.go`:
 
 ```go
-func TestRepository_SaveLoaded_updatesSnapshotVersionAcrossBoundary(t *testing.T) {
+func TestCommandRepository_SaveLoaded_updatesSnapshotVersionAcrossBoundary(t *testing.T) {
     cfg := es.DefaultConfig()
     cfg.SnapshotInterval = 2
 
-    repo, store := newCounterRepo(t, cfg)
+    repo, store := newCounterCommandRepo(t, cfg)
     id := counterID{value: "snapshot"}
 
     loaded, err := repo.LoadForCommand(context.Background(), id)
@@ -349,7 +349,7 @@ func TestRepository_SaveLoaded_updatesSnapshotVersionAcrossBoundary(t *testing.T
 Add one overview bullet and one short usage example like this:
 
 ```md
-- `Repository.LoadForCommand` / `Repository.SaveLoaded` は、同一 aggregate に複数 command を続けて適用する時の最適化経路
+- `CommandRepository.LoadForCommand` / `CommandRepository.SaveLoaded` は、同一 aggregate に複数 command を続けて適用する時の最適化経路
 ```
 
 ```go

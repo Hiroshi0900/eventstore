@@ -532,6 +532,179 @@ func TestCommandRepository_LoadForCommand_notFound(t *testing.T) {
 	}
 }
 
+type transitionCounterEvent interface {
+	es.Event
+	isTransitionCounterEvent()
+}
+
+type transitionCounterIncrementedEvent struct {
+	AggID      counterID
+	By         int
+	MakeUnsafe bool
+}
+
+func (e transitionCounterIncrementedEvent) EventTypeName() string {
+	return "TransitionCounterIncremented"
+}
+func (e transitionCounterIncrementedEvent) AggregateID() es.AggregateID {
+	return e.AggID
+}
+func (transitionCounterIncrementedEvent) isTransitionCounterEvent() {}
+
+type transitionCounterCommand interface {
+	es.Command
+	isTransitionCounterCommand()
+}
+
+type transitionIncrementCommand struct {
+	By int
+}
+
+func (transitionIncrementCommand) CommandTypeName() string     { return "TransitionIncrement" }
+func (transitionIncrementCommand) isTransitionCounterCommand() {}
+
+type transitionMakeUnsafeCommand struct {
+	By int
+}
+
+func (transitionMakeUnsafeCommand) CommandTypeName() string     { return "TransitionMakeUnsafe" }
+func (transitionMakeUnsafeCommand) isTransitionCounterCommand() {}
+
+type transitionCounterAggregate interface {
+	es.Aggregate[transitionCounterCommand, transitionCounterEvent]
+	isTransitionCounterAggregate()
+}
+
+type safeTransitionCounterAggregate struct {
+	id    counterID
+	count int
+}
+
+func (a safeTransitionCounterAggregate) AggregateID() es.AggregateID { return a.id }
+
+func (a safeTransitionCounterAggregate) ApplyCommand(
+	cmd transitionCounterCommand,
+) (transitionCounterEvent, error) {
+	switch x := cmd.(type) {
+	case transitionIncrementCommand:
+		return transitionCounterIncrementedEvent{AggID: a.id, By: x.By}, nil
+	case transitionMakeUnsafeCommand:
+		return transitionCounterIncrementedEvent{AggID: a.id, By: x.By, MakeUnsafe: true}, nil
+	default:
+		return nil, es.ErrUnknownCommand
+	}
+}
+
+func (a safeTransitionCounterAggregate) ApplyEvent(
+	ev transitionCounterEvent,
+) es.Aggregate[transitionCounterCommand, transitionCounterEvent] {
+	e, ok := ev.(transitionCounterIncrementedEvent)
+	if !ok {
+		return a
+	}
+	if e.MakeUnsafe {
+		return unsafeTransitionCounterAggregate{
+			id:      a.id,
+			history: []int{a.count, a.count + e.By},
+		}
+	}
+	return safeTransitionCounterAggregate{
+		id:    a.id,
+		count: a.count + e.By,
+	}
+}
+
+func (safeTransitionCounterAggregate) isTransitionCounterAggregate() {}
+
+type unsafeTransitionCounterAggregate struct {
+	id      counterID
+	history []int
+}
+
+func (a unsafeTransitionCounterAggregate) AggregateID() es.AggregateID { return a.id }
+
+func (a unsafeTransitionCounterAggregate) ApplyCommand(
+	cmd transitionCounterCommand,
+) (transitionCounterEvent, error) {
+	switch x := cmd.(type) {
+	case transitionIncrementCommand:
+		return transitionCounterIncrementedEvent{AggID: a.id, By: x.By}, nil
+	case transitionMakeUnsafeCommand:
+		return transitionCounterIncrementedEvent{AggID: a.id, By: x.By, MakeUnsafe: true}, nil
+	default:
+		return nil, es.ErrUnknownCommand
+	}
+}
+
+func (a unsafeTransitionCounterAggregate) ApplyEvent(
+	ev transitionCounterEvent,
+) es.Aggregate[transitionCounterCommand, transitionCounterEvent] {
+	e, ok := ev.(transitionCounterIncrementedEvent)
+	if !ok {
+		return a
+	}
+
+	history := append([]int(nil), a.history...)
+	history = append(history, e.By)
+	return unsafeTransitionCounterAggregate{id: a.id, history: history}
+}
+
+func (unsafeTransitionCounterAggregate) isTransitionCounterAggregate() {}
+
+func blankTransitionCounter(id es.AggregateID) transitionCounterAggregate {
+	if cid, ok := id.(counterID); ok {
+		return safeTransitionCounterAggregate{id: cid}
+	}
+	return safeTransitionCounterAggregate{id: counterID{value: id.Value()}}
+}
+
+func TestCommandRepository_SaveLoaded_rejectsInvalidNextAggregateBeforePersist(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 100
+
+	store := memory.New[transitionCounterAggregate, transitionCounterCommand, transitionCounterEvent]()
+	repo := es.NewCommandRepository[transitionCounterAggregate, transitionCounterCommand, transitionCounterEvent](store, blankTransitionCounter, cfg)
+	id := counterID{value: "transition"}
+
+	if _, err := repo.Save(context.Background(), id, transitionIncrementCommand{By: 1}); err != nil {
+		t.Fatalf("seed Save: %v", err)
+	}
+
+	loaded, err := repo.LoadForCommand(context.Background(), id)
+	if err != nil {
+		t.Fatalf("LoadForCommand: %v", err)
+	}
+
+	_, err = repo.SaveLoaded(context.Background(), loaded, transitionMakeUnsafeCommand{By: 2})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, es.ErrInvalidAggregate) {
+		t.Fatalf("expected ErrInvalidAggregate, got %v", err)
+	}
+
+	stored, err := store.LoadStreamAfter(context.Background(), id, 0)
+	if err != nil {
+		t.Fatalf("LoadStreamAfter: %v", err)
+	}
+	if len(stored) != 1 {
+		t.Fatalf("stored events after failed SaveLoaded: got %d, want 1", len(stored))
+	}
+
+	got, err := repo.Load(context.Background(), id)
+	if err != nil {
+		t.Fatalf("Load after failed SaveLoaded: %v", err)
+	}
+
+	safe, ok := got.(safeTransitionCounterAggregate)
+	if !ok {
+		t.Fatalf("aggregate type after failed SaveLoaded: got %T, want safeTransitionCounterAggregate", got)
+	}
+	if safe.count != 1 {
+		t.Fatalf("aggregate count after failed SaveLoaded: got %d, want 1", safe.count)
+	}
+}
+
 type unsafeCounterEvent interface {
 	es.Event
 	isUnsafeCounterEvent()
@@ -614,6 +787,101 @@ func TestCommandRepository_LoadForCommand_rejectsReferenceSemanticAggregate(t *t
 	}
 	if !strings.Contains(err.Error(), "slice") {
 		t.Fatalf("expected slice detail in message, got %q", err.Error())
+	}
+}
+
+type timedCounterEvent interface {
+	es.Event
+	isTimedCounterEvent()
+}
+
+type timedCounterStampedEvent struct {
+	AggID counterID
+	At    time.Time
+}
+
+func (e timedCounterStampedEvent) EventTypeName() string       { return "TimedCounterStamped" }
+func (e timedCounterStampedEvent) AggregateID() es.AggregateID { return e.AggID }
+func (timedCounterStampedEvent) isTimedCounterEvent()          {}
+
+type timedCounterCommand interface {
+	es.Command
+	isTimedCounterCommand()
+}
+
+type stampTimedCounterCommand struct {
+	At time.Time
+}
+
+func (stampTimedCounterCommand) CommandTypeName() string { return "StampTimedCounter" }
+func (stampTimedCounterCommand) isTimedCounterCommand()  {}
+
+type timedCounterAggregate struct {
+	id        counterID
+	updatedAt time.Time
+	updates   int
+}
+
+func (a timedCounterAggregate) AggregateID() es.AggregateID { return a.id }
+
+func (a timedCounterAggregate) ApplyCommand(cmd timedCounterCommand) (timedCounterEvent, error) {
+	switch x := cmd.(type) {
+	case stampTimedCounterCommand:
+		return timedCounterStampedEvent{AggID: a.id, At: x.At}, nil
+	default:
+		return nil, es.ErrUnknownCommand
+	}
+}
+
+func (a timedCounterAggregate) ApplyEvent(ev timedCounterEvent) es.Aggregate[timedCounterCommand, timedCounterEvent] {
+	e, ok := ev.(timedCounterStampedEvent)
+	if !ok {
+		return a
+	}
+	return timedCounterAggregate{
+		id:        a.id,
+		updatedAt: e.At,
+		updates:   a.updates + 1,
+	}
+}
+
+func blankTimedCounter(id es.AggregateID) timedCounterAggregate {
+	if cid, ok := id.(counterID); ok {
+		return timedCounterAggregate{id: cid}
+	}
+	return timedCounterAggregate{id: counterID{value: id.Value()}}
+}
+
+func TestCommandRepository_LoadForCommand_allowsTimeTimeAggregate(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 100
+
+	repo, _ := func() (es.CommandRepository[timedCounterAggregate, timedCounterCommand, timedCounterEvent], es.EventStore[timedCounterAggregate, timedCounterCommand, timedCounterEvent]) {
+		store := memory.New[timedCounterAggregate, timedCounterCommand, timedCounterEvent]()
+		return es.NewCommandRepository[timedCounterAggregate, timedCounterCommand, timedCounterEvent](store, blankTimedCounter, cfg), store
+	}()
+	id := counterID{value: "timed"}
+	firstAt := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	secondAt := firstAt.Add(2 * time.Hour)
+
+	if _, err := repo.Save(context.Background(), id, stampTimedCounterCommand{At: firstAt}); err != nil {
+		t.Fatalf("seed Save: %v", err)
+	}
+
+	loaded, err := repo.LoadForCommand(context.Background(), id)
+	if err != nil {
+		t.Fatalf("LoadForCommand: %v", err)
+	}
+	if got := loaded.Aggregate(); !got.updatedAt.Equal(firstAt) {
+		t.Fatalf("loaded updatedAt: got %v, want %v", got.updatedAt, firstAt)
+	}
+
+	next, err := repo.SaveLoaded(context.Background(), loaded, stampTimedCounterCommand{At: secondAt})
+	if err != nil {
+		t.Fatalf("SaveLoaded: %v", err)
+	}
+	if got := next.Aggregate(); !got.updatedAt.Equal(secondAt) || got.updates != 2 {
+		t.Fatalf("next aggregate: got updatedAt=%v updates=%d, want updatedAt=%v updates=2", got.updatedAt, got.updates, secondAt)
 	}
 }
 

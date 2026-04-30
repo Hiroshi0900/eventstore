@@ -177,7 +177,13 @@ type savedAggregateState[A any] struct {
 	version   uint64
 }
 
+var timeTimeType = reflect.TypeOf(time.Time{})
+
 func invalidLoadedAggregateTypeReason(typ reflect.Type, path string) string {
+	if typ == timeTimeType {
+		return ""
+	}
+
 	switch typ.Kind() {
 	case reflect.Pointer:
 		return fmt.Sprintf("%s uses pointer type %s", path, typ)
@@ -227,6 +233,25 @@ func (r *defaultRepository[A, C, E]) unsupportedLoadedAggregateError(
 	)
 }
 
+func (r *defaultRepository[A, C, E]) validateLoadedAggregate(
+	operation string,
+	agg A,
+) error {
+	typ := reflect.TypeOf(agg)
+	if typ == nil {
+		return r.unsupportedLoadedAggregateError(operation, agg)
+	}
+	if reason := invalidLoadedAggregateTypeReason(typ, typ.String()); reason != "" {
+		return fmt.Errorf(
+			"%w: %s requires value-semantic aggregates; %s",
+			ErrInvalidAggregate,
+			operation,
+			reason,
+		)
+	}
+	return nil
+}
+
 func (r *defaultRepository[A, C, E]) newLoadedAggregate(
 	operation string,
 	agg A,
@@ -235,17 +260,8 @@ func (r *defaultRepository[A, C, E]) newLoadedAggregate(
 ) (LoadedAggregate[A, C, E], error) {
 	var zero LoadedAggregate[A, C, E]
 
-	typ := reflect.TypeOf(agg)
-	if typ == nil {
-		return zero, r.unsupportedLoadedAggregateError(operation, agg)
-	}
-	if reason := invalidLoadedAggregateTypeReason(typ, typ.String()); reason != "" {
-		return zero, fmt.Errorf(
-			"%w: %s requires value-semantic aggregates; %s",
-			ErrInvalidAggregate,
-			operation,
-			reason,
-		)
+	if err := r.validateLoadedAggregate(operation, agg); err != nil {
+		return zero, err
 	}
 
 	return LoadedAggregate[A, C, E]{
@@ -262,6 +278,7 @@ func (r *defaultRepository[A, C, E]) persistKnownAggregate(
 	currentSeqNr uint64,
 	currentVersion uint64,
 	cmd C,
+	validateNext func(A) error,
 ) (savedAggregateState[A], error) {
 	var zero savedAggregateState[A]
 
@@ -276,6 +293,11 @@ func (r *defaultRepository[A, C, E]) persistKnownAggregate(
 			"%w: ApplyEvent returned a value that does not implement A",
 			ErrInvalidAggregate,
 		)
+	}
+	if validateNext != nil {
+		if err := validateNext(next); err != nil {
+			return zero, err
+		}
 	}
 
 	nextSeqNr := currentSeqNr + 1
@@ -337,7 +359,16 @@ func (r *defaultRepository[A, C, E]) saveKnownAggregate(
 	currentVersion uint64,
 	cmd C,
 ) (LoadedAggregate[A, C, E], error) {
-	next, err := r.persistKnownAggregate(ctx, agg, currentSeqNr, currentVersion, cmd)
+	next, err := r.persistKnownAggregate(
+		ctx,
+		agg,
+		currentSeqNr,
+		currentVersion,
+		cmd,
+		func(next A) error {
+			return r.validateLoadedAggregate("SaveLoaded", next)
+		},
+	)
 	if err != nil {
 		var zero LoadedAggregate[A, C, E]
 		return zero, err
@@ -359,7 +390,7 @@ func (r *defaultRepository[A, C, E]) Save(
 		return zero, err
 	}
 
-	next, err := r.persistKnownAggregate(ctx, agg, currentSeqNr, currentVersion, cmd)
+	next, err := r.persistKnownAggregate(ctx, agg, currentSeqNr, currentVersion, cmd, nil)
 	if err != nil {
 		return zero, err
 	}
