@@ -3,6 +3,7 @@ package eventstore_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	es "github.com/Hiroshi0900/eventstore"
@@ -91,16 +92,43 @@ func newCounterRepo(t *testing.T, cfg es.Config) (es.Repository[counterAggregate
 }
 
 // staleLoadStore exposes the future LoadStreamAfter contract without changing
-// the current GetEventsSince behavior. The test documents the intended API
-// surface ahead of the production change.
+// the current GetEventsSince behavior. The next LoadStreamAfter after each
+// successful PersistEvent returns the cached pre-write stream once.
 type staleLoadStore[A es.Aggregate[C, E], C es.Command, E es.Event] struct {
 	es.EventStore[A, C, E]
+
+	mu        sync.Mutex
+	staleRead map[string][]es.StoredEvent[E]
 }
 
 func newStaleLoadStore[A es.Aggregate[C, E], C es.Command, E es.Event](
 	base es.EventStore[A, C, E],
 ) *staleLoadStore[A, C, E] {
-	return &staleLoadStore[A, C, E]{EventStore: base}
+	return &staleLoadStore[A, C, E]{
+		EventStore: base,
+		staleRead:  make(map[string][]es.StoredEvent[E]),
+	}
+}
+
+func (s *staleLoadStore[A, C, E]) PersistEvent(
+	ctx context.Context,
+	ev es.StoredEvent[E],
+	expectedVersion uint64,
+) error {
+	key := ev.Event.AggregateID().AsString()
+
+	pre, err := s.EventStore.GetEventsSince(ctx, ev.Event.AggregateID(), 0)
+	if err != nil {
+		return err
+	}
+	if err := s.EventStore.PersistEvent(ctx, ev, expectedVersion); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	s.staleRead[key] = append([]es.StoredEvent[E](nil), pre...)
+	s.mu.Unlock()
+	return nil
 }
 
 func (s *staleLoadStore[A, C, E]) LoadStreamAfter(
@@ -108,10 +136,37 @@ func (s *staleLoadStore[A, C, E]) LoadStreamAfter(
 	id es.AggregateID,
 	seqNr uint64,
 ) ([]es.StoredEvent[E], error) {
+	key := id.AsString()
+
+	s.mu.Lock()
+	stale, ok := s.staleRead[key]
+	if ok {
+		delete(s.staleRead, key)
+	}
+	s.mu.Unlock()
+
+	if ok {
+		out := make([]es.StoredEvent[E], 0, len(stale))
+		for _, ev := range stale {
+			if ev.SeqNr > seqNr {
+				out = append(out, ev)
+			}
+		}
+		return out, nil
+	}
+
 	return s.EventStore.GetEventsSince(ctx, id, seqNr)
 }
 
+type counterLoadStreamStore interface {
+	LoadStreamAfter(context.Context, es.AggregateID, uint64) ([]es.StoredEvent[counterEvent], error)
+}
+
+func requireCounterLoadStreamStore(counterLoadStreamStore) {}
+
 func TestRepository_Save_backToBackUsesStoreReconstructionContract(t *testing.T) {
+	requireCounterLoadStreamStore(memory.New[counterAggregate, counterCommand, counterEvent]())
+
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 100
 
