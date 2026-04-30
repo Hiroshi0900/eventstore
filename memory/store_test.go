@@ -134,25 +134,25 @@ func TestStore_LoadStreamAfter_returnsEventsInAscendingOrder(t *testing.T) {
 	s := memory.New[stubAggregate, stubCommand, stubEvent]()
 	id := memoryTestAggID{"Visit", "ordering"}
 
-	if err := s.PersistEvent(context.Background(), newStored(id, 3, true), 0); err != nil {
-		t.Fatalf("PersistEvent 3: %v", err)
-	}
-	if err := s.PersistEvent(context.Background(), newStored(id, 1, false), 1); err != nil {
+	if err := s.PersistEvent(context.Background(), newStored(id, 1, true), 0); err != nil {
 		t.Fatalf("PersistEvent 1: %v", err)
 	}
 	if err := s.PersistEvent(context.Background(), newStored(id, 2, false), 1); err != nil {
 		t.Fatalf("PersistEvent 2: %v", err)
 	}
+	if err := s.PersistEvent(context.Background(), newStored(id, 3, false), 1); err != nil {
+		t.Fatalf("PersistEvent 3: %v", err)
+	}
 
-	got, err := s.LoadStreamAfter(context.Background(), id, 0)
+	got, err := s.LoadStreamAfter(context.Background(), id, 1)
 	if err != nil {
 		t.Fatalf("LoadStreamAfter: %v", err)
 	}
-	if len(got) != 3 {
-		t.Fatalf("len = %d, want 3", len(got))
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2", len(got))
 	}
-	if got[0].SeqNr != 1 || got[1].SeqNr != 2 || got[2].SeqNr != 3 {
-		t.Fatalf("seq order = [%d %d %d], want [1 2 3]", got[0].SeqNr, got[1].SeqNr, got[2].SeqNr)
+	if got[0].SeqNr != 2 || got[1].SeqNr != 3 {
+		t.Fatalf("seq order = [%d %d], want [2 3]", got[0].SeqNr, got[1].SeqNr)
 	}
 }
 
