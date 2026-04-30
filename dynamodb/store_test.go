@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	awsdynamo "github.com/aws/aws-sdk-go-v2/service/dynamodb"
 
 	es "github.com/Hiroshi0900/eventstore"
@@ -35,6 +36,16 @@ func (fakeClient) CreateTable(ctx context.Context, params *awsdynamo.CreateTable
 
 func (fakeClient) DescribeTable(ctx context.Context, params *awsdynamo.DescribeTableInput, optFns ...func(*awsdynamo.Options)) (*awsdynamo.DescribeTableOutput, error) {
 	return &awsdynamo.DescribeTableOutput{}, nil
+}
+
+type capturingClient struct {
+	fakeClient
+	lastQuery *awsdynamo.QueryInput
+}
+
+func (c *capturingClient) Query(ctx context.Context, params *awsdynamo.QueryInput, optFns ...func(*awsdynamo.Options)) (*awsdynamo.QueryOutput, error) {
+	c.lastQuery = params
+	return &awsdynamo.QueryOutput{}, nil
 }
 
 // stub types for generic instantiation.
@@ -100,5 +111,29 @@ func TestNewWithTables_Construct(t *testing.T) {
 	)
 	if mgr == nil {
 		t.Fatal("expected non-nil TableManager")
+	}
+}
+
+func TestLoadStreamAfter_UsesPrimaryTableConsistentRead(t *testing.T) {
+	client := &capturingClient{}
+	store := v2dynamo.New[ddbStubAggregate, ddbStubCommand, ddbStubEvent](
+		client,
+		v2dynamo.DefaultConfig(),
+		ddbStubAggSer{},
+		ddbStubEvSer{},
+	)
+
+	_, err := store.LoadStreamAfter(context.Background(), ddbTestAggID{value: "1"}, 0)
+	if err != nil {
+		t.Fatalf("LoadStreamAfter: %v", err)
+	}
+	if client.lastQuery == nil {
+		t.Fatal("expected Query call")
+	}
+	if client.lastQuery.IndexName != nil {
+		t.Fatalf("IndexName = %q, want nil", aws.ToString(client.lastQuery.IndexName))
+	}
+	if client.lastQuery.ConsistentRead == nil || !aws.ToBool(client.lastQuery.ConsistentRead) {
+		t.Fatal("ConsistentRead = false, want true")
 	}
 }

@@ -164,21 +164,21 @@ func (s *store[A, C, E]) GetLatestSnapshot(ctx context.Context, id es.AggregateI
 	}, true, nil
 }
 
-// GetEventsSince queries the journal GSI for events with SeqNr > seqNr.
-func (s *store[A, C, E]) GetEventsSince(ctx context.Context, id es.AggregateID, seqNr uint64) ([]es.StoredEvent[E], error) {
-	aidKey := s.keyResolver.ResolveAggregateIDKey(id)
+// LoadStreamAfter returns events with SeqNr > seqNr using a strongly consistent primary-table query.
+func (s *store[A, C, E]) LoadStreamAfter(ctx context.Context, id es.AggregateID, seqNr uint64) ([]es.StoredEvent[E], error) {
+	keys := s.keyResolver.ResolveEventKeys(id, seqNr)
 	out, err := s.client.Query(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(s.config.JournalTableName),
-		IndexName:              aws.String(s.config.JournalGSIName),
-		KeyConditionExpression: aws.String("#aid = :aid AND #seq_nr > :seq_nr"),
+		TableName: aws.String(s.config.JournalTableName),
+		KeyConditionExpression: aws.String("#pk = :pk AND #sk > :sk"),
 		ExpressionAttributeNames: map[string]string{
-			"#aid":    colAid,
-			"#seq_nr": colSeqNr,
+			"#pk": colPKey,
+			"#sk": colSKey,
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":aid":    &types.AttributeValueMemberS{Value: aidKey},
-			":seq_nr": &types.AttributeValueMemberN{Value: strconv.FormatUint(seqNr, 10)},
+			":pk": &types.AttributeValueMemberS{Value: keys.PartitionKey},
+			":sk": &types.AttributeValueMemberS{Value: keys.SortKey},
 		},
+		ConsistentRead:   aws.Bool(true),
 		ScanIndexForward: aws.Bool(true),
 	})
 	if err != nil {
