@@ -3,6 +3,7 @@ package eventstore
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"time"
 )
 
@@ -32,6 +33,12 @@ type Repository[A Aggregate[C, E], C Command, E Event] interface {
 	// で適用してイベントを生成、ApplyEvent で次状態に遷移後、永続化して新状態を返す。
 	// SnapshotInterval に達した seqNr では snapshot も同時に書く。
 	Save(ctx context.Context, aggID AggregateID, cmd C) (A, error)
+}
+
+// CommandRepository は repeated command handling 向けの最適化 API を含む。
+// LoadedAggregate を返す API は値セマンティクスを持つ aggregate に限定される。
+type CommandRepository[A Aggregate[C, E], C Command, E Event] interface {
+	Repository[A, C, E]
 
 	// LoadForCommand は command 側の連続 Save 向けに aggregate と永続化文脈を返す。
 	LoadForCommand(ctx context.Context, aggID AggregateID) (LoadedAggregate[A, C, E], error)
@@ -61,6 +68,20 @@ func NewRepository[A Aggregate[C, E], C Command, E Event](
 	createBlank func(AggregateID) A,
 	config Config,
 ) Repository[A, C, E] {
+	return &defaultRepository[A, C, E]{
+		store:       store,
+		createBlank: createBlank,
+		config:      config,
+	}
+}
+
+// NewCommandRepository は CommandRepository[A, C, E] を生成する。
+// 実装は NewRepository と同じ defaultRepository を利用する。
+func NewCommandRepository[A Aggregate[C, E], C Command, E Event](
+	store EventStore[A, C, E],
+	createBlank func(AggregateID) A,
+	config Config,
+) CommandRepository[A, C, E] {
 	return &defaultRepository[A, C, E]{
 		store:       store,
 		createBlank: createBlank,
@@ -140,12 +161,7 @@ func (r *defaultRepository[A, C, E]) LoadForCommand(
 		var zero LoadedAggregate[A, C, E]
 		return zero, NewAggregateNotFoundError(aggID.TypeName(), aggID.Value())
 	}
-	return LoadedAggregate[A, C, E]{
-		aggregate: agg,
-		seqNr:     seqNr,
-		version:   version,
-		owner:     r,
-	}, nil
+	return r.newLoadedAggregate("LoadForCommand", agg, seqNr, version)
 }
 
 func (r *defaultRepository[A, C, E]) invalidLoadedAggregateError() error {
@@ -155,14 +171,99 @@ func (r *defaultRepository[A, C, E]) invalidLoadedAggregateError() error {
 	)
 }
 
-func (r *defaultRepository[A, C, E]) saveKnownAggregate(
+type savedAggregateState[A any] struct {
+	aggregate A
+	seqNr     uint64
+	version   uint64
+}
+
+func invalidLoadedAggregateTypeReason(typ reflect.Type, path string) string {
+	switch typ.Kind() {
+	case reflect.Pointer:
+		return fmt.Sprintf("%s uses pointer type %s", path, typ)
+	case reflect.Map:
+		return fmt.Sprintf("%s uses map type %s", path, typ)
+	case reflect.Slice:
+		return fmt.Sprintf("%s uses slice type %s", path, typ)
+	case reflect.Func:
+		return fmt.Sprintf("%s uses func type %s", path, typ)
+	case reflect.Chan:
+		return fmt.Sprintf("%s uses channel type %s", path, typ)
+	case reflect.Interface:
+		return fmt.Sprintf("%s uses interface type %s", path, typ)
+	case reflect.UnsafePointer:
+		return fmt.Sprintf("%s uses unsafe pointer type %s", path, typ)
+	case reflect.Array:
+		return invalidLoadedAggregateTypeReason(typ.Elem(), path+"[]")
+	case reflect.Struct:
+		for i := 0; i < typ.NumField(); i++ {
+			field := typ.Field(i)
+			if reason := invalidLoadedAggregateTypeReason(field.Type, path+"."+field.Name); reason != "" {
+				return reason
+			}
+		}
+	}
+	return ""
+}
+
+func (r *defaultRepository[A, C, E]) unsupportedLoadedAggregateError(
+	operation string,
+	agg A,
+) error {
+	typ := reflect.TypeOf(agg)
+	if typ == nil {
+		return fmt.Errorf(
+			"%w: %s requires value-semantic aggregates; aggregate type is nil",
+			ErrInvalidAggregate,
+			operation,
+		)
+	}
+
+	return fmt.Errorf(
+		"%w: %s requires value-semantic aggregates; %s",
+		ErrInvalidAggregate,
+		operation,
+		invalidLoadedAggregateTypeReason(typ, typ.String()),
+	)
+}
+
+func (r *defaultRepository[A, C, E]) newLoadedAggregate(
+	operation string,
+	agg A,
+	seqNr uint64,
+	version uint64,
+) (LoadedAggregate[A, C, E], error) {
+	var zero LoadedAggregate[A, C, E]
+
+	typ := reflect.TypeOf(agg)
+	if typ == nil {
+		return zero, r.unsupportedLoadedAggregateError(operation, agg)
+	}
+	if reason := invalidLoadedAggregateTypeReason(typ, typ.String()); reason != "" {
+		return zero, fmt.Errorf(
+			"%w: %s requires value-semantic aggregates; %s",
+			ErrInvalidAggregate,
+			operation,
+			reason,
+		)
+	}
+
+	return LoadedAggregate[A, C, E]{
+		aggregate: agg,
+		seqNr:     seqNr,
+		version:   version,
+		owner:     r,
+	}, nil
+}
+
+func (r *defaultRepository[A, C, E]) persistKnownAggregate(
 	ctx context.Context,
 	agg A,
 	currentSeqNr uint64,
 	currentVersion uint64,
 	cmd C,
-) (LoadedAggregate[A, C, E], error) {
-	var zero LoadedAggregate[A, C, E]
+) (savedAggregateState[A], error) {
+	var zero savedAggregateState[A]
 
 	ev, err := agg.ApplyCommand(cmd)
 	if err != nil {
@@ -222,12 +323,26 @@ func (r *defaultRepository[A, C, E]) saveKnownAggregate(
 		}
 	}
 
-	return LoadedAggregate[A, C, E]{
+	return savedAggregateState[A]{
 		aggregate: next,
 		seqNr:     nextSeqNr,
 		version:   nextVersion,
-		owner:     r,
 	}, nil
+}
+
+func (r *defaultRepository[A, C, E]) saveKnownAggregate(
+	ctx context.Context,
+	agg A,
+	currentSeqNr uint64,
+	currentVersion uint64,
+	cmd C,
+) (LoadedAggregate[A, C, E], error) {
+	next, err := r.persistKnownAggregate(ctx, agg, currentSeqNr, currentVersion, cmd)
+	if err != nil {
+		var zero LoadedAggregate[A, C, E]
+		return zero, err
+	}
+	return r.newLoadedAggregate("SaveLoaded", next.aggregate, next.seqNr, next.version)
 }
 
 // Save は load → ApplyCommand → ApplyEvent → 永続化 を一括で行う。
@@ -244,11 +359,11 @@ func (r *defaultRepository[A, C, E]) Save(
 		return zero, err
 	}
 
-	loaded, err := r.saveKnownAggregate(ctx, agg, currentSeqNr, currentVersion, cmd)
+	next, err := r.persistKnownAggregate(ctx, agg, currentSeqNr, currentVersion, cmd)
 	if err != nil {
 		return zero, err
 	}
-	return loaded.Aggregate(), nil
+	return next.aggregate, nil
 }
 
 // SaveLoaded はロード済み aggregate に command を適用し、次の loaded 状態を返す。

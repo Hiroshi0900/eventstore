@@ -3,6 +3,7 @@ package eventstore_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -91,6 +92,13 @@ func newCounterRepo(t *testing.T, cfg es.Config) (es.Repository[counterAggregate
 	t.Helper()
 	store := memory.New[counterAggregate, counterCommand, counterEvent]()
 	repo := es.NewRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
+	return repo, store
+}
+
+func newCounterCommandRepo(t *testing.T, cfg es.Config) (es.CommandRepository[counterAggregate, counterCommand, counterEvent], es.EventStore[counterAggregate, counterCommand, counterEvent]) {
+	t.Helper()
+	store := memory.New[counterAggregate, counterCommand, counterEvent]()
+	repo := es.NewCommandRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
 	return repo, store
 }
 
@@ -274,6 +282,13 @@ func TestRepository_Construct(t *testing.T) {
 	}
 }
 
+func TestCommandRepository_Construct(t *testing.T) {
+	repo, _ := newCounterCommandRepo(t, es.DefaultConfig())
+	if repo == nil {
+		t.Fatal("expected non-nil CommandRepository")
+	}
+}
+
 func TestRepository_Load_notFound(t *testing.T) {
 	repo, _ := newCounterRepo(t, es.DefaultConfig())
 	_, err := repo.Load(context.Background(), counterID{value: "missing"})
@@ -340,13 +355,13 @@ func TestRepository_Save_subsequentEvent(t *testing.T) {
 	}
 }
 
-func TestRepository_SaveLoaded_reusesLoadedContextWithoutReplay(t *testing.T) {
+func TestCommandRepository_SaveLoaded_reusesLoadedContextWithoutReplay(t *testing.T) {
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 100
 
 	base := memory.New[counterAggregate, counterCommand, counterEvent]()
 	store := newCountingStore(base)
-	repo := es.NewRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
+	repo := es.NewCommandRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
 	id := counterID{value: "loaded"}
 
 	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
@@ -382,8 +397,8 @@ func TestRepository_SaveLoaded_reusesLoadedContextWithoutReplay(t *testing.T) {
 	}
 }
 
-func TestRepository_SaveLoaded_rejectsZeroValueLoadedAggregate(t *testing.T) {
-	repo, _ := newCounterRepo(t, es.DefaultConfig())
+func TestCommandRepository_SaveLoaded_rejectsZeroValueLoadedAggregate(t *testing.T) {
+	repo, _ := newCounterCommandRepo(t, es.DefaultConfig())
 
 	_, err := repo.SaveLoaded(context.Background(), es.LoadedAggregate[counterAggregate, counterCommand, counterEvent]{}, incrementCommand{By: 1})
 	if err == nil {
@@ -397,12 +412,12 @@ func TestRepository_SaveLoaded_rejectsZeroValueLoadedAggregate(t *testing.T) {
 	}
 }
 
-func TestRepository_SaveLoaded_rejectsHandleFromDifferentRepository(t *testing.T) {
+func TestCommandRepository_SaveLoaded_rejectsHandleFromDifferentRepository(t *testing.T) {
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 100
 
-	repo1, _ := newCounterRepo(t, cfg)
-	repo2, _ := newCounterRepo(t, cfg)
+	repo1, _ := newCounterCommandRepo(t, cfg)
+	repo2, _ := newCounterCommandRepo(t, cfg)
 	id := counterID{value: "foreign"}
 
 	if _, err := repo1.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
@@ -426,11 +441,11 @@ func TestRepository_SaveLoaded_rejectsHandleFromDifferentRepository(t *testing.T
 	}
 }
 
-func TestRepository_SaveLoaded_updatesSnapshotVersionAcrossBoundary(t *testing.T) {
+func TestCommandRepository_SaveLoaded_updatesSnapshotVersionAcrossBoundary(t *testing.T) {
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 2
 
-	repo, store := newCounterRepo(t, cfg)
+	repo, store := newCounterCommandRepo(t, cfg)
 	id := counterID{value: "snapshot"}
 
 	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
@@ -503,8 +518,8 @@ func TestRepository_SaveLoaded_updatesSnapshotVersionAcrossBoundary(t *testing.T
 	}
 }
 
-func TestRepository_LoadForCommand_notFound(t *testing.T) {
-	repo, _ := newCounterRepo(t, es.DefaultConfig())
+func TestCommandRepository_LoadForCommand_notFound(t *testing.T) {
+	repo, _ := newCounterCommandRepo(t, es.DefaultConfig())
 
 	_, err := repo.LoadForCommand(context.Background(), counterID{value: "missing"})
 	if err == nil {
@@ -514,6 +529,91 @@ func TestRepository_LoadForCommand_notFound(t *testing.T) {
 	var nf *es.AggregateNotFoundError
 	if !errors.As(err, &nf) {
 		t.Fatalf("expected AggregateNotFoundError, got %T", err)
+	}
+}
+
+type unsafeCounterEvent interface {
+	es.Event
+	isUnsafeCounterEvent()
+}
+
+type unsafeCounterIncrementedEvent struct {
+	AggID counterID
+	By    int
+}
+
+func (e unsafeCounterIncrementedEvent) EventTypeName() string       { return "UnsafeCounterIncremented" }
+func (e unsafeCounterIncrementedEvent) AggregateID() es.AggregateID { return e.AggID }
+func (unsafeCounterIncrementedEvent) isUnsafeCounterEvent()         {}
+
+type unsafeCounterCommand interface {
+	es.Command
+	isUnsafeCounterCommand()
+}
+
+type unsafeIncrementCommand struct {
+	By int
+}
+
+func (unsafeIncrementCommand) CommandTypeName() string { return "UnsafeIncrement" }
+func (unsafeIncrementCommand) isUnsafeCounterCommand() {}
+
+type unsafeCounterAggregate struct {
+	id      counterID
+	history []int
+}
+
+func (a unsafeCounterAggregate) AggregateID() es.AggregateID { return a.id }
+
+func (a unsafeCounterAggregate) ApplyCommand(cmd unsafeCounterCommand) (unsafeCounterEvent, error) {
+	switch x := cmd.(type) {
+	case unsafeIncrementCommand:
+		return unsafeCounterIncrementedEvent{AggID: a.id, By: x.By}, nil
+	default:
+		return nil, es.ErrUnknownCommand
+	}
+}
+
+func (a unsafeCounterAggregate) ApplyEvent(ev unsafeCounterEvent) es.Aggregate[unsafeCounterCommand, unsafeCounterEvent] {
+	if e, ok := ev.(unsafeCounterIncrementedEvent); ok {
+		history := append([]int(nil), a.history...)
+		history = append(history, e.By)
+		return unsafeCounterAggregate{id: a.id, history: history}
+	}
+	return a
+}
+
+func blankUnsafeCounter(id es.AggregateID) unsafeCounterAggregate {
+	if cid, ok := id.(counterID); ok {
+		return unsafeCounterAggregate{id: cid}
+	}
+	return unsafeCounterAggregate{id: counterID{value: id.Value()}}
+}
+
+func TestCommandRepository_LoadForCommand_rejectsReferenceSemanticAggregate(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 100
+
+	store := memory.New[unsafeCounterAggregate, unsafeCounterCommand, unsafeCounterEvent]()
+	repo := es.NewCommandRepository[unsafeCounterAggregate, unsafeCounterCommand, unsafeCounterEvent](store, blankUnsafeCounter, cfg)
+	id := counterID{value: "unsafe"}
+
+	if _, err := repo.Save(context.Background(), id, unsafeIncrementCommand{By: 1}); err != nil {
+		t.Fatalf("seed Save: %v", err)
+	}
+
+	_, err := repo.LoadForCommand(context.Background(), id)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, es.ErrInvalidAggregate) {
+		t.Fatalf("expected ErrInvalidAggregate, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "value-semantic") {
+		t.Fatalf("expected value-semantic message, got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "slice") {
+		t.Fatalf("expected slice detail in message, got %q", err.Error())
 	}
 }
 

@@ -2,13 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a `LoadedAggregate`-based advanced repository API that avoids replaying the same aggregate between repeated command-side saves while preserving the existing `Load` / `Save` behavior.
+**Goal:** Add a `LoadedAggregate`-based advanced command repository API that avoids replaying the same aggregate between repeated command-side saves while preserving the existing `Repository.Load` / `Repository.Save` behavior and interface shape.
 
-**Architecture:** Extend `Repository` with `LoadForCommand` and `SaveLoaded`, introduce a public `LoadedAggregate` wrapper with opaque revision fields and an `Aggregate()` accessor, and refactor repository persistence logic so the standard and advanced paths share one command-application and persistence flow. Prove the new path with repository-level tests that detect redundant `LoadStreamAfter` calls and preserve snapshot/optimistic-lock semantics.
+**Architecture:** Keep `Repository` limited to `Load` / `Save`, add a separate `CommandRepository` that embeds it and exposes `LoadForCommand` / `SaveLoaded`, introduce a public `LoadedAggregate` wrapper with opaque revision fields and an `Aggregate()` accessor, and refactor repository persistence logic so the standard and advanced paths share one command-application and persistence flow. The loaded-handle API must reject non-value-semantic aggregate shapes at runtime. Prove the new path with repository-level tests that detect redundant `LoadStreamAfter` calls and preserve snapshot/optimistic-lock semantics.
 
 **Tech Stack:** Go, generics, standard `testing` package, existing memory store and repository fixtures
 
 ---
+
+> **Implementation note:** This plan was written before the final compatibility correction. Any step below that says "extend `Repository`" or uses `NewRepository(...)` for the loaded flow should be read as "add/use `CommandRepository` via `NewCommandRepository(...)`". The implemented API keeps `Repository` unchanged and applies the loaded-handle API only to value-semantic aggregate shapes.
 
 ### Task 1: Add failing tests for the loaded-aggregate flow
 

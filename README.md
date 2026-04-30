@@ -22,7 +22,8 @@ go get github.com/Hiroshi0900/eventstore
 - `Aggregate[C Command, E Event]`, `Event`, `Command` はドメイン情報だけを持つ
 - 保存用メタデータは `StoredEvent` / `StoredSnapshot` に集約
 - `Repository.Load` / `Repository.Save(aggID, cmd)` は標準の correctness-first API で、最新 snapshot とその後の確定済み event stream を使って集約を復元する
-- `Repository.LoadForCommand` / `Repository.SaveLoaded` は、同じ aggregate に複数 command を続けて適用するときに再 replay を避ける最適化パス
+- `CommandRepository.LoadForCommand` / `CommandRepository.SaveLoaded` は、同じ aggregate に複数 command を続けて適用するときに再 replay を避ける最適化パス
+- `LoadedAggregate` を使う advanced path は、aggregate がポインタや slice/map/interface などの参照型を再帰的に含まない値セマンティクス形状であることを前提とする
 - `EventStore` 実装は、利用者が永続化の内部構造を意識しなくてもよいように、再構築に必要な stream を正しく返す責務を持つ
 - serializer は `EventStore` 実装側で扱う
 - `ApplyEvent(E) Aggregate[C, E]` により State Pattern に対応
@@ -97,27 +98,33 @@ repo := es.NewRepository[Counter, CounterCommand, CounterEvent](store, NewBlankC
 
 ## Advanced Command Flow
 
-`Repository.Load` / `Repository.Save` は標準の correctness-first API です。既存 aggregate に対して command を連続適用し、毎回 replay したくない場合だけ `LoadForCommand` / `SaveLoaded` を使います。`SaveLoaded` を呼ぶたびに最新の `LoadedAggregate` が返るので、呼び出し側はその戻り値を引き続き使い、古い handle を再利用しないでください。
+`Repository.Load` / `Repository.Save` は標準の correctness-first API です。既存 aggregate に対して command を連続適用し、毎回 replay したくない場合だけ `CommandRepository` を使います。`LoadedAggregate` を返す API は aggregate が値セマンティクス形状である場合にだけ使えます。具体的には、aggregate 自体がポインタでないことに加え、内部に pointer / map / slice / func / chan / interface / unsafe-pointer を再帰的に含めてはいけません。`SaveLoaded` を呼ぶたびに最新の `LoadedAggregate` が返るので、呼び出し側はその戻り値を引き続き使い、古い handle を再利用しないでください。
 
 ```go
 ctx := context.Background()
 id := CounterID{value: "counter-1"}
 
-if _, err := repo.Save(ctx, id, IncrementCmd{By: 1}); err != nil {
+commandRepo := es.NewCommandRepository[Counter, CounterCommand, CounterEvent](
+    store,
+    NewBlankCounter,
+    es.DefaultConfig(),
+)
+
+if _, err := commandRepo.Save(ctx, id, IncrementCmd{By: 1}); err != nil {
     panic(err)
 }
 
-loaded, err := repo.LoadForCommand(ctx, id)
+loaded, err := commandRepo.LoadForCommand(ctx, id)
 if err != nil {
     panic(err)
 }
 
-loaded, err = repo.SaveLoaded(ctx, loaded, IncrementCmd{By: 2})
+loaded, err = commandRepo.SaveLoaded(ctx, loaded, IncrementCmd{By: 2})
 if err != nil {
     panic(err)
 }
 
-loaded, err = repo.SaveLoaded(ctx, loaded, IncrementCmd{By: 3})
+loaded, err = commandRepo.SaveLoaded(ctx, loaded, IncrementCmd{By: 3})
 if err != nil {
     panic(err)
 }

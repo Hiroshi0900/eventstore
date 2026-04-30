@@ -14,6 +14,10 @@ Adopt the following design direction:
 type Repository[A Aggregate[C, E], C Command, E Event] interface {
     Load(ctx context.Context, aggID AggregateID) (A, error)
     Save(ctx context.Context, aggID AggregateID, cmd C) (A, error)
+}
+
+type CommandRepository[A Aggregate[C, E], C Command, E Event] interface {
+    Repository[A, C, E]
 
     LoadForCommand(ctx context.Context, aggID AggregateID) (LoadedAggregate[A, C, E], error)
     SaveLoaded(ctx context.Context, loaded LoadedAggregate[A, C, E], cmd C) (LoadedAggregate[A, C, E], error)
@@ -22,7 +26,7 @@ type Repository[A Aggregate[C, E], C Command, E Event] interface {
 
 `LoadedAggregate` is a public wrapper type used only for this advanced path. It exposes the current aggregate state through an accessor, but keeps revision and replay metadata opaque.
 
-The first implementation will keep this advanced path on `Repository` directly rather than introducing a second repository interface.
+`NewRepository(...)` remains the backward-compatible standard entry point. `NewCommandRepository(...)` returns the same underlying implementation behind a wider interface for callers that explicitly opt into the advanced path.
 
 ## Problem Statement
 
@@ -68,6 +72,7 @@ The semantics are:
 - `LoadForCommand` reconstructs the aggregate using the same correctness rules as `Load`
 - `SaveLoaded` applies one command to an existing loaded handle and persists the result using the stored opaque revision context
 - `SaveLoaded` returns the next `LoadedAggregate`, ready for another command without a fresh replay roundtrip
+- `LoadedAggregate` can only be created for value-semantic aggregate shapes; pointer aggregates and aggregates that recursively contain pointer / map / slice / func / chan / interface / unsafe-pointer fields are rejected with `ErrInvalidAggregate`
 
 This keeps the return type focused on "continue the command session" rather than "return persistence metadata or emitted events."
 
@@ -94,13 +99,13 @@ The new advanced path behaves similarly, but uses the loaded handle as its recon
 
 Application code is still expected to wrap this type inside an infrastructure-facing repository or command session abstraction if it wants to keep eventstore-specific concepts out of use-case code.
 
-## Why Not a Separate Interface
+## Why a Separate Interface
 
-Separating this into `AdvancedRepository`-style API would hide the advanced methods from simpler consumers, but it adds naming and discovery overhead without changing the real boundary.
+The advanced path must not change the shape of the existing `Repository` interface because that would be a source-breaking change for current users.
 
-The important boundary is not whether the methods live on a second interface. The important boundary is that raw persistence metadata remains opaque.
+`CommandRepository` keeps the standard path small and backward compatible while still allowing the same `defaultRepository` implementation to expose the optimization for callers that explicitly opt in.
 
-For this library's current size and API shape, adding separate methods to `Repository` is the simpler and more coherent starting point.
+The important boundary remains that raw persistence metadata stays opaque. Splitting the interface simply makes that opt-in explicit at the public API level.
 
 ## Backend Position
 
@@ -130,9 +135,9 @@ This would help performance, but it pushes storage concerns into application cod
 
 This would make the simple standard path harder to use and would overfit the public API to optimization-oriented flows.
 
-### Introduce a separate advanced repository interface first
+### Put the advanced methods directly on `Repository`
 
-This can still be revisited later, but it is extra API structure without clear benefit in the first iteration.
+Rejected because it breaks backward compatibility for existing implementations and mocks that satisfy `Repository`.
 
 ### Return the emitted domain event from `SaveLoaded`
 
@@ -143,8 +148,10 @@ This broadens the purpose of the API. The main requirement is to continue a load
 In scope:
 
 - add `LoadedAggregate`
-- add `LoadForCommand` and `SaveLoaded` to `Repository`
+- add `CommandRepository` plus `NewCommandRepository`
+- keep `Repository` limited to `Load` and `Save`
 - update repository implementation to track and refresh opaque revision context
+- validate that the loaded-handle API only accepts value-semantic aggregate shapes
 - add tests for repeated command handling without a second replay roundtrip
 - document intended usage in README and package comments
 
@@ -167,6 +174,10 @@ Out of scope:
 
 If `LoadedAggregate` exposes too much internal detail, the library will reintroduce persistence concerns at the public boundary. The implementation should keep all revision metadata unexported.
 
+### Mutable aliasing through aggregate shape
+
+If `LoadedAggregate` is created for pointer-heavy or reference-heavy aggregate shapes, callers can mutate shared state behind the repository's back. The advanced API therefore rejects non-value-semantic aggregate shapes at runtime.
+
 ### Behavioral drift between standard and advanced paths
 
 If `Save` and `SaveLoaded` diverge in command application or snapshot logic, the API will become confusing. The implementation should reuse the same internal persist logic where possible.
@@ -179,4 +190,5 @@ If real usage reveals that `LoadedAggregate` is confusing in application-level c
 
 - treat this as an additive public API change
 - keep `Load` / `Save` documented as the standard path
-- describe `LoadForCommand` / `SaveLoaded` as an explicit optimization path for repeated command handling
+- describe `CommandRepository.LoadForCommand` / `CommandRepository.SaveLoaded` as an explicit optimization path for repeated command handling
+- document the value-semantic restriction anywhere the advanced flow is shown
