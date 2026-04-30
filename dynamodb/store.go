@@ -170,7 +170,8 @@ func (s *store[A, C, E]) LoadStreamAfter(ctx context.Context, id es.AggregateID,
 		return nil, nil
 	}
 
-	keys := s.keyResolver.ResolveEventKeys(id, seqNr+1)
+	// #sk > :sk を使うので、下限は "直前の番号" ではなく seqNr 自身に合わせる。
+	keys := s.keyResolver.ResolveEventKeys(id, seqNr)
 
 	out, err := s.client.Query(ctx, &dynamodb.QueryInput{
 		TableName: aws.String(s.config.JournalTableName),

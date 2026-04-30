@@ -151,8 +151,8 @@ func TestLoadStreamAfter_UsesPrimaryTableConsistentRead(t *testing.T) {
 	if !ok {
 		t.Fatalf(":sk type = %T, want string", from)
 	}
-	if fromS.Value != "T-1-00000000000000000001" {
-		t.Fatalf(":sk = %q, want %q", fromS.Value, "T-1-00000000000000000001")
+	if fromS.Value != "T-1-00000000000000000000" {
+		t.Fatalf(":sk = %q, want %q", fromS.Value, "T-1-00000000000000000000")
 	}
 	aid, ok := client.lastQuery.ExpressionAttributeValues[":aid"]
 	if !ok {
@@ -164,5 +164,44 @@ func TestLoadStreamAfter_UsesPrimaryTableConsistentRead(t *testing.T) {
 	}
 	if aidS.Value != "T-1" {
 		t.Fatalf(":aid = %q, want %q", aidS.Value, "T-1")
+	}
+}
+
+func TestLoadStreamAfter_UsesSeqNrAsLowerBound(t *testing.T) {
+	tests := []struct {
+		name     string
+		seqNr    uint64
+		wantSk   string
+	}{
+		{name: "seq0", seqNr: 0, wantSk: "T-1-00000000000000000000"},
+		{name: "seq1", seqNr: 1, wantSk: "T-1-00000000000000000001"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &capturingClient{}
+			store := v2dynamo.New[ddbStubAggregate, ddbStubCommand, ddbStubEvent](
+				client,
+				v2dynamo.DefaultConfig(),
+				ddbStubAggSer{},
+				ddbStubEvSer{},
+			)
+
+			_, err := store.LoadStreamAfter(context.Background(), ddbTestAggID{value: "1"}, tc.seqNr)
+			if err != nil {
+				t.Fatalf("LoadStreamAfter: %v", err)
+			}
+			from, ok := client.lastQuery.ExpressionAttributeValues[":sk"]
+			if !ok {
+				t.Fatal("expected :sk attribute value")
+			}
+			fromS, ok := from.(*awsdynamotypes.AttributeValueMemberS)
+			if !ok {
+				t.Fatalf(":sk type = %T, want string", from)
+			}
+			if fromS.Value != tc.wantSk {
+				t.Fatalf(":sk = %q, want %q", fromS.Value, tc.wantSk)
+			}
+		})
 	}
 }
