@@ -130,7 +130,7 @@ func TestStore_LoadStreamAfter_excludesBoundarySeqNr(t *testing.T) {
 	}
 }
 
-func TestStore_LoadStreamAfter_returnsEventsInAscendingOrder(t *testing.T) {
+func TestStore_LoadStreamAfter_returnsRemainingEventsInExpectedOrder(t *testing.T) {
 	s := memory.New[stubAggregate, stubCommand, stubEvent]()
 	id := memoryTestAggID{"Visit", "ordering"}
 
@@ -152,7 +152,7 @@ func TestStore_LoadStreamAfter_returnsEventsInAscendingOrder(t *testing.T) {
 		t.Fatalf("len = %d, want 2", len(got))
 	}
 	if got[0].SeqNr != 2 || got[1].SeqNr != 3 {
-		t.Fatalf("seq order = [%d %d], want [2 3]", got[0].SeqNr, got[1].SeqNr)
+		t.Fatalf("remaining seq order = [%d %d], want [2 3]", got[0].SeqNr, got[1].SeqNr)
 	}
 }
 
