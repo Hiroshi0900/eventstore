@@ -466,18 +466,40 @@ func TestRepository_SaveLoaded_updatesSnapshotVersionAcrossBoundary(t *testing.T
 
 	loaded, err = repo.SaveLoaded(context.Background(), loaded, incrementCommand{By: 1})
 	if err != nil {
-		t.Fatalf("SaveLoaded after snapshot boundary: %v", err)
+		t.Fatalf("SaveLoaded after first snapshot boundary: %v", err)
 	}
 	if got := loaded.Aggregate().count; got != 3 {
-		t.Fatalf("count after snapshot boundary follow-up: got %d, want 3", got)
+		t.Fatalf("count after seqNr=3: got %d, want 3", got)
+	}
+
+	loaded, err = repo.SaveLoaded(context.Background(), loaded, incrementCommand{By: 1})
+	if err != nil {
+		t.Fatalf("SaveLoaded at second snapshot boundary: %v", err)
+	}
+	if got := loaded.Aggregate().count; got != 4 {
+		t.Fatalf("count after seqNr=4: got %d, want 4", got)
+	}
+
+	snap, found, err = store.GetLatestSnapshot(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetLatestSnapshot after second boundary: %v", err)
+	}
+	if !found {
+		t.Fatal("expected snapshot after second boundary")
+	}
+	if snap.Version != 2 {
+		t.Fatalf("snapshot version after second boundary: got %d, want 2", snap.Version)
+	}
+	if snap.SeqNr != 4 {
+		t.Fatalf("snapshot seqNr after second boundary: got %d, want 4", snap.SeqNr)
 	}
 
 	got, err := repo.Load(context.Background(), id)
 	if err != nil {
 		t.Fatalf("Load after SaveLoaded sequence: %v", err)
 	}
-	if got.count != 3 {
-		t.Fatalf("loaded count after SaveLoaded sequence: got %d, want 3", got.count)
+	if got.count != 4 {
+		t.Fatalf("loaded count after SaveLoaded sequence: got %d, want 4", got.count)
 	}
 }
 

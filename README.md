@@ -97,7 +97,7 @@ repo := es.NewRepository[Counter, CounterCommand, CounterEvent](store, NewBlankC
 
 ## Advanced Command Flow
 
-`Repository.Load` / `Repository.Save` は標準の correctness-first API です。既存 aggregate に対して command を連続適用し、毎回 replay したくない場合だけ `LoadForCommand` / `SaveLoaded` を使います。
+`Repository.Load` / `Repository.Save` は標準の correctness-first API です。既存 aggregate に対して command を連続適用し、毎回 replay したくない場合だけ `LoadForCommand` / `SaveLoaded` を使います。`SaveLoaded` を呼ぶたびに最新の `LoadedAggregate` が返るので、呼び出し側はその戻り値を引き続き使い、古い handle を再利用しないでください。
 
 ```go
 ctx := context.Background()
@@ -113,6 +113,11 @@ if err != nil {
 }
 
 loaded, err = repo.SaveLoaded(ctx, loaded, IncrementCmd{By: 2})
+if err != nil {
+    panic(err)
+}
+
+loaded, err = repo.SaveLoaded(ctx, loaded, IncrementCmd{By: 3})
 if err != nil {
     panic(err)
 }
