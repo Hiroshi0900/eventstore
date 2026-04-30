@@ -21,7 +21,8 @@ go get github.com/Hiroshi0900/eventstore
 
 - `Aggregate[C Command, E Event]`, `Event`, `Command` はドメイン情報だけを持つ
 - 保存用メタデータは `StoredEvent` / `StoredSnapshot` に集約
-- `Repository.Save(aggID, cmd)` で load → apply → persist を一括実行
+- `Repository.Load` / `Repository.Save(aggID, cmd)` は、最新 snapshot とその後の確定済み event stream を使って集約を復元する
+- `EventStore` 実装は、利用者が永続化の内部構造を意識しなくてもよいように、再構築に必要な stream を正しく返す責務を持つ
 - serializer は `EventStore` 実装側で扱う
 - `ApplyEvent(E) Aggregate[C, E]` により State Pattern に対応
 

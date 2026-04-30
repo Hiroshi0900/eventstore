@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	es "github.com/Hiroshi0900/eventstore"
 	"github.com/Hiroshi0900/eventstore/memory"
@@ -68,7 +69,10 @@ func (c counterAggregate) ApplyCommand(cmd counterCommand) (counterEvent, error)
 
 func (c counterAggregate) ApplyEvent(ev counterEvent) es.Aggregate[counterCommand, counterEvent] {
 	if e, ok := ev.(incrementedEvent); ok {
-		return counterAggregate{id: c.id, count: c.count + e.By}
+		return counterAggregate{
+			id:    c.id,
+			count: c.count + e.By,
+		}
 	}
 	return c
 }
@@ -88,6 +92,159 @@ func newCounterRepo(t *testing.T, cfg es.Config) (es.Repository[counterAggregate
 	store := memory.New[counterAggregate, counterCommand, counterEvent]()
 	repo := es.NewRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
 	return repo, store
+}
+
+// === replay witness contract fixture (test-only, isolated from counter fixture) ===
+
+type witnessCounterEvent interface {
+	es.Event
+	isWitnessCounterEvent()
+}
+
+type witnessCounterIncrementedEvent struct {
+	AggID counterID
+	By    int
+}
+
+func (e witnessCounterIncrementedEvent) EventTypeName() string       { return "WitnessCounterIncremented" }
+func (e witnessCounterIncrementedEvent) AggregateID() es.AggregateID { return e.AggID }
+func (witnessCounterIncrementedEvent) isWitnessCounterEvent()        {}
+
+// replayWitnessEvent is a test-only event used to prove replay consumed the
+// returned LoadStreamAfter slice on the existing-aggregate path.
+type replayWitnessEvent struct {
+	AggID counterID
+}
+
+func (e replayWitnessEvent) EventTypeName() string       { return "ReplayWitness" }
+func (e replayWitnessEvent) AggregateID() es.AggregateID { return e.AggID }
+func (replayWitnessEvent) isWitnessCounterEvent()        {}
+
+type witnessCounterCommand interface {
+	es.Command
+	isWitnessCounterCommand()
+}
+
+type witnessCounterIncrementCommand struct {
+	By int
+}
+
+func (witnessCounterIncrementCommand) CommandTypeName() string  { return "WitnessCounterIncrement" }
+func (witnessCounterIncrementCommand) isWitnessCounterCommand() {}
+
+type witnessCounterAggregate struct {
+	id             counterID
+	count          int
+	witnessApplied bool
+}
+
+func (a witnessCounterAggregate) AggregateID() es.AggregateID { return a.id }
+
+func (a witnessCounterAggregate) ApplyCommand(cmd witnessCounterCommand) (witnessCounterEvent, error) {
+	switch x := cmd.(type) {
+	case witnessCounterIncrementCommand:
+		return witnessCounterIncrementedEvent{AggID: a.id, By: x.By}, nil
+	default:
+		return nil, es.ErrUnknownCommand
+	}
+}
+
+func (a witnessCounterAggregate) ApplyEvent(ev witnessCounterEvent) es.Aggregate[witnessCounterCommand, witnessCounterEvent] {
+	switch e := ev.(type) {
+	case witnessCounterIncrementedEvent:
+		return witnessCounterAggregate{
+			id:             a.id,
+			count:          a.count + e.By,
+			witnessApplied: a.witnessApplied,
+		}
+	case replayWitnessEvent:
+		return witnessCounterAggregate{
+			id:             a.id,
+			count:          a.count,
+			witnessApplied: true,
+		}
+	default:
+		return a
+	}
+}
+
+func blankWitnessCounter(id es.AggregateID) witnessCounterAggregate {
+	if cid, ok := id.(counterID); ok {
+		return witnessCounterAggregate{id: cid}
+	}
+	return witnessCounterAggregate{id: counterID{value: id.Value()}}
+}
+
+type replayWitnessingStore struct {
+	es.EventStore[witnessCounterAggregate, witnessCounterCommand, witnessCounterEvent]
+}
+
+func newReplayWitnessingStore(
+	base es.EventStore[witnessCounterAggregate, witnessCounterCommand, witnessCounterEvent],
+) *replayWitnessingStore {
+	return &replayWitnessingStore{EventStore: base}
+}
+
+func (s *replayWitnessingStore) LoadStreamAfter(
+	ctx context.Context,
+	id es.AggregateID,
+	seqNr uint64,
+) ([]es.StoredEvent[witnessCounterEvent], error) {
+	events, err := s.EventStore.LoadStreamAfter(ctx, id, seqNr)
+	if err != nil {
+		return nil, err
+	}
+	if len(events) == 0 {
+		return events, nil
+	}
+	altered := append([]es.StoredEvent[witnessCounterEvent](nil), events...)
+	return appendReplayWitness(id, altered), nil
+}
+
+func appendReplayWitness(
+	id es.AggregateID,
+	events []es.StoredEvent[witnessCounterEvent],
+) []es.StoredEvent[witnessCounterEvent] {
+	witnessID, ok := id.(counterID)
+	if !ok {
+		witnessID = counterID{value: id.Value()}
+	}
+	last := events[len(events)-1]
+	witnessOccurredAt := last.OccurredAt
+	if witnessOccurredAt.IsZero() {
+		witnessOccurredAt = time.Unix(0, int64(last.SeqNr)).UTC()
+	}
+	return append(events, es.StoredEvent[witnessCounterEvent]{
+		Event:      replayWitnessEvent{AggID: witnessID},
+		EventID:    "replay-witness-" + witnessID.Value(),
+		SeqNr:      last.SeqNr + 1,
+		OccurredAt: witnessOccurredAt.Add(time.Nanosecond),
+	})
+}
+
+func TestRepository_Save_existingAggregateAppliesReturnedLoadStream(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 100
+
+	base := memory.New[witnessCounterAggregate, witnessCounterCommand, witnessCounterEvent]()
+	store := newReplayWitnessingStore(base)
+	repo := es.NewRepository[witnessCounterAggregate, witnessCounterCommand, witnessCounterEvent](store, blankWitnessCounter, cfg)
+	id := counterID{value: "contract"}
+
+	if _, err := repo.Save(context.Background(), id, witnessCounterIncrementCommand{By: 1}); err != nil {
+		t.Fatalf("first Save: %v", err)
+	}
+
+	got, err := repo.Save(context.Background(), id, witnessCounterIncrementCommand{By: 1})
+	if err != nil {
+		t.Fatalf("second Save: %v", err)
+	}
+	if got.count != 2 {
+		t.Fatalf("count: got %d, want 2", got.count)
+	}
+	if !got.witnessApplied {
+		t.Fatal("expected replay witness event to be applied during reconstruction")
+	}
 }
 
 func TestRepository_Construct(t *testing.T) {
@@ -122,9 +279,9 @@ func TestRepository_Save_firstEventCreatesAggregate(t *testing.T) {
 		t.Errorf("count: got %d, want 3", got.count)
 	}
 
-	stored, err := store.GetEventsSince(context.Background(), id, 0)
+	stored, err := store.LoadStreamAfter(context.Background(), id, 0)
 	if err != nil {
-		t.Fatalf("GetEventsSince: %v", err)
+		t.Fatalf("LoadStreamAfter: %v", err)
 	}
 	if len(stored) != 1 {
 		t.Fatalf("len: got %d, want 1", len(stored))
@@ -157,7 +314,7 @@ func TestRepository_Save_subsequentEvent(t *testing.T) {
 		t.Errorf("count: got %d, want 5", got.count)
 	}
 
-	stored, _ := store.GetEventsSince(context.Background(), id, 0)
+	stored, _ := store.LoadStreamAfter(context.Background(), id, 0)
 	if len(stored) != 2 || stored[1].IsCreated || stored[1].SeqNr != 2 {
 		t.Errorf("metadata mismatch: %+v", stored[1])
 	}

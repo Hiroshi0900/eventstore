@@ -70,7 +70,7 @@ func (r *defaultRepository[A, C, E]) loadInternal(
 		version = 0
 	}
 
-	events, err := r.store.GetEventsSince(ctx, id, seqNr)
+	events, err := r.store.LoadStreamAfter(ctx, id, seqNr)
 	if err != nil {
 		return agg, 0, 0, false, err
 	}

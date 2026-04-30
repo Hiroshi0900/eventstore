@@ -164,33 +164,48 @@ func (s *store[A, C, E]) GetLatestSnapshot(ctx context.Context, id es.AggregateI
 	}, true, nil
 }
 
-// GetEventsSince queries the journal GSI for events with SeqNr > seqNr.
-func (s *store[A, C, E]) GetEventsSince(ctx context.Context, id es.AggregateID, seqNr uint64) ([]es.StoredEvent[E], error) {
-	aidKey := s.keyResolver.ResolveAggregateIDKey(id)
-	out, err := s.client.Query(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(s.config.JournalTableName),
-		IndexName:              aws.String(s.config.JournalGSIName),
-		KeyConditionExpression: aws.String("#aid = :aid AND #seq_nr > :seq_nr"),
+// LoadStreamAfter returns events with SeqNr > seqNr using a strongly consistent primary-table query.
+func (s *store[A, C, E]) LoadStreamAfter(ctx context.Context, id es.AggregateID, seqNr uint64) ([]es.StoredEvent[E], error) {
+	if seqNr == ^uint64(0) {
+		return nil, nil
+	}
+
+	// #sk > :sk を使うので、下限は "直前の番号" ではなく seqNr 自身に合わせる。
+	keys := s.keyResolver.ResolveEventKeys(id, seqNr)
+	query := &dynamodb.QueryInput{
+		TableName: aws.String(s.config.JournalTableName),
+		KeyConditionExpression: aws.String("#pk = :pk AND #sk > :sk"),
+		FilterExpression:       aws.String("#aid = :aid"),
 		ExpressionAttributeNames: map[string]string{
-			"#aid":    colAid,
-			"#seq_nr": colSeqNr,
+			"#pk":  colPKey,
+			"#sk":  colSKey,
+			"#aid": colAid,
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":aid":    &types.AttributeValueMemberS{Value: aidKey},
-			":seq_nr": &types.AttributeValueMemberN{Value: strconv.FormatUint(seqNr, 10)},
+			":pk":  &types.AttributeValueMemberS{Value: keys.PartitionKey},
+			":sk":  &types.AttributeValueMemberS{Value: keys.SortKey},
+			":aid": &types.AttributeValueMemberS{Value: keys.AggregateIDKey},
 		},
+		ConsistentRead:   aws.Bool(true),
 		ScanIndexForward: aws.Bool(true),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("query events: %w", err)
 	}
-	stored := make([]es.StoredEvent[E], 0, len(out.Items))
-	for _, item := range out.Items {
-		ev, err := s.unmarshalEvent(item)
+	stored := make([]es.StoredEvent[E], 0)
+	for {
+		out, err := s.client.Query(ctx, query)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("query events: %w", err)
 		}
-		stored = append(stored, ev)
+		for _, item := range out.Items {
+			ev, err := s.unmarshalEvent(item)
+			if err != nil {
+				return nil, err
+			}
+			stored = append(stored, ev)
+		}
+		if len(out.LastEvaluatedKey) == 0 {
+			break
+		}
+		query.ExclusiveStartKey = out.LastEvaluatedKey
 	}
 	return stored, nil
 }
