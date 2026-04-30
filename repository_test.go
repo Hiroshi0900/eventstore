@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	es "github.com/Hiroshi0900/eventstore"
 	"github.com/Hiroshi0900/eventstore/memory"
@@ -38,14 +39,6 @@ func (incrementedEvent) isCounterEvent()               {}
 
 // replayWitnessEvent is a test-only event used to prove replay consumed the
 // returned LoadStreamAfter slice on the existing-aggregate path.
-type replayWitnessEvent struct {
-	AggID counterID
-}
-
-func (e replayWitnessEvent) EventTypeName() string       { return "ReplayWitness" }
-func (e replayWitnessEvent) AggregateID() es.AggregateID { return e.AggID }
-func (replayWitnessEvent) isCounterEvent()               {}
-
 type counterCommand interface {
 	es.Command
 	isCounterCommand()
@@ -61,9 +54,8 @@ func (incrementCommand) isCounterCommand()       {}
 // counterAggregate: pure struct, no embedded boilerplate, no SeqNr/Version。
 // 全メタは library の StoredEvent / StoredSnapshot に集約。
 type counterAggregate struct {
-	id                   counterID
-	count                int
-	replayWitnessApplied bool
+	id    counterID
+	count int
 }
 
 func (c counterAggregate) AggregateID() es.AggregateID { return c.id }
@@ -80,16 +72,8 @@ func (c counterAggregate) ApplyCommand(cmd counterCommand) (counterEvent, error)
 func (c counterAggregate) ApplyEvent(ev counterEvent) es.Aggregate[counterCommand, counterEvent] {
 	if e, ok := ev.(incrementedEvent); ok {
 		return counterAggregate{
-			id:                   c.id,
-			count:                c.count + e.By,
-			replayWitnessApplied: c.replayWitnessApplied,
-		}
-	}
-	if _, ok := ev.(replayWitnessEvent); ok {
-		return counterAggregate{
-			id:                   c.id,
-			count:                c.count,
-			replayWitnessApplied: true,
+			id:    c.id,
+			count: c.count + e.By,
 		}
 	}
 	return c
@@ -112,73 +96,153 @@ func newCounterRepo(t *testing.T, cfg es.Config) (es.Repository[counterAggregate
 	return repo, store
 }
 
-// replayWitnessingStore appends a test-only witness event to non-empty
-// reconstruction reads so repository replay can be observed explicitly.
-type replayWitnessingStore struct {
-	es.EventStore[counterAggregate, counterCommand, counterEvent]
+// === replay witness contract fixture (test-only, isolated from counter fixture) ===
+
+type witnessCounterEvent interface {
+	es.Event
+	isWitnessCounterEvent()
 }
 
-func newReplayWitnessingStore(
-	base es.EventStore[counterAggregate, counterCommand, counterEvent],
-) *replayWitnessingStore {
-	return &replayWitnessingStore{
-		EventStore: base,
+type witnessCounterIncrementedEvent struct {
+	AggID counterID
+	By    int
+}
+
+func (e witnessCounterIncrementedEvent) EventTypeName() string       { return "WitnessCounterIncremented" }
+func (e witnessCounterIncrementedEvent) AggregateID() es.AggregateID { return e.AggID }
+func (witnessCounterIncrementedEvent) isWitnessCounterEvent()        {}
+
+type replayWitnessEvent struct {
+	AggID counterID
+}
+
+func (e replayWitnessEvent) EventTypeName() string       { return "ReplayWitness" }
+func (e replayWitnessEvent) AggregateID() es.AggregateID { return e.AggID }
+func (replayWitnessEvent) isWitnessCounterEvent()        {}
+
+type witnessCounterCommand interface {
+	es.Command
+	isWitnessCounterCommand()
+}
+
+type witnessCounterIncrementCommand struct {
+	By int
+}
+
+func (witnessCounterIncrementCommand) CommandTypeName() string  { return "WitnessCounterIncrement" }
+func (witnessCounterIncrementCommand) isWitnessCounterCommand() {}
+
+type witnessCounterAggregate struct {
+	id             counterID
+	count          int
+	witnessApplied bool
+}
+
+func (a witnessCounterAggregate) AggregateID() es.AggregateID { return a.id }
+
+func (a witnessCounterAggregate) ApplyCommand(cmd witnessCounterCommand) (witnessCounterEvent, error) {
+	switch x := cmd.(type) {
+	case witnessCounterIncrementCommand:
+		return witnessCounterIncrementedEvent{AggID: a.id, By: x.By}, nil
+	default:
+		return nil, es.ErrUnknownCommand
 	}
 }
 
-func (s *replayWitnessingStore) PersistEvent(
-	ctx context.Context,
-	ev es.StoredEvent[counterEvent],
-	expectedVersion uint64,
-) error {
-	return s.EventStore.PersistEvent(ctx, ev, expectedVersion)
+func (a witnessCounterAggregate) ApplyEvent(ev witnessCounterEvent) es.Aggregate[witnessCounterCommand, witnessCounterEvent] {
+	switch e := ev.(type) {
+	case witnessCounterIncrementedEvent:
+		return witnessCounterAggregate{
+			id:             a.id,
+			count:          a.count + e.By,
+			witnessApplied: a.witnessApplied,
+		}
+	case replayWitnessEvent:
+		return witnessCounterAggregate{
+			id:             a.id,
+			count:          a.count,
+			witnessApplied: true,
+		}
+	default:
+		return a
+	}
+}
+
+func blankWitnessCounter(id es.AggregateID) witnessCounterAggregate {
+	if cid, ok := id.(counterID); ok {
+		return witnessCounterAggregate{id: cid}
+	}
+	return witnessCounterAggregate{id: counterID{value: id.Value()}}
+}
+
+type replayWitnessingStore struct {
+	es.EventStore[witnessCounterAggregate, witnessCounterCommand, witnessCounterEvent]
+}
+
+func newReplayWitnessingStore(
+	base es.EventStore[witnessCounterAggregate, witnessCounterCommand, witnessCounterEvent],
+) *replayWitnessingStore {
+	return &replayWitnessingStore{EventStore: base}
 }
 
 func (s *replayWitnessingStore) LoadStreamAfter(
 	ctx context.Context,
 	id es.AggregateID,
 	seqNr uint64,
-) ([]es.StoredEvent[counterEvent], error) {
+) ([]es.StoredEvent[witnessCounterEvent], error) {
 	events, err := s.EventStore.LoadStreamAfter(ctx, id, seqNr)
 	if err != nil {
 		return nil, err
 	}
-	if len(events) > 0 {
-		altered := append([]es.StoredEvent[counterEvent](nil), events...)
-		witnessID, ok := id.(counterID)
-		if !ok {
-			witnessID = counterID{value: id.Value()}
-		}
-		altered = append(altered, es.StoredEvent[counterEvent]{
-			Event: replayWitnessEvent{AggID: witnessID},
-			SeqNr: events[len(events)-1].SeqNr,
-		})
-		return altered, nil
+	if len(events) == 0 {
+		return events, nil
 	}
-	return events, nil
+	altered := append([]es.StoredEvent[witnessCounterEvent](nil), events...)
+	return appendReplayWitness(id, altered), nil
+}
+
+func appendReplayWitness(
+	id es.AggregateID,
+	events []es.StoredEvent[witnessCounterEvent],
+) []es.StoredEvent[witnessCounterEvent] {
+	witnessID, ok := id.(counterID)
+	if !ok {
+		witnessID = counterID{value: id.Value()}
+	}
+	last := events[len(events)-1]
+	witnessOccurredAt := last.OccurredAt
+	if witnessOccurredAt.IsZero() {
+		witnessOccurredAt = time.Unix(0, int64(last.SeqNr)).UTC()
+	}
+	return append(events, es.StoredEvent[witnessCounterEvent]{
+		Event:      replayWitnessEvent{AggID: witnessID},
+		EventID:    "replay-witness-" + witnessID.Value(),
+		SeqNr:      last.SeqNr + 1,
+		OccurredAt: witnessOccurredAt.Add(time.Nanosecond),
+	})
 }
 
 func TestRepository_Save_existingAggregateAppliesReturnedLoadStream(t *testing.T) {
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 100
 
-	base := memory.New[counterAggregate, counterCommand, counterEvent]()
+	base := memory.New[witnessCounterAggregate, witnessCounterCommand, witnessCounterEvent]()
 	store := newReplayWitnessingStore(base)
-	repo := es.NewRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
+	repo := es.NewRepository[witnessCounterAggregate, witnessCounterCommand, witnessCounterEvent](store, blankWitnessCounter, cfg)
 	id := counterID{value: "contract"}
 
-	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
+	if _, err := repo.Save(context.Background(), id, witnessCounterIncrementCommand{By: 1}); err != nil {
 		t.Fatalf("first Save: %v", err)
 	}
 
-	got, err := repo.Save(context.Background(), id, incrementCommand{By: 1})
+	got, err := repo.Save(context.Background(), id, witnessCounterIncrementCommand{By: 1})
 	if err != nil {
 		t.Fatalf("second Save: %v", err)
 	}
 	if got.count != 2 {
 		t.Fatalf("count: got %d, want 2", got.count)
 	}
-	if !got.replayWitnessApplied {
+	if !got.witnessApplied {
 		t.Fatal("expected replay witness event to be applied during reconstruction")
 	}
 }
