@@ -90,9 +90,8 @@ func newCounterRepo(t *testing.T, cfg es.Config) (es.Repository[counterAggregate
 	return repo, store
 }
 
-// loadStreamMutatingStore alters reconstruction reads on the existing-aggregate
-// path so the caller's aggregate state changes only if the returned stream is
-// actually applied.
+// loadStreamMutatingStore alters non-empty reconstruction reads so the caller's
+// aggregate state changes only if the returned stream is actually applied.
 type loadStreamMutatingStore[A es.Aggregate[C, E], C es.Command, E es.Event] struct {
 	es.EventStore[A, C, E]
 }
@@ -122,9 +121,9 @@ func (s *loadStreamMutatingStore[A, C, E]) LoadStreamAfter(
 	if err != nil {
 		return nil, err
 	}
-	if seqNr == 0 && len(events) == 1 {
+	if len(events) > 0 {
 		altered := append([]es.StoredEvent[E](nil), events...)
-		altered = append(altered, events[0])
+		altered = append(altered, events[len(events)-1])
 		return altered, nil
 	}
 	return events, nil
