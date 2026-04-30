@@ -1,4 +1,4 @@
-package memory_test
+package memory
 
 import (
 	"context"
@@ -7,7 +7,6 @@ import (
 	"time"
 
 	es "github.com/Hiroshi0900/eventstore"
-	"github.com/Hiroshi0900/eventstore/memory"
 )
 
 // memoryTestAggID is a typed AggregateID local to the memory tests.
@@ -68,7 +67,7 @@ func newStoredSnap(id memoryTestAggID, seqNr, version uint64) es.StoredSnapshot[
 }
 
 func TestStore_GetLatestSnapshot_empty(t *testing.T) {
-	s := memory.New[stubAggregate, stubCommand, stubEvent]()
+	s := New[stubAggregate, stubCommand, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
 	_, found, err := s.GetLatestSnapshot(context.Background(), id)
@@ -81,7 +80,7 @@ func TestStore_GetLatestSnapshot_empty(t *testing.T) {
 }
 
 func TestStore_LoadStreamAfter_empty(t *testing.T) {
-	s := memory.New[stubAggregate, stubCommand, stubEvent]()
+	s := New[stubAggregate, stubCommand, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
 	events, err := s.LoadStreamAfter(context.Background(), id, 0)
@@ -94,7 +93,7 @@ func TestStore_LoadStreamAfter_empty(t *testing.T) {
 }
 
 func TestStore_PersistEvent_persistsAndQueryable(t *testing.T) {
-	s := memory.New[stubAggregate, stubCommand, stubEvent]()
+	s := New[stubAggregate, stubCommand, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
 	if err := s.PersistEvent(context.Background(), newStored(id, 1, true), 0); err != nil {
@@ -111,7 +110,7 @@ func TestStore_PersistEvent_persistsAndQueryable(t *testing.T) {
 }
 
 func TestStore_LoadStreamAfter_excludesBoundarySeqNr(t *testing.T) {
-	s := memory.New[stubAggregate, stubCommand, stubEvent]()
+	s := New[stubAggregate, stubCommand, stubEvent]()
 	id := memoryTestAggID{"Visit", "boundary"}
 
 	if err := s.PersistEvent(context.Background(), newStored(id, 1, true), 0); err != nil {
@@ -131,17 +130,14 @@ func TestStore_LoadStreamAfter_excludesBoundarySeqNr(t *testing.T) {
 }
 
 func TestStore_LoadStreamAfter_returnsRemainingEventsInExpectedOrder(t *testing.T) {
-	s := memory.New[stubAggregate, stubCommand, stubEvent]()
+	s := &store[stubAggregate, stubCommand, stubEvent]{
+		events: map[string][]es.StoredEvent[stubEvent]{},
+	}
 	id := memoryTestAggID{"Visit", "ordering"}
-
-	if err := s.PersistEvent(context.Background(), newStored(id, 1, true), 0); err != nil {
-		t.Fatalf("PersistEvent 1: %v", err)
-	}
-	if err := s.PersistEvent(context.Background(), newStored(id, 2, false), 1); err != nil {
-		t.Fatalf("PersistEvent 2: %v", err)
-	}
-	if err := s.PersistEvent(context.Background(), newStored(id, 3, false), 1); err != nil {
-		t.Fatalf("PersistEvent 3: %v", err)
+	s.events[id.AsString()] = []es.StoredEvent[stubEvent]{
+		newStored(id, 3, false),
+		newStored(id, 1, true),
+		newStored(id, 2, false),
 	}
 
 	got, err := s.LoadStreamAfter(context.Background(), id, 1)
@@ -157,7 +153,7 @@ func TestStore_LoadStreamAfter_returnsRemainingEventsInExpectedOrder(t *testing.
 }
 
 func TestStore_PersistEvent_duplicateSeqNr(t *testing.T) {
-	s := memory.New[stubAggregate, stubCommand, stubEvent]()
+	s := New[stubAggregate, stubCommand, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
 	if err := s.PersistEvent(context.Background(), newStored(id, 1, true), 0); err != nil {
@@ -173,7 +169,7 @@ func TestStore_PersistEvent_duplicateSeqNr(t *testing.T) {
 }
 
 func TestStore_PersistEvent_initialOnExistingAggregate(t *testing.T) {
-	s := memory.New[stubAggregate, stubCommand, stubEvent]()
+	s := New[stubAggregate, stubCommand, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
 	if err := s.PersistEvent(context.Background(), newStored(id, 1, true), 0); err != nil {
@@ -186,7 +182,7 @@ func TestStore_PersistEvent_initialOnExistingAggregate(t *testing.T) {
 }
 
 func TestStore_PersistEventAndSnapshot_initialWrite(t *testing.T) {
-	s := memory.New[stubAggregate, stubCommand, stubEvent]()
+	s := New[stubAggregate, stubCommand, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
 	ev := newStored(id, 5, false)
@@ -206,7 +202,7 @@ func TestStore_PersistEventAndSnapshot_initialWrite(t *testing.T) {
 }
 
 func TestStore_PersistEventAndSnapshot_optimisticLockFailure(t *testing.T) {
-	s := memory.New[stubAggregate, stubCommand, stubEvent]()
+	s := New[stubAggregate, stubCommand, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
 	if err := s.PersistEventAndSnapshot(

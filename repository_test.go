@@ -37,8 +37,6 @@ func (e incrementedEvent) EventTypeName() string       { return "Incremented" }
 func (e incrementedEvent) AggregateID() es.AggregateID { return e.AggID }
 func (incrementedEvent) isCounterEvent()               {}
 
-// replayWitnessEvent is a test-only event used to prove replay consumed the
-// returned LoadStreamAfter slice on the existing-aggregate path.
 type counterCommand interface {
 	es.Command
 	isCounterCommand()
@@ -112,6 +110,8 @@ func (e witnessCounterIncrementedEvent) EventTypeName() string       { return "W
 func (e witnessCounterIncrementedEvent) AggregateID() es.AggregateID { return e.AggID }
 func (witnessCounterIncrementedEvent) isWitnessCounterEvent()        {}
 
+// replayWitnessEvent is a test-only event used to prove replay consumed the
+// returned LoadStreamAfter slice on the existing-aggregate path.
 type replayWitnessEvent struct {
 	AggID counterID
 }
