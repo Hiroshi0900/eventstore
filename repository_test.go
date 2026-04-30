@@ -90,22 +90,22 @@ func newCounterRepo(t *testing.T, cfg es.Config) (es.Repository[counterAggregate
 	return repo, store
 }
 
-// loadStreamTrackingStore counts reconstruction reads while delegating all
-// behavior to the wrapped store.
-type loadStreamTrackingStore[A es.Aggregate[C, E], C es.Command, E es.Event] struct {
+// loadStreamMutatingStore alters reconstruction reads on the existing-aggregate
+// path so the caller's aggregate state changes only if the returned stream is
+// actually applied.
+type loadStreamMutatingStore[A es.Aggregate[C, E], C es.Command, E es.Event] struct {
 	es.EventStore[A, C, E]
-	loadStreamAfterCalls int
 }
 
-func newLoadStreamTrackingStore[A es.Aggregate[C, E], C es.Command, E es.Event](
+func newLoadStreamMutatingStore[A es.Aggregate[C, E], C es.Command, E es.Event](
 	base es.EventStore[A, C, E],
-) *loadStreamTrackingStore[A, C, E] {
-	return &loadStreamTrackingStore[A, C, E]{
+) *loadStreamMutatingStore[A, C, E] {
+	return &loadStreamMutatingStore[A, C, E]{
 		EventStore: base,
 	}
 }
 
-func (s *loadStreamTrackingStore[A, C, E]) PersistEvent(
+func (s *loadStreamMutatingStore[A, C, E]) PersistEvent(
 	ctx context.Context,
 	ev es.StoredEvent[E],
 	expectedVersion uint64,
@@ -113,13 +113,21 @@ func (s *loadStreamTrackingStore[A, C, E]) PersistEvent(
 	return s.EventStore.PersistEvent(ctx, ev, expectedVersion)
 }
 
-func (s *loadStreamTrackingStore[A, C, E]) LoadStreamAfter(
+func (s *loadStreamMutatingStore[A, C, E]) LoadStreamAfter(
 	ctx context.Context,
 	id es.AggregateID,
 	seqNr uint64,
 ) ([]es.StoredEvent[E], error) {
-	s.loadStreamAfterCalls++
-	return s.EventStore.LoadStreamAfter(ctx, id, seqNr)
+	events, err := s.EventStore.LoadStreamAfter(ctx, id, seqNr)
+	if err != nil {
+		return nil, err
+	}
+	if seqNr == 0 && len(events) == 1 {
+		altered := append([]es.StoredEvent[E](nil), events...)
+		altered = append(altered, events[0])
+		return altered, nil
+	}
+	return events, nil
 }
 
 func TestRepository_Save_backToBackUsesStoreReconstructionContract(t *testing.T) {
@@ -127,31 +135,20 @@ func TestRepository_Save_backToBackUsesStoreReconstructionContract(t *testing.T)
 	cfg.SnapshotInterval = 100
 
 	base := memory.New[counterAggregate, counterCommand, counterEvent]()
-	store := newLoadStreamTrackingStore[counterAggregate, counterCommand, counterEvent](base)
+	store := newLoadStreamMutatingStore[counterAggregate, counterCommand, counterEvent](base)
 	repo := es.NewRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
 	id := counterID{value: "contract"}
 
 	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
 		t.Fatalf("first Save: %v", err)
 	}
-	firstLoadCalls := store.loadStreamAfterCalls
-	if firstLoadCalls == 0 {
-		t.Fatal("first Save did not call LoadStreamAfter")
-	}
 
 	got, err := repo.Save(context.Background(), id, incrementCommand{By: 1})
 	if err != nil {
 		t.Fatalf("second Save: %v", err)
 	}
-	if got.count != 2 {
-		t.Fatalf("count: got %d, want 2", got.count)
-	}
-	if store.loadStreamAfterCalls <= firstLoadCalls {
-		t.Fatalf(
-			"second Save did not trigger additional LoadStreamAfter calls: got %d, want > %d",
-			store.loadStreamAfterCalls,
-			firstLoadCalls,
-		)
+	if got.count != 3 {
+		t.Fatalf("count: got %d, want 3", got.count)
 	}
 }
 
