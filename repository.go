@@ -6,6 +6,18 @@ import (
 	"time"
 )
 
+// LoadedAggregate は command 側で再利用可能な aggregate と opaque な永続化文脈を持つ。
+type LoadedAggregate[A Aggregate[C, E], C Command, E Event] struct {
+	aggregate A
+	seqNr     uint64
+	version   uint64
+}
+
+// Aggregate は現在の aggregate 状態を返す。
+func (l LoadedAggregate[A, C, E]) Aggregate() A {
+	return l.aggregate
+}
+
 // Repository は集約 A の高レベル Load / Save API。
 //
 // 利用側は domain ごとに `Repository[Visit, VisitCommand, VisitEvent]` のように instantiate する。
@@ -19,6 +31,12 @@ type Repository[A Aggregate[C, E], C Command, E Event] interface {
 	// で適用してイベントを生成、ApplyEvent で次状態に遷移後、永続化して新状態を返す。
 	// SnapshotInterval に達した seqNr では snapshot も同時に書く。
 	Save(ctx context.Context, aggID AggregateID, cmd C) (A, error)
+
+	// LoadForCommand は command 側の連続 Save 向けに aggregate と永続化文脈を返す。
+	LoadForCommand(ctx context.Context, aggID AggregateID) (LoadedAggregate[A, C, E], error)
+
+	// SaveLoaded は事前にロード済みの aggregate に command を適用して次の loaded 状態を返す。
+	SaveLoaded(ctx context.Context, loaded LoadedAggregate[A, C, E], cmd C) (LoadedAggregate[A, C, E], error)
 }
 
 // defaultRepository は Repository interface の library 内部実装 (factory-sealed)。
@@ -107,19 +125,35 @@ func (r *defaultRepository[A, C, E]) Load(ctx context.Context, aggID AggregateID
 	return agg, nil
 }
 
-// Save は load → ApplyCommand → ApplyEvent → 永続化 を一括で行う。
-// 集約未存在でも blank で開始するため、creation 系コマンドの初回適用にも使える。
-func (r *defaultRepository[A, C, E]) Save(
+// LoadForCommand は集約と次の SaveLoaded に必要な永続化文脈をロードする。
+func (r *defaultRepository[A, C, E]) LoadForCommand(
 	ctx context.Context,
 	aggID AggregateID,
-	cmd C,
-) (A, error) {
-	var zero A
-
-	agg, currentSeqNr, currentVersion, _, err := r.loadInternal(ctx, aggID)
+) (LoadedAggregate[A, C, E], error) {
+	agg, seqNr, version, notFound, err := r.loadInternal(ctx, aggID)
 	if err != nil {
+		var zero LoadedAggregate[A, C, E]
 		return zero, err
 	}
+	if notFound {
+		var zero LoadedAggregate[A, C, E]
+		return zero, NewAggregateNotFoundError(aggID.TypeName(), aggID.Value())
+	}
+	return LoadedAggregate[A, C, E]{
+		aggregate: agg,
+		seqNr:     seqNr,
+		version:   version,
+	}, nil
+}
+
+func (r *defaultRepository[A, C, E]) saveKnownAggregate(
+	ctx context.Context,
+	agg A,
+	currentSeqNr uint64,
+	currentVersion uint64,
+	cmd C,
+) (LoadedAggregate[A, C, E], error) {
+	var zero LoadedAggregate[A, C, E]
 
 	ev, err := agg.ApplyCommand(cmd)
 	if err != nil {
@@ -151,11 +185,13 @@ func (r *defaultRepository[A, C, E]) Save(
 		// TraceParent / TraceState は dynamodb 側で context から注入する。
 	}
 
+	nextVersion := currentVersion
 	if r.config.ShouldSnapshot(nextSeqNr) {
+		nextVersion = currentVersion + 1
 		snap := StoredSnapshot[A]{
 			Aggregate:  next,
 			SeqNr:      nextSeqNr,
-			Version:    currentVersion + 1,
+			Version:    nextVersion,
 			OccurredAt: now,
 		}
 		if err := r.store.PersistEventAndSnapshot(ctx, stored, snap); err != nil {
@@ -177,5 +213,39 @@ func (r *defaultRepository[A, C, E]) Save(
 		}
 	}
 
-	return next, nil
+	return LoadedAggregate[A, C, E]{
+		aggregate: next,
+		seqNr:     nextSeqNr,
+		version:   nextVersion,
+	}, nil
+}
+
+// Save は load → ApplyCommand → ApplyEvent → 永続化 を一括で行う。
+// 集約未存在でも blank で開始するため、creation 系コマンドの初回適用にも使える。
+func (r *defaultRepository[A, C, E]) Save(
+	ctx context.Context,
+	aggID AggregateID,
+	cmd C,
+) (A, error) {
+	var zero A
+
+	agg, currentSeqNr, currentVersion, _, err := r.loadInternal(ctx, aggID)
+	if err != nil {
+		return zero, err
+	}
+
+	loaded, err := r.saveKnownAggregate(ctx, agg, currentSeqNr, currentVersion, cmd)
+	if err != nil {
+		return zero, err
+	}
+	return loaded.Aggregate(), nil
+}
+
+// SaveLoaded はロード済み aggregate に command を適用し、次の loaded 状態を返す。
+func (r *defaultRepository[A, C, E]) SaveLoaded(
+	ctx context.Context,
+	loaded LoadedAggregate[A, C, E],
+	cmd C,
+) (LoadedAggregate[A, C, E], error) {
+	return r.saveKnownAggregate(ctx, loaded.aggregate, loaded.seqNr, loaded.version, cmd)
 }

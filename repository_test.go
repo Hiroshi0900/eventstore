@@ -349,30 +349,36 @@ func TestRepository_SaveLoaded_reusesLoadedContextWithoutReplay(t *testing.T) {
 	repo := es.NewRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
 	id := counterID{value: "loaded"}
 
+	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
+		t.Fatalf("seed Save: %v", err)
+	}
+
 	loaded, err := repo.LoadForCommand(context.Background(), id)
 	if err != nil {
 		t.Fatalf("LoadForCommand: %v", err)
 	}
+	callsAfterLoad := store.loadCalls
 
 	afterFirst, err := repo.SaveLoaded(context.Background(), loaded, incrementCommand{By: 2})
 	if err != nil {
 		t.Fatalf("first SaveLoaded: %v", err)
 	}
-	if got := afterFirst.Aggregate().count; got != 2 {
-		t.Fatalf("count after first SaveLoaded: got %d, want 2", got)
+	if got := afterFirst.Aggregate().count; got != 3 {
+		t.Fatalf("count after first SaveLoaded: got %d, want 3", got)
 	}
-
-	callsAfterFirst := store.loadCalls
+	if store.loadCalls != callsAfterLoad {
+		t.Fatalf("LoadStreamAfter calls after first SaveLoaded: got %d, want %d", store.loadCalls, callsAfterLoad)
+	}
 
 	afterSecond, err := repo.SaveLoaded(context.Background(), afterFirst, incrementCommand{By: 3})
 	if err != nil {
 		t.Fatalf("second SaveLoaded: %v", err)
 	}
-	if got := afterSecond.Aggregate().count; got != 5 {
-		t.Fatalf("count after second SaveLoaded: got %d, want 5", got)
+	if got := afterSecond.Aggregate().count; got != 6 {
+		t.Fatalf("count after second SaveLoaded: got %d, want 6", got)
 	}
-	if store.loadCalls != callsAfterFirst {
-		t.Fatalf("LoadStreamAfter calls: got %d, want %d", store.loadCalls, callsAfterFirst)
+	if store.loadCalls != callsAfterLoad {
+		t.Fatalf("LoadStreamAfter calls after second SaveLoaded: got %d, want %d", store.loadCalls, callsAfterLoad)
 	}
 }
 
