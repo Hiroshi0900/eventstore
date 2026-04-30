@@ -222,6 +222,26 @@ func appendReplayWitness(
 	})
 }
 
+type countingStore struct {
+	es.EventStore[counterAggregate, counterCommand, counterEvent]
+	loadCalls int
+}
+
+func newCountingStore(
+	base es.EventStore[counterAggregate, counterCommand, counterEvent],
+) *countingStore {
+	return &countingStore{EventStore: base}
+}
+
+func (s *countingStore) LoadStreamAfter(
+	ctx context.Context,
+	id es.AggregateID,
+	seqNr uint64,
+) ([]es.StoredEvent[counterEvent], error) {
+	s.loadCalls++
+	return s.EventStore.LoadStreamAfter(ctx, id, seqNr)
+}
+
 func TestRepository_Save_existingAggregateAppliesReturnedLoadStream(t *testing.T) {
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 100
@@ -317,6 +337,56 @@ func TestRepository_Save_subsequentEvent(t *testing.T) {
 	stored, _ := store.LoadStreamAfter(context.Background(), id, 0)
 	if len(stored) != 2 || stored[1].IsCreated || stored[1].SeqNr != 2 {
 		t.Errorf("metadata mismatch: %+v", stored[1])
+	}
+}
+
+func TestRepository_SaveLoaded_reusesLoadedContextWithoutReplay(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 100
+
+	base := memory.New[counterAggregate, counterCommand, counterEvent]()
+	store := newCountingStore(base)
+	repo := es.NewRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
+	id := counterID{value: "loaded"}
+
+	loaded, err := repo.LoadForCommand(context.Background(), id)
+	if err != nil {
+		t.Fatalf("LoadForCommand: %v", err)
+	}
+
+	afterFirst, err := repo.SaveLoaded(context.Background(), loaded, incrementCommand{By: 2})
+	if err != nil {
+		t.Fatalf("first SaveLoaded: %v", err)
+	}
+	if got := afterFirst.Aggregate().count; got != 2 {
+		t.Fatalf("count after first SaveLoaded: got %d, want 2", got)
+	}
+
+	callsAfterFirst := store.loadCalls
+
+	afterSecond, err := repo.SaveLoaded(context.Background(), afterFirst, incrementCommand{By: 3})
+	if err != nil {
+		t.Fatalf("second SaveLoaded: %v", err)
+	}
+	if got := afterSecond.Aggregate().count; got != 5 {
+		t.Fatalf("count after second SaveLoaded: got %d, want 5", got)
+	}
+	if store.loadCalls != callsAfterFirst {
+		t.Fatalf("LoadStreamAfter calls: got %d, want %d", store.loadCalls, callsAfterFirst)
+	}
+}
+
+func TestRepository_LoadForCommand_notFound(t *testing.T) {
+	repo, _ := newCounterRepo(t, es.DefaultConfig())
+
+	_, err := repo.LoadForCommand(context.Background(), counterID{value: "missing"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	var nf *es.AggregateNotFoundError
+	if !errors.As(err, &nf) {
+		t.Fatalf("expected AggregateNotFoundError, got %T", err)
 	}
 }
 
