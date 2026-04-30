@@ -72,7 +72,8 @@ The semantics are:
 - `LoadForCommand` reconstructs the aggregate using the same correctness rules as `Load`
 - `SaveLoaded` applies one command to an existing loaded handle and persists the result using the stored opaque revision context
 - `SaveLoaded` returns the next `LoadedAggregate`, ready for another command without a fresh replay roundtrip
-- `LoadedAggregate` can only be created for value-semantic aggregate shapes; pointer aggregates and aggregates that recursively contain pointer / map / slice / func / chan / interface / unsafe-pointer fields are rejected with `ErrInvalidAggregate`
+- `LoadedAggregate` can only be created for value-semantic aggregate shapes; pointer aggregates and aggregates that directly expose pointer / map / slice / func / chan / interface / unsafe-pointer state are rejected with `ErrInvalidAggregate`
+- opaque value types that are safe to copy at the aggregate boundary, such as `time.Time`, remain allowed even though they may contain internal implementation pointers
 
 This keeps the return type focused on "continue the command session" rather than "return persistence metadata or emitted events."
 
