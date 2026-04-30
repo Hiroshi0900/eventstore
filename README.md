@@ -98,7 +98,7 @@ repo := es.NewRepository[Counter, CounterCommand, CounterEvent](store, NewBlankC
 
 ## Advanced Command Flow
 
-`Repository.Load` / `Repository.Save` は標準の correctness-first API です。既存 aggregate に対して command を連続適用し、毎回 replay したくない場合だけ `CommandRepository` を使います。`LoadedAggregate` を返す API は aggregate が値セマンティクス形状である場合にだけ使えます。具体的には、aggregate 自体がポインタでないことに加え、呼び出し側にそのまま露出すると別名参照になりうる pointer / map / slice / func / chan / interface / unsafe-pointer を直接保持する形は拒否されます。一方で `time.Time` のような opaque な値型は利用できます。`SaveLoaded` を呼ぶたびに最新の `LoadedAggregate` が返るので、呼び出し側はその戻り値を引き続き使い、古い handle を再利用しないでください。
+`Repository.Load` / `Repository.Save` は標準の correctness-first API です。既存 aggregate に対して command を連続適用し、毎回 replay したくない場合だけ `CommandRepository` を使います。`LoadedAggregate` を返す API は aggregate が値セマンティクス形状である場合にだけ使えます。具体的には、aggregate 自体がポインタでないことに加え、ネストした struct / array を含めて再帰的に見たときに、呼び出し側へそのまま露出すると別名参照になりうる pointer / map / slice / func / chan / interface / unsafe-pointer を含んではいけません。一方で `time.Time` のような opaque な値型は利用できます。`SaveLoaded` を呼ぶたびに最新の `LoadedAggregate` が返るので、呼び出し側はその戻り値を引き続き使い、古い handle を再利用しないでください。
 
 ```go
 ctx := context.Background()
