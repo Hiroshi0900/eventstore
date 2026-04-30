@@ -382,6 +382,50 @@ func TestRepository_SaveLoaded_reusesLoadedContextWithoutReplay(t *testing.T) {
 	}
 }
 
+func TestRepository_SaveLoaded_rejectsZeroValueLoadedAggregate(t *testing.T) {
+	repo, _ := newCounterRepo(t, es.DefaultConfig())
+
+	_, err := repo.SaveLoaded(context.Background(), es.LoadedAggregate[counterAggregate, counterCommand, counterEvent]{}, incrementCommand{By: 1})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, es.ErrInvalidAggregate) {
+		t.Fatalf("expected ErrInvalidAggregate, got %v", err)
+	}
+	if got := err.Error(); got != "invalid aggregate: SaveLoaded requires a loaded aggregate handle created by this repository" {
+		t.Fatalf("error message = %q", got)
+	}
+}
+
+func TestRepository_SaveLoaded_rejectsHandleFromDifferentRepository(t *testing.T) {
+	cfg := es.DefaultConfig()
+	cfg.SnapshotInterval = 100
+
+	repo1, _ := newCounterRepo(t, cfg)
+	repo2, _ := newCounterRepo(t, cfg)
+	id := counterID{value: "foreign"}
+
+	if _, err := repo1.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
+		t.Fatalf("seed Save: %v", err)
+	}
+
+	loaded, err := repo1.LoadForCommand(context.Background(), id)
+	if err != nil {
+		t.Fatalf("LoadForCommand: %v", err)
+	}
+
+	_, err = repo2.SaveLoaded(context.Background(), loaded, incrementCommand{By: 1})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, es.ErrInvalidAggregate) {
+		t.Fatalf("expected ErrInvalidAggregate, got %v", err)
+	}
+	if got := err.Error(); got != "invalid aggregate: SaveLoaded requires a loaded aggregate handle created by this repository" {
+		t.Fatalf("error message = %q", got)
+	}
+}
+
 func TestRepository_LoadForCommand_notFound(t *testing.T) {
 	repo, _ := newCounterRepo(t, es.DefaultConfig())
 

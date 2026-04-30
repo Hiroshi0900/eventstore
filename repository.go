@@ -11,6 +11,7 @@ type LoadedAggregate[A Aggregate[C, E], C Command, E Event] struct {
 	aggregate A
 	seqNr     uint64
 	version   uint64
+	owner     *defaultRepository[A, C, E]
 }
 
 // Aggregate は現在の aggregate 状態を返す。
@@ -143,7 +144,15 @@ func (r *defaultRepository[A, C, E]) LoadForCommand(
 		aggregate: agg,
 		seqNr:     seqNr,
 		version:   version,
+		owner:     r,
 	}, nil
+}
+
+func (r *defaultRepository[A, C, E]) invalidLoadedAggregateError() error {
+	return fmt.Errorf(
+		"%w: SaveLoaded requires a loaded aggregate handle created by this repository",
+		ErrInvalidAggregate,
+	)
 }
 
 func (r *defaultRepository[A, C, E]) saveKnownAggregate(
@@ -217,6 +226,7 @@ func (r *defaultRepository[A, C, E]) saveKnownAggregate(
 		aggregate: next,
 		seqNr:     nextSeqNr,
 		version:   nextVersion,
+		owner:     r,
 	}, nil
 }
 
@@ -247,5 +257,9 @@ func (r *defaultRepository[A, C, E]) SaveLoaded(
 	loaded LoadedAggregate[A, C, E],
 	cmd C,
 ) (LoadedAggregate[A, C, E], error) {
+	if loaded.owner == nil || loaded.owner != r {
+		var zero LoadedAggregate[A, C, E]
+		return zero, r.invalidLoadedAggregateError()
+	}
 	return r.saveKnownAggregate(ctx, loaded.aggregate, loaded.seqNr, loaded.version, cmd)
 }
