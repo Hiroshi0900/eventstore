@@ -90,21 +90,22 @@ func newCounterRepo(t *testing.T, cfg es.Config) (es.Repository[counterAggregate
 	return repo, store
 }
 
-// futureLoadStreamStore is a thin wrapper used to assert the repository is
-// wired against the LoadStreamAfter-based reconstruction contract.
-type futureLoadStreamStore[A es.Aggregate[C, E], C es.Command, E es.Event] struct {
+// loadStreamTrackingStore counts reconstruction reads while delegating all
+// behavior to the wrapped store.
+type loadStreamTrackingStore[A es.Aggregate[C, E], C es.Command, E es.Event] struct {
 	es.EventStore[A, C, E]
+	loadStreamAfterCalls int
 }
 
-func newFutureLoadStreamStore[A es.Aggregate[C, E], C es.Command, E es.Event](
+func newLoadStreamTrackingStore[A es.Aggregate[C, E], C es.Command, E es.Event](
 	base es.EventStore[A, C, E],
-) *futureLoadStreamStore[A, C, E] {
-	return &futureLoadStreamStore[A, C, E]{
+) *loadStreamTrackingStore[A, C, E] {
+	return &loadStreamTrackingStore[A, C, E]{
 		EventStore: base,
 	}
 }
 
-func (s *futureLoadStreamStore[A, C, E]) PersistEvent(
+func (s *loadStreamTrackingStore[A, C, E]) PersistEvent(
 	ctx context.Context,
 	ev es.StoredEvent[E],
 	expectedVersion uint64,
@@ -112,35 +113,30 @@ func (s *futureLoadStreamStore[A, C, E]) PersistEvent(
 	return s.EventStore.PersistEvent(ctx, ev, expectedVersion)
 }
 
-func (s *futureLoadStreamStore[A, C, E]) LoadStreamAfter(
+func (s *loadStreamTrackingStore[A, C, E]) LoadStreamAfter(
 	ctx context.Context,
 	id es.AggregateID,
 	seqNr uint64,
 ) ([]es.StoredEvent[E], error) {
+	s.loadStreamAfterCalls++
 	return s.EventStore.LoadStreamAfter(ctx, id, seqNr)
 }
 
-type counterLoadStreamStore interface {
-	LoadStreamAfter(context.Context, es.AggregateID, uint64) ([]es.StoredEvent[counterEvent], error)
-}
-
-func requireCounterLoadStreamStore(counterLoadStreamStore) {}
-
 func TestRepository_Save_backToBackUsesStoreReconstructionContract(t *testing.T) {
-	// Task 1's temporary compile-red becomes a real contract assertion once the
-	// production EventStore API and memory implementation expose LoadStreamAfter.
-	requireCounterLoadStreamStore(memory.New[counterAggregate, counterCommand, counterEvent]())
-
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 100
 
 	base := memory.New[counterAggregate, counterCommand, counterEvent]()
-	store := newFutureLoadStreamStore[counterAggregate, counterCommand, counterEvent](base)
+	store := newLoadStreamTrackingStore[counterAggregate, counterCommand, counterEvent](base)
 	repo := es.NewRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
 	id := counterID{value: "contract"}
 
 	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
 		t.Fatalf("first Save: %v", err)
+	}
+	firstLoadCalls := store.loadStreamAfterCalls
+	if firstLoadCalls == 0 {
+		t.Fatal("first Save did not call LoadStreamAfter")
 	}
 
 	got, err := repo.Save(context.Background(), id, incrementCommand{By: 1})
@@ -149,6 +145,13 @@ func TestRepository_Save_backToBackUsesStoreReconstructionContract(t *testing.T)
 	}
 	if got.count != 2 {
 		t.Fatalf("count: got %d, want 2", got.count)
+	}
+	if store.loadStreamAfterCalls <= firstLoadCalls {
+		t.Fatalf(
+			"second Save did not trigger additional LoadStreamAfter calls: got %d, want > %d",
+			store.loadStreamAfterCalls,
+			firstLoadCalls,
+		)
 	}
 }
 
