@@ -44,8 +44,8 @@ func (s *store[A, C, E]) GetLatestSnapshot(_ context.Context, id es.AggregateID)
 	return s.snapshots[key], true, nil
 }
 
-// GetEventsSince returns events with SeqNr > seqNr, ordered by SeqNr.
-func (s *store[A, C, E]) GetEventsSince(_ context.Context, id es.AggregateID, seqNr uint64) ([]es.StoredEvent[E], error) {
+// LoadStreamAfter returns events with SeqNr > seqNr, ordered by SeqNr.
+func (s *store[A, C, E]) LoadStreamAfter(_ context.Context, id es.AggregateID, seqNr uint64) ([]es.StoredEvent[E], error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 

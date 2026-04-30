@@ -101,9 +101,9 @@ func TestStore_PersistEvent_persistsAndQueryable(t *testing.T) {
 		t.Fatalf("PersistEvent: %v", err)
 	}
 
-	got, err := s.GetEventsSince(context.Background(), id, 0)
+	got, err := s.LoadStreamAfter(context.Background(), id, 0)
 	if err != nil {
-		t.Fatalf("GetEventsSince: %v", err)
+		t.Fatalf("LoadStreamAfter: %v", err)
 	}
 	if len(got) != 1 || got[0].SeqNr != 1 {
 		t.Errorf("got %+v, want 1 event with SeqNr=1", got)

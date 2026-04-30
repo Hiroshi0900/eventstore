@@ -35,8 +35,9 @@ type EventStore[A Aggregate[C, E], C Command, E Event] interface {
 	// GetLatestSnapshot は最新 snapshot を返す。snapshot 未存在の場合は found=false を返す。
 	GetLatestSnapshot(ctx context.Context, id AggregateID) (snap StoredSnapshot[A], found bool, err error)
 
-	// GetEventsSince は seqNr より大きい seqNr の events を昇順で返す。
-	GetEventsSince(ctx context.Context, id AggregateID, seqNr uint64) ([]StoredEvent[E], error)
+	// LoadStreamAfter は aggregate 再構築の正しさを支える重要な read であり、
+	// seqNr より大きい seqNr の events を昇順で返さなければならない。
+	LoadStreamAfter(ctx context.Context, id AggregateID, seqNr uint64) ([]StoredEvent[E], error)
 
 	// PersistEvent は event 単独を保存する (snapshot interval 外のケース)。
 	// expectedVersion は呼び出し側 context 用で、実装は楽観ロックには使わない。

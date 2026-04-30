@@ -90,13 +90,10 @@ func newCounterRepo(t *testing.T, cfg es.Config) (es.Repository[counterAggregate
 	return repo, store
 }
 
-// futureLoadStreamStore is a deliberate TDD red fake for the future
-// LoadStreamAfter API. It does not protect the current Repository.Save path;
-// it only models the contract we want after the production rename.
+// futureLoadStreamStore is a thin wrapper used to assert the repository is
+// wired against the LoadStreamAfter-based reconstruction contract.
 type futureLoadStreamStore[A es.Aggregate[C, E], C es.Command, E es.Event] struct {
 	es.EventStore[A, C, E]
-
-	staleRead map[string][]es.StoredEvent[E]
 }
 
 func newFutureLoadStreamStore[A es.Aggregate[C, E], C es.Command, E es.Event](
@@ -104,7 +101,6 @@ func newFutureLoadStreamStore[A es.Aggregate[C, E], C es.Command, E es.Event](
 ) *futureLoadStreamStore[A, C, E] {
 	return &futureLoadStreamStore[A, C, E]{
 		EventStore: base,
-		staleRead:  make(map[string][]es.StoredEvent[E]),
 	}
 }
 
@@ -113,18 +109,7 @@ func (s *futureLoadStreamStore[A, C, E]) PersistEvent(
 	ev es.StoredEvent[E],
 	expectedVersion uint64,
 ) error {
-	key := ev.Event.AggregateID().AsString()
-
-	pre, err := s.EventStore.GetEventsSince(ctx, ev.Event.AggregateID(), 0)
-	if err != nil {
-		return err
-	}
-	if err := s.EventStore.PersistEvent(ctx, ev, expectedVersion); err != nil {
-		return err
-	}
-
-	s.staleRead[key] = append([]es.StoredEvent[E](nil), pre...)
-	return nil
+	return s.EventStore.PersistEvent(ctx, ev, expectedVersion)
 }
 
 func (s *futureLoadStreamStore[A, C, E]) LoadStreamAfter(
@@ -132,24 +117,7 @@ func (s *futureLoadStreamStore[A, C, E]) LoadStreamAfter(
 	id es.AggregateID,
 	seqNr uint64,
 ) ([]es.StoredEvent[E], error) {
-	key := id.AsString()
-
-	stale, ok := s.staleRead[key]
-	if ok {
-		delete(s.staleRead, key)
-	}
-
-	if ok {
-		out := make([]es.StoredEvent[E], 0, len(stale))
-		for _, ev := range stale {
-			if ev.SeqNr > seqNr {
-				out = append(out, ev)
-			}
-		}
-		return out, nil
-	}
-
-	return s.EventStore.GetEventsSince(ctx, id, seqNr)
+	return s.EventStore.LoadStreamAfter(ctx, id, seqNr)
 }
 
 type counterLoadStreamStore interface {
@@ -159,8 +127,8 @@ type counterLoadStreamStore interface {
 func requireCounterLoadStreamStore(counterLoadStreamStore) {}
 
 func TestRepository_Save_backToBackUsesStoreReconstructionContract(t *testing.T) {
-	// Deliberate TDD red gate: this should not compile until the production
-	// EventStore API grows LoadStreamAfter and memory.New implements it.
+	// Task 1's temporary compile-red becomes a real contract assertion once the
+	// production EventStore API and memory implementation expose LoadStreamAfter.
 	requireCounterLoadStreamStore(memory.New[counterAggregate, counterCommand, counterEvent]())
 
 	cfg := es.DefaultConfig()
@@ -216,9 +184,9 @@ func TestRepository_Save_firstEventCreatesAggregate(t *testing.T) {
 		t.Errorf("count: got %d, want 3", got.count)
 	}
 
-	stored, err := store.GetEventsSince(context.Background(), id, 0)
+	stored, err := store.LoadStreamAfter(context.Background(), id, 0)
 	if err != nil {
-		t.Fatalf("GetEventsSince: %v", err)
+		t.Fatalf("LoadStreamAfter: %v", err)
 	}
 	if len(stored) != 1 {
 		t.Fatalf("len: got %d, want 1", len(stored))
@@ -251,7 +219,7 @@ func TestRepository_Save_subsequentEvent(t *testing.T) {
 		t.Errorf("count: got %d, want 5", got.count)
 	}
 
-	stored, _ := store.GetEventsSince(context.Background(), id, 0)
+	stored, _ := store.LoadStreamAfter(context.Background(), id, 0)
 	if len(stored) != 2 || stored[1].IsCreated || stored[1].SeqNr != 2 {
 		t.Errorf("metadata mismatch: %+v", stored[1])
 	}
