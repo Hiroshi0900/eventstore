@@ -112,7 +112,7 @@ func (e witnessCounterIncrementedEvent) AggregateID() es.AggregateID { return e.
 func (witnessCounterIncrementedEvent) isWitnessCounterEvent()        {}
 
 // replayWitnessEvent is a test-only event used to prove replay consumed the
-// returned LoadStreamAfter slice on the existing-aggregate path.
+// returned GetEventsSince slice on the existing-aggregate path.
 type replayWitnessEvent struct {
 	AggID counterID
 }
@@ -186,12 +186,12 @@ func newReplayWitnessingStore(
 	return &replayWitnessingStore{EventStore: base}
 }
 
-func (s *replayWitnessingStore) LoadStreamAfter(
+func (s *replayWitnessingStore) GetEventsSince(
 	ctx context.Context,
 	id es.AggregateID,
 	seqNr uint64,
 ) ([]es.StoredEvent[witnessCounterEvent], error) {
-	events, err := s.EventStore.LoadStreamAfter(ctx, id, seqNr)
+	events, err := s.EventStore.GetEventsSince(ctx, id, seqNr)
 	if err != nil {
 		return nil, err
 	}
@@ -234,16 +234,18 @@ func newCountingStore(
 	return &countingStore{EventStore: base}
 }
 
-func (s *countingStore) LoadStreamAfter(
+func (s *countingStore) GetEventsSince(
 	ctx context.Context,
 	id es.AggregateID,
 	seqNr uint64,
 ) ([]es.StoredEvent[counterEvent], error) {
 	s.loadCalls++
-	return s.EventStore.LoadStreamAfter(ctx, id, seqNr)
+	return s.EventStore.GetEventsSince(ctx, id, seqNr)
 }
 
-func TestRepository_Save_existingAggregateAppliesReturnedLoadStream(t *testing.T) {
+// TestRepository_Load_appliesGetEventsSinceResultDuringReplay verifies that
+// Load replays all events returned by GetEventsSince onto the aggregate.
+func TestRepository_Load_appliesGetEventsSinceResultDuringReplay(t *testing.T) {
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 100
 
@@ -252,19 +254,28 @@ func TestRepository_Save_existingAggregateAppliesReturnedLoadStream(t *testing.T
 	repo := es.NewRepository[witnessCounterAggregate, witnessCounterCommand, witnessCounterEvent](store, blankWitnessCounter, cfg)
 	id := counterID{value: "contract"}
 
-	if _, err := repo.Save(context.Background(), id, witnessCounterIncrementCommand{By: 1}); err != nil {
-		t.Fatalf("first Save: %v", err)
+	seed, err := repo.NewAggregate(context.Background(), id)
+	if err != nil {
+		t.Fatalf("NewAggregate: %v", err)
+	}
+	if _, err := repo.Save(context.Background(), seed, witnessCounterIncrementCommand{By: 1}); err != nil {
+		t.Fatalf("seed Save: %v", err)
 	}
 
-	got, err := repo.Save(context.Background(), id, witnessCounterIncrementCommand{By: 1})
+	// Load triggers GetEventsSince; witnessing store appends a witness event.
+	loaded, err := repo.Load(context.Background(), id)
 	if err != nil {
-		t.Fatalf("second Save: %v", err)
+		t.Fatalf("Load: %v", err)
 	}
-	if got.count != 2 {
-		t.Fatalf("count: got %d, want 2", got.count)
+	got, err := repo.Save(context.Background(), loaded, witnessCounterIncrementCommand{By: 1})
+	if err != nil {
+		t.Fatalf("Save: %v", err)
 	}
-	if !got.witnessApplied {
-		t.Fatal("expected replay witness event to be applied during reconstruction")
+	if got.Aggregate().count != 2 {
+		t.Fatalf("count: got %d, want 2", got.Aggregate().count)
+	}
+	if !got.Aggregate().witnessApplied {
+		t.Fatal("expected replay witness event to be applied during Load")
 	}
 }
 
@@ -286,23 +297,27 @@ func TestRepository_Load_notFound(t *testing.T) {
 	}
 }
 
-func TestRepository_Save_firstEventCreatesAggregate(t *testing.T) {
+func TestRepository_NewAggregate_thenSave_createsFirstEvent(t *testing.T) {
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 100 // snapshot 回避
 	repo, store := newCounterRepo(t, cfg)
 	id := counterID{value: "1"}
 
-	got, err := repo.Save(context.Background(), id, incrementCommand{By: 3})
+	blank, err := repo.NewAggregate(context.Background(), id)
+	if err != nil {
+		t.Fatalf("NewAggregate: %v", err)
+	}
+	got, err := repo.Save(context.Background(), blank, incrementCommand{By: 3})
 	if err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	if got.count != 3 {
-		t.Errorf("count: got %d, want 3", got.count)
+	if got.Aggregate().count != 3 {
+		t.Errorf("count: got %d, want 3", got.Aggregate().count)
 	}
 
-	stored, err := store.LoadStreamAfter(context.Background(), id, 0)
+	stored, err := store.GetEventsSince(context.Background(), id, 0)
 	if err != nil {
-		t.Fatalf("LoadStreamAfter: %v", err)
+		t.Fatalf("GetEventsSince: %v", err)
 	}
 	if len(stored) != 1 {
 		t.Fatalf("len: got %d, want 1", len(stored))
@@ -318,30 +333,37 @@ func TestRepository_Save_firstEventCreatesAggregate(t *testing.T) {
 	}
 }
 
-func TestRepository_Save_subsequentEvent(t *testing.T) {
+func TestRepository_ChainedSave_producesSubsequentEvent(t *testing.T) {
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 100
 	repo, store := newCounterRepo(t, cfg)
 	id := counterID{value: "2"}
 
-	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
-		t.Fatalf("first: %v", err)
-	}
-	got, err := repo.Save(context.Background(), id, incrementCommand{By: 4})
+	loaded, err := repo.NewAggregate(context.Background(), id)
 	if err != nil {
-		t.Fatalf("second: %v", err)
+		t.Fatalf("NewAggregate: %v", err)
 	}
-	if got.count != 5 {
-		t.Errorf("count: got %d, want 5", got.count)
+	loaded, err = repo.Save(context.Background(), loaded, incrementCommand{By: 1})
+	if err != nil {
+		t.Fatalf("first Save: %v", err)
+	}
+	got, err := repo.Save(context.Background(), loaded, incrementCommand{By: 4})
+	if err != nil {
+		t.Fatalf("second Save: %v", err)
+	}
+	if got.Aggregate().count != 5 {
+		t.Errorf("count: got %d, want 5", got.Aggregate().count)
 	}
 
-	stored, _ := store.LoadStreamAfter(context.Background(), id, 0)
+	stored, _ := store.GetEventsSince(context.Background(), id, 0)
 	if len(stored) != 2 || stored[1].IsCreated || stored[1].SeqNr != 2 {
 		t.Errorf("metadata mismatch: %+v", stored[1])
 	}
 }
 
-func TestRepository_SaveLoaded_reusesLoadedContextWithoutReplay(t *testing.T) {
+// TestRepository_Save_reusesLoadedContextWithoutReplay verifies that consecutive
+// Save calls on the same LoadedAggregate do not re-read from the store.
+func TestRepository_Save_reusesLoadedContextWithoutReplay(t *testing.T) {
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 100
 
@@ -350,55 +372,59 @@ func TestRepository_SaveLoaded_reusesLoadedContextWithoutReplay(t *testing.T) {
 	repo := es.NewRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
 	id := counterID{value: "loaded"}
 
-	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
+	seed, err := repo.NewAggregate(context.Background(), id)
+	if err != nil {
+		t.Fatalf("NewAggregate: %v", err)
+	}
+	if _, err := repo.Save(context.Background(), seed, incrementCommand{By: 1}); err != nil {
 		t.Fatalf("seed Save: %v", err)
 	}
 
-	loaded, err := repo.LoadForCommand(context.Background(), id)
+	loaded, err := repo.Load(context.Background(), id)
 	if err != nil {
-		t.Fatalf("LoadForCommand: %v", err)
+		t.Fatalf("Load: %v", err)
 	}
 	callsAfterLoad := store.loadCalls
 
-	afterFirst, err := repo.SaveLoaded(context.Background(), loaded, incrementCommand{By: 2})
+	afterFirst, err := repo.Save(context.Background(), loaded, incrementCommand{By: 2})
 	if err != nil {
-		t.Fatalf("first SaveLoaded: %v", err)
+		t.Fatalf("first Save: %v", err)
 	}
 	if got := afterFirst.Aggregate().count; got != 3 {
-		t.Fatalf("count after first SaveLoaded: got %d, want 3", got)
+		t.Fatalf("count after first Save: got %d, want 3", got)
 	}
 	if store.loadCalls != callsAfterLoad {
-		t.Fatalf("LoadStreamAfter calls after first SaveLoaded: got %d, want %d", store.loadCalls, callsAfterLoad)
+		t.Fatalf("GetEventsSince calls after first Save: got %d, want %d", store.loadCalls, callsAfterLoad)
 	}
 
-	afterSecond, err := repo.SaveLoaded(context.Background(), afterFirst, incrementCommand{By: 3})
+	afterSecond, err := repo.Save(context.Background(), afterFirst, incrementCommand{By: 3})
 	if err != nil {
-		t.Fatalf("second SaveLoaded: %v", err)
+		t.Fatalf("second Save: %v", err)
 	}
 	if got := afterSecond.Aggregate().count; got != 6 {
-		t.Fatalf("count after second SaveLoaded: got %d, want 6", got)
+		t.Fatalf("count after second Save: got %d, want 6", got)
 	}
 	if store.loadCalls != callsAfterLoad {
-		t.Fatalf("LoadStreamAfter calls after second SaveLoaded: got %d, want %d", store.loadCalls, callsAfterLoad)
+		t.Fatalf("GetEventsSince calls after second Save: got %d, want %d", store.loadCalls, callsAfterLoad)
 	}
 }
 
-func TestRepository_SaveLoaded_rejectsZeroValueLoadedAggregate(t *testing.T) {
+func TestRepository_Save_rejectsZeroValueLoadedAggregate(t *testing.T) {
 	repo, _ := newCounterRepo(t, es.DefaultConfig())
 
-	_, err := repo.SaveLoaded(context.Background(), es.LoadedAggregate[counterAggregate, counterCommand, counterEvent]{}, incrementCommand{By: 1})
+	_, err := repo.Save(context.Background(), es.LoadedAggregate[counterAggregate, counterCommand, counterEvent]{}, incrementCommand{By: 1})
 	if err == nil {
 		t.Fatal("expected error")
 	}
 	if !errors.Is(err, es.ErrInvalidAggregate) {
 		t.Fatalf("expected ErrInvalidAggregate, got %v", err)
 	}
-	if got := err.Error(); got != "invalid aggregate: SaveLoaded requires a loaded aggregate handle created by this repository" {
+	if got := err.Error(); got != "invalid aggregate: Save requires a loaded aggregate handle created by this repository" {
 		t.Fatalf("error message = %q", got)
 	}
 }
 
-func TestRepository_SaveLoaded_rejectsHandleFromDifferentRepository(t *testing.T) {
+func TestRepository_Save_rejectsHandleFromDifferentRepository(t *testing.T) {
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 100
 
@@ -406,46 +432,52 @@ func TestRepository_SaveLoaded_rejectsHandleFromDifferentRepository(t *testing.T
 	repo2, _ := newCounterRepo(t, cfg)
 	id := counterID{value: "foreign"}
 
-	if _, err := repo1.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
+	seed, err := repo1.NewAggregate(context.Background(), id)
+	if err != nil {
+		t.Fatalf("NewAggregate: %v", err)
+	}
+	if _, err := repo1.Save(context.Background(), seed, incrementCommand{By: 1}); err != nil {
 		t.Fatalf("seed Save: %v", err)
 	}
 
-	loaded, err := repo1.LoadForCommand(context.Background(), id)
+	loaded, err := repo1.Load(context.Background(), id)
 	if err != nil {
-		t.Fatalf("LoadForCommand: %v", err)
+		t.Fatalf("Load: %v", err)
 	}
 
-	_, err = repo2.SaveLoaded(context.Background(), loaded, incrementCommand{By: 1})
+	_, err = repo2.Save(context.Background(), loaded, incrementCommand{By: 1})
 	if err == nil {
 		t.Fatal("expected error")
 	}
 	if !errors.Is(err, es.ErrInvalidAggregate) {
 		t.Fatalf("expected ErrInvalidAggregate, got %v", err)
 	}
-	if got := err.Error(); got != "invalid aggregate: SaveLoaded requires a loaded aggregate handle created by this repository" {
+	if got := err.Error(); got != "invalid aggregate: Save requires a loaded aggregate handle created by this repository" {
 		t.Fatalf("error message = %q", got)
 	}
 }
 
-func TestRepository_SaveLoaded_updatesSnapshotVersionAcrossBoundary(t *testing.T) {
+func TestRepository_Save_updatesSnapshotVersionAcrossBoundary(t *testing.T) {
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 2
 
 	repo, store := newCounterRepo(t, cfg)
 	id := counterID{value: "snapshot"}
 
-	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
-		t.Fatalf("seed Save: %v", err)
+	// seqNr=1 (no snapshot)
+	loaded, err := repo.NewAggregate(context.Background(), id)
+	if err != nil {
+		t.Fatalf("NewAggregate: %v", err)
+	}
+	loaded, err = repo.Save(context.Background(), loaded, incrementCommand{By: 1})
+	if err != nil {
+		t.Fatalf("first Save: %v", err)
 	}
 
-	loaded, err := repo.LoadForCommand(context.Background(), id)
+	// seqNr=2 → snapshot taken (version=1)
+	loaded, err = repo.Save(context.Background(), loaded, incrementCommand{By: 1})
 	if err != nil {
-		t.Fatalf("LoadForCommand after seed: %v", err)
-	}
-
-	loaded, err = repo.SaveLoaded(context.Background(), loaded, incrementCommand{By: 1})
-	if err != nil {
-		t.Fatalf("SaveLoaded at snapshot boundary: %v", err)
+		t.Fatalf("Save at snapshot boundary: %v", err)
 	}
 	if got := loaded.Aggregate().count; got != 2 {
 		t.Fatalf("count after snapshot boundary: got %d, want 2", got)
@@ -465,20 +497,22 @@ func TestRepository_SaveLoaded_updatesSnapshotVersionAcrossBoundary(t *testing.T
 		t.Fatalf("snapshot seqNr: got %d, want 2", snap.SeqNr)
 	}
 
-	loaded, err = repo.SaveLoaded(context.Background(), loaded, incrementCommand{By: 1})
+	// seqNr=3 (no snapshot)
+	loaded, err = repo.Save(context.Background(), loaded, incrementCommand{By: 1})
 	if err != nil {
-		t.Fatalf("SaveLoaded after first snapshot boundary: %v", err)
+		t.Fatalf("Save seqNr=3: %v", err)
 	}
 	if got := loaded.Aggregate().count; got != 3 {
-		t.Fatalf("count after seqNr=3: got %d, want 3", got)
+		t.Fatalf("count at seqNr=3: got %d, want 3", got)
 	}
 
-	loaded, err = repo.SaveLoaded(context.Background(), loaded, incrementCommand{By: 1})
+	// seqNr=4 → snapshot taken (version=2)
+	loaded, err = repo.Save(context.Background(), loaded, incrementCommand{By: 1})
 	if err != nil {
-		t.Fatalf("SaveLoaded at second snapshot boundary: %v", err)
+		t.Fatalf("Save at second snapshot boundary: %v", err)
 	}
 	if got := loaded.Aggregate().count; got != 4 {
-		t.Fatalf("count after seqNr=4: got %d, want 4", got)
+		t.Fatalf("count at seqNr=4: got %d, want 4", got)
 	}
 
 	snap, found, err = store.GetLatestSnapshot(context.Background(), id)
@@ -497,24 +531,10 @@ func TestRepository_SaveLoaded_updatesSnapshotVersionAcrossBoundary(t *testing.T
 
 	got, err := repo.Load(context.Background(), id)
 	if err != nil {
-		t.Fatalf("Load after SaveLoaded sequence: %v", err)
+		t.Fatalf("Load after Save sequence: %v", err)
 	}
-	if got.count != 4 {
-		t.Fatalf("loaded count after SaveLoaded sequence: got %d, want 4", got.count)
-	}
-}
-
-func TestRepository_LoadForCommand_notFound(t *testing.T) {
-	repo, _ := newCounterRepo(t, es.DefaultConfig())
-
-	_, err := repo.LoadForCommand(context.Background(), counterID{value: "missing"})
-	if err == nil {
-		t.Fatal("expected error")
-	}
-
-	var nf *es.AggregateNotFoundError
-	if !errors.As(err, &nf) {
-		t.Fatalf("expected AggregateNotFoundError, got %T", err)
+	if got.Aggregate().count != 4 {
+		t.Fatalf("loaded count after Save sequence: got %d, want 4", got.Aggregate().count)
 	}
 }
 
@@ -644,7 +664,7 @@ func blankTransitionCounter(id es.AggregateID) transitionCounterAggregate {
 	return safeTransitionCounterAggregate{id: counterID{value: id.Value()}}
 }
 
-func TestRepository_SaveLoaded_rejectsInvalidNextAggregateBeforePersist(t *testing.T) {
+func TestRepository_Save_rejectsInvalidNextAggregateBeforePersist(t *testing.T) {
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 100
 
@@ -652,16 +672,16 @@ func TestRepository_SaveLoaded_rejectsInvalidNextAggregateBeforePersist(t *testi
 	repo := es.NewRepository[transitionCounterAggregate, transitionCounterCommand, transitionCounterEvent](store, blankTransitionCounter, cfg)
 	id := counterID{value: "transition"}
 
-	if _, err := repo.Save(context.Background(), id, transitionIncrementCommand{By: 1}); err != nil {
+	loaded, err := repo.NewAggregate(context.Background(), id)
+	if err != nil {
+		t.Fatalf("NewAggregate: %v", err)
+	}
+	loaded, err = repo.Save(context.Background(), loaded, transitionIncrementCommand{By: 1})
+	if err != nil {
 		t.Fatalf("seed Save: %v", err)
 	}
 
-	loaded, err := repo.LoadForCommand(context.Background(), id)
-	if err != nil {
-		t.Fatalf("LoadForCommand: %v", err)
-	}
-
-	_, err = repo.SaveLoaded(context.Background(), loaded, transitionMakeUnsafeCommand{By: 2})
+	_, err = repo.Save(context.Background(), loaded, transitionMakeUnsafeCommand{By: 2})
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -669,25 +689,25 @@ func TestRepository_SaveLoaded_rejectsInvalidNextAggregateBeforePersist(t *testi
 		t.Fatalf("expected ErrInvalidAggregate, got %v", err)
 	}
 
-	stored, err := store.LoadStreamAfter(context.Background(), id, 0)
+	stored, err := store.GetEventsSince(context.Background(), id, 0)
 	if err != nil {
-		t.Fatalf("LoadStreamAfter: %v", err)
+		t.Fatalf("GetEventsSince: %v", err)
 	}
 	if len(stored) != 1 {
-		t.Fatalf("stored events after failed SaveLoaded: got %d, want 1", len(stored))
+		t.Fatalf("stored events after failed Save: got %d, want 1", len(stored))
 	}
 
 	got, err := repo.Load(context.Background(), id)
 	if err != nil {
-		t.Fatalf("Load after failed SaveLoaded: %v", err)
+		t.Fatalf("Load after failed Save: %v", err)
 	}
 
-	safe, ok := got.(safeTransitionCounterAggregate)
+	safe, ok := got.Aggregate().(safeTransitionCounterAggregate)
 	if !ok {
-		t.Fatalf("aggregate type after failed SaveLoaded: got %T, want safeTransitionCounterAggregate", got)
+		t.Fatalf("aggregate type after failed Save: got %T, want safeTransitionCounterAggregate", got.Aggregate())
 	}
 	if safe.count != 1 {
-		t.Fatalf("aggregate count after failed SaveLoaded: got %d, want 1", safe.count)
+		t.Fatalf("aggregate count after failed Save: got %d, want 1", safe.count)
 	}
 }
 
@@ -749,7 +769,9 @@ func blankUnsafeCounter(id es.AggregateID) unsafeCounterAggregate {
 	return unsafeCounterAggregate{id: counterID{value: id.Value()}}
 }
 
-func TestRepository_LoadForCommand_rejectsReferenceSemanticAggregate(t *testing.T) {
+// TestRepository_NewAggregate_rejectsReferenceSemanticAggregate verifies that
+// NewAggregate rejects aggregate types with reference semantics (slices, maps, etc.).
+func TestRepository_NewAggregate_rejectsReferenceSemanticAggregate(t *testing.T) {
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 100
 
@@ -757,11 +779,7 @@ func TestRepository_LoadForCommand_rejectsReferenceSemanticAggregate(t *testing.
 	repo := es.NewRepository[unsafeCounterAggregate, unsafeCounterCommand, unsafeCounterEvent](store, blankUnsafeCounter, cfg)
 	id := counterID{value: "unsafe"}
 
-	if _, err := repo.Save(context.Background(), id, unsafeIncrementCommand{By: 1}); err != nil {
-		t.Fatalf("seed Save: %v", err)
-	}
-
-	_, err := repo.LoadForCommand(context.Background(), id)
+	_, err := repo.NewAggregate(context.Background(), id)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -838,49 +856,55 @@ func blankTimedCounter(id es.AggregateID) timedCounterAggregate {
 	return timedCounterAggregate{id: counterID{value: id.Value()}}
 }
 
-func TestRepository_LoadForCommand_allowsTimeTimeAggregate(t *testing.T) {
+// TestRepository_NewAggregate_allowsTimeTimeAggregate verifies that aggregates
+// containing time.Time fields are accepted (time.Time is whitelisted).
+func TestRepository_NewAggregate_allowsTimeTimeAggregate(t *testing.T) {
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 100
 
-	repo, _ := func() (es.Repository[timedCounterAggregate, timedCounterCommand, timedCounterEvent], es.EventStore[timedCounterAggregate, timedCounterCommand, timedCounterEvent]) {
-		store := memory.New[timedCounterAggregate, timedCounterCommand, timedCounterEvent]()
-		return es.NewRepository[timedCounterAggregate, timedCounterCommand, timedCounterEvent](store, blankTimedCounter, cfg), store
-	}()
+	store := memory.New[timedCounterAggregate, timedCounterCommand, timedCounterEvent]()
+	repo := es.NewRepository[timedCounterAggregate, timedCounterCommand, timedCounterEvent](store, blankTimedCounter, cfg)
 	id := counterID{value: "timed"}
 	firstAt := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
 	secondAt := firstAt.Add(2 * time.Hour)
 
-	if _, err := repo.Save(context.Background(), id, stampTimedCounterCommand{At: firstAt}); err != nil {
-		t.Fatalf("seed Save: %v", err)
-	}
-
-	loaded, err := repo.LoadForCommand(context.Background(), id)
+	loaded, err := repo.NewAggregate(context.Background(), id)
 	if err != nil {
-		t.Fatalf("LoadForCommand: %v", err)
+		t.Fatalf("NewAggregate: %v", err)
+	}
+	loaded, err = repo.Save(context.Background(), loaded, stampTimedCounterCommand{At: firstAt})
+	if err != nil {
+		t.Fatalf("first Save: %v", err)
 	}
 	if got := loaded.Aggregate(); !got.updatedAt.Equal(firstAt) {
-		t.Fatalf("loaded updatedAt: got %v, want %v", got.updatedAt, firstAt)
+		t.Fatalf("updatedAt after first Save: got %v, want %v", got.updatedAt, firstAt)
 	}
 
-	next, err := repo.SaveLoaded(context.Background(), loaded, stampTimedCounterCommand{At: secondAt})
+	next, err := repo.Save(context.Background(), loaded, stampTimedCounterCommand{At: secondAt})
 	if err != nil {
-		t.Fatalf("SaveLoaded: %v", err)
+		t.Fatalf("second Save: %v", err)
 	}
 	if got := next.Aggregate(); !got.updatedAt.Equal(secondAt) || got.updates != 2 {
 		t.Fatalf("next aggregate: got updatedAt=%v updates=%d, want updatedAt=%v updates=2", got.updatedAt, got.updates, secondAt)
 	}
 }
 
-func TestRepository_LoadAfterSave_replaysCorrectly(t *testing.T) {
+func TestRepository_LoadAfterSaves_replaysCorrectly(t *testing.T) {
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 100
 	repo, _ := newCounterRepo(t, cfg)
 	id := counterID{value: "3"}
 
-	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 7}); err != nil {
+	loaded, err := repo.NewAggregate(context.Background(), id)
+	if err != nil {
+		t.Fatalf("NewAggregate: %v", err)
+	}
+	loaded, err = repo.Save(context.Background(), loaded, incrementCommand{By: 7})
+	if err != nil {
 		t.Fatalf("Save 1: %v", err)
 	}
-	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 3}); err != nil {
+	loaded, err = repo.Save(context.Background(), loaded, incrementCommand{By: 3})
+	if err != nil {
 		t.Fatalf("Save 2: %v", err)
 	}
 
@@ -888,8 +912,8 @@ func TestRepository_LoadAfterSave_replaysCorrectly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got.count != 10 {
-		t.Errorf("count: got %d, want 10", got.count)
+	if got.Aggregate().count != 10 {
+		t.Errorf("count: got %d, want 10", got.Aggregate().count)
 	}
 }
 
@@ -899,8 +923,13 @@ func TestRepository_Save_triggersSnapshot(t *testing.T) {
 	repo, store := newCounterRepo(t, cfg)
 	id := counterID{value: "snap"}
 
+	loaded, err := repo.NewAggregate(context.Background(), id)
+	if err != nil {
+		t.Fatalf("NewAggregate: %v", err)
+	}
 	for i := 0; i < 3; i++ {
-		if _, err := repo.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
+		loaded, err = repo.Save(context.Background(), loaded, incrementCommand{By: 1})
+		if err != nil {
 			t.Fatalf("Save %d: %v", i, err)
 		}
 	}
@@ -923,8 +952,13 @@ func TestRepository_LoadAfterSnapshot_usesSnapshot(t *testing.T) {
 	repo, _ := newCounterRepo(t, cfg)
 	id := counterID{value: "snapload"}
 
+	loaded, err := repo.NewAggregate(context.Background(), id)
+	if err != nil {
+		t.Fatalf("NewAggregate: %v", err)
+	}
 	for i := 0; i < 4; i++ {
-		if _, err := repo.Save(context.Background(), id, incrementCommand{By: 2}); err != nil {
+		loaded, err = repo.Save(context.Background(), loaded, incrementCommand{By: 2})
+		if err != nil {
 			t.Fatalf("Save %d: %v", i, err)
 		}
 	}
@@ -933,8 +967,8 @@ func TestRepository_LoadAfterSnapshot_usesSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got.count != 8 {
-		t.Errorf("count: got %d, want 8", got.count)
+	if got.Aggregate().count != 8 {
+		t.Errorf("count: got %d, want 8", got.Aggregate().count)
 	}
 }
 
@@ -961,7 +995,11 @@ func TestRepository_Save_propagatesOptimisticLockError(t *testing.T) {
 	}
 	repo := es.NewRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
 
-	_, err := repo.Save(context.Background(), counterID{value: "lock"}, incrementCommand{By: 1})
+	loaded, err := repo.NewAggregate(context.Background(), counterID{value: "lock"})
+	if err != nil {
+		t.Fatalf("NewAggregate: %v", err)
+	}
+	_, err = repo.Save(context.Background(), loaded, incrementCommand{By: 1})
 	if err == nil {
 		t.Fatal("want error, got nil")
 	}
@@ -977,7 +1015,11 @@ func (unknownCmd) isCounterCommand()       {}
 
 func TestRepository_Save_propagatesApplyCommandError(t *testing.T) {
 	repo, _ := newCounterRepo(t, es.DefaultConfig())
-	_, err := repo.Save(context.Background(), counterID{value: "err"}, unknownCmd{})
+	loaded, err := repo.NewAggregate(context.Background(), counterID{value: "err"})
+	if err != nil {
+		t.Fatalf("NewAggregate: %v", err)
+	}
+	_, err = repo.Save(context.Background(), loaded, unknownCmd{})
 	if err == nil {
 		t.Fatal("want error, got nil")
 	}

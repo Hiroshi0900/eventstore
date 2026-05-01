@@ -79,11 +79,11 @@ func TestStore_GetLatestSnapshot_empty(t *testing.T) {
 	}
 }
 
-func TestStore_LoadStreamAfter_empty(t *testing.T) {
+func TestStore_GetEventsSince_empty(t *testing.T) {
 	s := New[stubAggregate, stubCommand, stubEvent]()
 	id := memoryTestAggID{"Visit", "x"}
 
-	events, err := s.LoadStreamAfter(context.Background(), id, 0)
+	events, err := s.GetEventsSince(context.Background(), id, 0)
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -100,16 +100,16 @@ func TestStore_PersistEvent_persistsAndQueryable(t *testing.T) {
 		t.Fatalf("PersistEvent: %v", err)
 	}
 
-	got, err := s.LoadStreamAfter(context.Background(), id, 0)
+	got, err := s.GetEventsSince(context.Background(), id, 0)
 	if err != nil {
-		t.Fatalf("LoadStreamAfter: %v", err)
+		t.Fatalf("GetEventsSince: %v", err)
 	}
 	if len(got) != 1 || got[0].SeqNr != 1 {
 		t.Errorf("got %+v, want 1 event with SeqNr=1", got)
 	}
 }
 
-func TestStore_LoadStreamAfter_excludesBoundarySeqNr(t *testing.T) {
+func TestStore_GetEventsSince_excludesBoundarySeqNr(t *testing.T) {
 	s := New[stubAggregate, stubCommand, stubEvent]()
 	id := memoryTestAggID{"Visit", "boundary"}
 
@@ -120,16 +120,16 @@ func TestStore_LoadStreamAfter_excludesBoundarySeqNr(t *testing.T) {
 		t.Fatalf("PersistEvent 2: %v", err)
 	}
 
-	got, err := s.LoadStreamAfter(context.Background(), id, 1)
+	got, err := s.GetEventsSince(context.Background(), id, 1)
 	if err != nil {
-		t.Fatalf("LoadStreamAfter: %v", err)
+		t.Fatalf("GetEventsSince: %v", err)
 	}
 	if len(got) != 1 || got[0].SeqNr != 2 {
 		t.Fatalf("got %+v, want only SeqNr=2", got)
 	}
 }
 
-func TestStore_LoadStreamAfter_returnsRemainingEventsInExpectedOrder(t *testing.T) {
+func TestStore_GetEventsSince_returnsRemainingEventsInExpectedOrder(t *testing.T) {
 	s := &store[stubAggregate, stubCommand, stubEvent]{
 		events: map[string][]es.StoredEvent[stubEvent]{},
 	}
@@ -140,9 +140,9 @@ func TestStore_LoadStreamAfter_returnsRemainingEventsInExpectedOrder(t *testing.
 		newStored(id, 2, false),
 	}
 
-	got, err := s.LoadStreamAfter(context.Background(), id, 1)
+	got, err := s.GetEventsSince(context.Background(), id, 1)
 	if err != nil {
-		t.Fatalf("LoadStreamAfter: %v", err)
+		t.Fatalf("GetEventsSince: %v", err)
 	}
 	if len(got) != 2 {
 		t.Fatalf("len = %d, want 2", len(got))
