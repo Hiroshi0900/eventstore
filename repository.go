@@ -154,7 +154,19 @@ func invalidLoadedAggregateTypeReason(typ reflect.Type, path string) string {
 
 	switch typ.Kind() {
 	case reflect.Pointer:
-		return fmt.Sprintf("%s uses pointer type %s", path, typ)
+		// Optional fields represented as pointers to basic/named types (e.g. *string, *int,
+		// *MyStringType) are copy-safe and common in Go domain models.
+		// Reject only pointers whose element type would itself fail the check.
+		elemKind := typ.Elem().Kind()
+		switch elemKind {
+		case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Func,
+			reflect.Chan, reflect.Interface, reflect.UnsafePointer:
+			return fmt.Sprintf("%s uses pointer type %s", path, typ)
+		case reflect.Struct:
+			return invalidLoadedAggregateTypeReason(typ.Elem(), path)
+		}
+		// pointer to basic or named-basic kind: allowed
+		return ""
 	case reflect.Map:
 		return fmt.Sprintf("%s uses map type %s", path, typ)
 	case reflect.Slice:
