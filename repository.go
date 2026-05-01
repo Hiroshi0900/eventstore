@@ -33,12 +33,6 @@ type Repository[A Aggregate[C, E], C Command, E Event] interface {
 	// で適用してイベントを生成、ApplyEvent で次状態に遷移後、永続化して新状態を返す。
 	// SnapshotInterval に達した seqNr では snapshot も同時に書く。
 	Save(ctx context.Context, aggID AggregateID, cmd C) (A, error)
-}
-
-// CommandRepository は repeated command handling 向けの最適化 API を含む。
-// LoadedAggregate を返す API は値セマンティクスを持つ aggregate に限定される。
-type CommandRepository[A Aggregate[C, E], C Command, E Event] interface {
-	Repository[A, C, E]
 
 	// LoadForCommand は command 側の連続 Save 向けに aggregate と永続化文脈を返す。
 	LoadForCommand(ctx context.Context, aggID AggregateID) (LoadedAggregate[A, C, E], error)
@@ -68,20 +62,6 @@ func NewRepository[A Aggregate[C, E], C Command, E Event](
 	createBlank func(AggregateID) A,
 	config Config,
 ) Repository[A, C, E] {
-	return &defaultRepository[A, C, E]{
-		store:       store,
-		createBlank: createBlank,
-		config:      config,
-	}
-}
-
-// NewCommandRepository は CommandRepository[A, C, E] を生成する。
-// 実装は NewRepository と同じ defaultRepository を利用する。
-func NewCommandRepository[A Aggregate[C, E], C Command, E Event](
-	store EventStore[A, C, E],
-	createBlank func(AggregateID) A,
-	config Config,
-) CommandRepository[A, C, E] {
 	return &defaultRepository[A, C, E]{
 		store:       store,
 		createBlank: createBlank,

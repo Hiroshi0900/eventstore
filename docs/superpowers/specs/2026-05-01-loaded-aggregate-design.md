@@ -14,19 +14,12 @@ Adopt the following design direction:
 type Repository[A Aggregate[C, E], C Command, E Event] interface {
     Load(ctx context.Context, aggID AggregateID) (A, error)
     Save(ctx context.Context, aggID AggregateID, cmd C) (A, error)
-}
-
-type CommandRepository[A Aggregate[C, E], C Command, E Event] interface {
-    Repository[A, C, E]
-
     LoadForCommand(ctx context.Context, aggID AggregateID) (LoadedAggregate[A, C, E], error)
     SaveLoaded(ctx context.Context, loaded LoadedAggregate[A, C, E], cmd C) (LoadedAggregate[A, C, E], error)
 }
 ```
 
 `LoadedAggregate` is a public wrapper type used only for this advanced path. It exposes the current aggregate state through an accessor, but keeps revision and replay metadata opaque.
-
-`NewRepository(...)` remains the backward-compatible standard entry point. `NewCommandRepository(...)` returns the same underlying implementation behind a wider interface for callers that explicitly opt into the advanced path.
 
 ## Problem Statement
 
@@ -100,13 +93,11 @@ The new advanced path behaves similarly, but uses the loaded handle as its recon
 
 Application code is still expected to wrap this type inside an infrastructure-facing repository or command session abstraction if it wants to keep eventstore-specific concepts out of use-case code.
 
-## Why a Separate Interface
+## Why on `Repository`
 
-The advanced path must not change the shape of the existing `Repository` interface because that would be a source-breaking change for current users.
+The advanced path still belongs to the repository abstraction. Splitting it into two public interfaces makes the shape of the API harder to explain because the advanced interface is mostly a superset of the standard one.
 
-`CommandRepository` keeps the standard path small and backward compatible while still allowing the same `defaultRepository` implementation to expose the optimization for callers that explicitly opt in.
-
-The important boundary remains that raw persistence metadata stays opaque. Splitting the interface simply makes that opt-in explicit at the public API level.
+This design therefore keeps the simpler conceptual model and accepts the source-breaking API change.
 
 ## Backend Position
 
@@ -136,10 +127,6 @@ This would help performance, but it pushes storage concerns into application cod
 
 This would make the simple standard path harder to use and would overfit the public API to optimization-oriented flows.
 
-### Put the advanced methods directly on `Repository`
-
-Rejected because it breaks backward compatibility for existing implementations and mocks that satisfy `Repository`.
-
 ### Return the emitted domain event from `SaveLoaded`
 
 This broadens the purpose of the API. The main requirement is to continue a loaded command flow, so returning the next handle is enough for the first version.
@@ -149,8 +136,7 @@ This broadens the purpose of the API. The main requirement is to continue a load
 In scope:
 
 - add `LoadedAggregate`
-- add `CommandRepository` plus `NewCommandRepository`
-- keep `Repository` limited to `Load` and `Save`
+- add `LoadForCommand` and `SaveLoaded` to `Repository`
 - update repository implementation to track and refresh opaque revision context
 - validate that the loaded-handle API only accepts value-semantic aggregate shapes
 - add tests for repeated command handling without a second replay roundtrip
@@ -189,7 +175,7 @@ If real usage reveals that `LoadedAggregate` is confusing in application-level c
 
 ## Rollout Notes
 
-- treat this as an additive public API change
+- treat this as a breaking public API change
 - keep `Load` / `Save` documented as the standard path
-- describe `CommandRepository.LoadForCommand` / `CommandRepository.SaveLoaded` as an explicit optimization path for repeated command handling
+- describe `Repository.LoadForCommand` / `Repository.SaveLoaded` as an explicit optimization path for repeated command handling
 - document the value-semantic restriction anywhere the advanced flow is shown

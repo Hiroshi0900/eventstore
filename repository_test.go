@@ -95,13 +95,6 @@ func newCounterRepo(t *testing.T, cfg es.Config) (es.Repository[counterAggregate
 	return repo, store
 }
 
-func newCounterCommandRepo(t *testing.T, cfg es.Config) (es.CommandRepository[counterAggregate, counterCommand, counterEvent], es.EventStore[counterAggregate, counterCommand, counterEvent]) {
-	t.Helper()
-	store := memory.New[counterAggregate, counterCommand, counterEvent]()
-	repo := es.NewCommandRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
-	return repo, store
-}
-
 // === replay witness contract fixture (test-only, isolated from counter fixture) ===
 
 type witnessCounterEvent interface {
@@ -282,13 +275,6 @@ func TestRepository_Construct(t *testing.T) {
 	}
 }
 
-func TestCommandRepository_Construct(t *testing.T) {
-	repo, _ := newCounterCommandRepo(t, es.DefaultConfig())
-	if repo == nil {
-		t.Fatal("expected non-nil CommandRepository")
-	}
-}
-
 func TestRepository_Load_notFound(t *testing.T) {
 	repo, _ := newCounterRepo(t, es.DefaultConfig())
 	_, err := repo.Load(context.Background(), counterID{value: "missing"})
@@ -355,13 +341,13 @@ func TestRepository_Save_subsequentEvent(t *testing.T) {
 	}
 }
 
-func TestCommandRepository_SaveLoaded_reusesLoadedContextWithoutReplay(t *testing.T) {
+func TestRepository_SaveLoaded_reusesLoadedContextWithoutReplay(t *testing.T) {
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 100
 
 	base := memory.New[counterAggregate, counterCommand, counterEvent]()
 	store := newCountingStore(base)
-	repo := es.NewCommandRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
+	repo := es.NewRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
 	id := counterID{value: "loaded"}
 
 	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
@@ -397,8 +383,8 @@ func TestCommandRepository_SaveLoaded_reusesLoadedContextWithoutReplay(t *testin
 	}
 }
 
-func TestCommandRepository_SaveLoaded_rejectsZeroValueLoadedAggregate(t *testing.T) {
-	repo, _ := newCounterCommandRepo(t, es.DefaultConfig())
+func TestRepository_SaveLoaded_rejectsZeroValueLoadedAggregate(t *testing.T) {
+	repo, _ := newCounterRepo(t, es.DefaultConfig())
 
 	_, err := repo.SaveLoaded(context.Background(), es.LoadedAggregate[counterAggregate, counterCommand, counterEvent]{}, incrementCommand{By: 1})
 	if err == nil {
@@ -412,12 +398,12 @@ func TestCommandRepository_SaveLoaded_rejectsZeroValueLoadedAggregate(t *testing
 	}
 }
 
-func TestCommandRepository_SaveLoaded_rejectsHandleFromDifferentRepository(t *testing.T) {
+func TestRepository_SaveLoaded_rejectsHandleFromDifferentRepository(t *testing.T) {
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 100
 
-	repo1, _ := newCounterCommandRepo(t, cfg)
-	repo2, _ := newCounterCommandRepo(t, cfg)
+	repo1, _ := newCounterRepo(t, cfg)
+	repo2, _ := newCounterRepo(t, cfg)
 	id := counterID{value: "foreign"}
 
 	if _, err := repo1.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
@@ -441,11 +427,11 @@ func TestCommandRepository_SaveLoaded_rejectsHandleFromDifferentRepository(t *te
 	}
 }
 
-func TestCommandRepository_SaveLoaded_updatesSnapshotVersionAcrossBoundary(t *testing.T) {
+func TestRepository_SaveLoaded_updatesSnapshotVersionAcrossBoundary(t *testing.T) {
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 2
 
-	repo, store := newCounterCommandRepo(t, cfg)
+	repo, store := newCounterRepo(t, cfg)
 	id := counterID{value: "snapshot"}
 
 	if _, err := repo.Save(context.Background(), id, incrementCommand{By: 1}); err != nil {
@@ -518,8 +504,8 @@ func TestCommandRepository_SaveLoaded_updatesSnapshotVersionAcrossBoundary(t *te
 	}
 }
 
-func TestCommandRepository_LoadForCommand_notFound(t *testing.T) {
-	repo, _ := newCounterCommandRepo(t, es.DefaultConfig())
+func TestRepository_LoadForCommand_notFound(t *testing.T) {
+	repo, _ := newCounterRepo(t, es.DefaultConfig())
 
 	_, err := repo.LoadForCommand(context.Background(), counterID{value: "missing"})
 	if err == nil {
@@ -658,12 +644,12 @@ func blankTransitionCounter(id es.AggregateID) transitionCounterAggregate {
 	return safeTransitionCounterAggregate{id: counterID{value: id.Value()}}
 }
 
-func TestCommandRepository_SaveLoaded_rejectsInvalidNextAggregateBeforePersist(t *testing.T) {
+func TestRepository_SaveLoaded_rejectsInvalidNextAggregateBeforePersist(t *testing.T) {
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 100
 
 	store := memory.New[transitionCounterAggregate, transitionCounterCommand, transitionCounterEvent]()
-	repo := es.NewCommandRepository[transitionCounterAggregate, transitionCounterCommand, transitionCounterEvent](store, blankTransitionCounter, cfg)
+	repo := es.NewRepository[transitionCounterAggregate, transitionCounterCommand, transitionCounterEvent](store, blankTransitionCounter, cfg)
 	id := counterID{value: "transition"}
 
 	if _, err := repo.Save(context.Background(), id, transitionIncrementCommand{By: 1}); err != nil {
@@ -763,12 +749,12 @@ func blankUnsafeCounter(id es.AggregateID) unsafeCounterAggregate {
 	return unsafeCounterAggregate{id: counterID{value: id.Value()}}
 }
 
-func TestCommandRepository_LoadForCommand_rejectsReferenceSemanticAggregate(t *testing.T) {
+func TestRepository_LoadForCommand_rejectsReferenceSemanticAggregate(t *testing.T) {
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 100
 
 	store := memory.New[unsafeCounterAggregate, unsafeCounterCommand, unsafeCounterEvent]()
-	repo := es.NewCommandRepository[unsafeCounterAggregate, unsafeCounterCommand, unsafeCounterEvent](store, blankUnsafeCounter, cfg)
+	repo := es.NewRepository[unsafeCounterAggregate, unsafeCounterCommand, unsafeCounterEvent](store, blankUnsafeCounter, cfg)
 	id := counterID{value: "unsafe"}
 
 	if _, err := repo.Save(context.Background(), id, unsafeIncrementCommand{By: 1}); err != nil {
@@ -852,13 +838,13 @@ func blankTimedCounter(id es.AggregateID) timedCounterAggregate {
 	return timedCounterAggregate{id: counterID{value: id.Value()}}
 }
 
-func TestCommandRepository_LoadForCommand_allowsTimeTimeAggregate(t *testing.T) {
+func TestRepository_LoadForCommand_allowsTimeTimeAggregate(t *testing.T) {
 	cfg := es.DefaultConfig()
 	cfg.SnapshotInterval = 100
 
-	repo, _ := func() (es.CommandRepository[timedCounterAggregate, timedCounterCommand, timedCounterEvent], es.EventStore[timedCounterAggregate, timedCounterCommand, timedCounterEvent]) {
+	repo, _ := func() (es.Repository[timedCounterAggregate, timedCounterCommand, timedCounterEvent], es.EventStore[timedCounterAggregate, timedCounterCommand, timedCounterEvent]) {
 		store := memory.New[timedCounterAggregate, timedCounterCommand, timedCounterEvent]()
-		return es.NewCommandRepository[timedCounterAggregate, timedCounterCommand, timedCounterEvent](store, blankTimedCounter, cfg), store
+		return es.NewRepository[timedCounterAggregate, timedCounterCommand, timedCounterEvent](store, blankTimedCounter, cfg), store
 	}()
 	id := counterID{value: "timed"}
 	firstAt := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)

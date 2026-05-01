@@ -2,15 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a `LoadedAggregate`-based advanced command repository API that avoids replaying the same aggregate between repeated command-side saves while preserving the existing `Repository.Load` / `Repository.Save` behavior and interface shape.
+**Goal:** Add a `LoadedAggregate`-based advanced repository API that avoids replaying the same aggregate between repeated command-side saves while preserving the existing `Repository.Load` / `Repository.Save` behavior.
 
-**Architecture:** Keep `Repository` limited to `Load` / `Save`, add a separate `CommandRepository` that embeds it and exposes `LoadForCommand` / `SaveLoaded`, introduce a public `LoadedAggregate` wrapper with opaque revision fields and an `Aggregate()` accessor, and refactor repository persistence logic so the standard and advanced paths share one command-application and persistence flow. The loaded-handle API must reject non-value-semantic aggregate shapes at runtime. Prove the new path with repository-level tests that detect redundant `LoadStreamAfter` calls and preserve snapshot/optimistic-lock semantics.
+**Architecture:** Extend `Repository` with `LoadForCommand` / `SaveLoaded`, introduce a public `LoadedAggregate` wrapper with opaque revision fields and an `Aggregate()` accessor, and refactor repository persistence logic so the standard and advanced paths share one command-application and persistence flow. The loaded-handle API must reject non-value-semantic aggregate shapes at runtime. Prove the new path with repository-level tests that detect redundant `LoadStreamAfter` calls and preserve snapshot/optimistic-lock semantics.
 
 **Tech Stack:** Go, generics, standard `testing` package, existing memory store and repository fixtures
 
 ---
-
-> **Implementation note:** This plan was written before the final compatibility correction. Any step below that says "extend `Repository`" or uses `NewRepository(...)` for the loaded flow should be read as "add/use `CommandRepository` via `NewCommandRepository(...)`". The implemented API keeps `Repository` unchanged and applies the loaded-handle API only to value-semantic aggregate shapes.
 
 ### Task 1: Add failing tests for the loaded-aggregate flow
 
@@ -48,13 +46,13 @@ func (s *countingStore) LoadStreamAfter(
 Append this test to `repository_test.go` after the existing `Save`-path tests:
 
 ```go
-func TestCommandRepository_SaveLoaded_reusesLoadedContextWithoutReplay(t *testing.T) {
+func TestRepository_SaveLoaded_reusesLoadedContextWithoutReplay(t *testing.T) {
     cfg := es.DefaultConfig()
     cfg.SnapshotInterval = 100
 
     base := memory.New[counterAggregate, counterCommand, counterEvent]()
     store := newCountingStore(base)
-    repo := es.NewCommandRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
+    repo := es.NewRepository[counterAggregate, counterCommand, counterEvent](store, blankCounter, cfg)
     id := counterID{value: "loaded"}
 
     loaded, err := repo.LoadForCommand(context.Background(), id)
@@ -90,7 +88,7 @@ func TestCommandRepository_SaveLoaded_reusesLoadedContextWithoutReplay(t *testin
 Append this test immediately after the previous one:
 
 ```go
-func TestCommandRepository_LoadForCommand_notFound(t *testing.T) {
+func TestRepository_LoadForCommand_notFound(t *testing.T) {
     repo, _ := newCounterCommandRepo(t, es.DefaultConfig())
 
     _, err := repo.LoadForCommand(context.Background(), counterID{value: "missing"})
@@ -110,10 +108,10 @@ func TestCommandRepository_LoadForCommand_notFound(t *testing.T) {
 Run:
 
 ```sh
-go test ./... -run 'TestCommandRepository_(SaveLoaded_reusesLoadedContextWithoutReplay|LoadForCommand_notFound)$'
+go test ./... -run 'TestRepository_(SaveLoaded_reusesLoadedContextWithoutReplay|LoadForCommand_notFound)$'
 ```
 
-Expected: compile failure because `CommandRepository` / `NewCommandRepository` and `LoadedAggregate` do not yet exist.
+Expected: compile failure because `Repository` does not yet expose `LoadForCommand` / `SaveLoaded`, and `LoadedAggregate` does not yet exist.
 
 - [ ] **Step 5: Commit the failing tests**
 
@@ -145,7 +143,7 @@ func (l LoadedAggregate[A, C, E]) Aggregate() A {
 }
 ```
 
-Then add `CommandRepository` with:
+Then add `Repository` with:
 
 ```go
 LoadForCommand(ctx context.Context, aggID AggregateID) (LoadedAggregate[A, C, E], error)
@@ -299,7 +297,7 @@ git commit -m "feat: add loaded aggregate repository API"
 Append this test to `repository_test.go`:
 
 ```go
-func TestCommandRepository_SaveLoaded_updatesSnapshotVersionAcrossBoundary(t *testing.T) {
+func TestRepository_SaveLoaded_updatesSnapshotVersionAcrossBoundary(t *testing.T) {
     cfg := es.DefaultConfig()
     cfg.SnapshotInterval = 2
 
@@ -349,7 +347,7 @@ func TestCommandRepository_SaveLoaded_updatesSnapshotVersionAcrossBoundary(t *te
 Add one overview bullet and one short usage example like this:
 
 ```md
-- `CommandRepository.LoadForCommand` / `CommandRepository.SaveLoaded` は、同一 aggregate に複数 command を続けて適用する時の最適化経路
+- `Repository.LoadForCommand` / `Repository.SaveLoaded` は、同一 aggregate に複数 command を続けて適用する時の最適化経路
 ```
 
 ```go
