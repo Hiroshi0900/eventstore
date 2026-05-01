@@ -611,7 +611,7 @@ func (a safeTransitionCounterAggregate) ApplyEvent(
 	if e.MakeUnsafe {
 		return unsafeTransitionCounterAggregate{
 			id:      a.id,
-			history: []int{a.count, a.count + e.By},
+			history: []map[string]int{{"val": a.count}, {"val": a.count + e.By}},
 		}
 	}
 	return safeTransitionCounterAggregate{
@@ -624,7 +624,7 @@ func (safeTransitionCounterAggregate) isTransitionCounterAggregate() {}
 
 type unsafeTransitionCounterAggregate struct {
 	id      counterID
-	history []int
+	history []map[string]int // map slice: unsafe element type, kept for rejection test
 }
 
 func (a unsafeTransitionCounterAggregate) AggregateID() es.AggregateID { return a.id }
@@ -650,8 +650,8 @@ func (a unsafeTransitionCounterAggregate) ApplyEvent(
 		return a
 	}
 
-	history := append([]int(nil), a.history...)
-	history = append(history, e.By)
+	history := append([]map[string]int(nil), a.history...)
+	history = append(history, map[string]int{"by": e.By})
 	return unsafeTransitionCounterAggregate{id: a.id, history: history}
 }
 
@@ -739,7 +739,7 @@ func (unsafeIncrementCommand) isUnsafeCounterCommand() {}
 
 type unsafeCounterAggregate struct {
 	id      counterID
-	history []int
+	history []map[string]int // map slice: unsafe element type, kept for rejection test
 }
 
 func (a unsafeCounterAggregate) AggregateID() es.AggregateID { return a.id }
@@ -755,8 +755,9 @@ func (a unsafeCounterAggregate) ApplyCommand(cmd unsafeCounterCommand) (unsafeCo
 
 func (a unsafeCounterAggregate) ApplyEvent(ev unsafeCounterEvent) es.Aggregate[unsafeCounterCommand, unsafeCounterEvent] {
 	if e, ok := ev.(unsafeCounterIncrementedEvent); ok {
-		history := append([]int(nil), a.history...)
-		history = append(history, e.By)
+		entry := map[string]int{"by": e.By}
+		history := append([]map[string]int(nil), a.history...)
+		history = append(history, entry)
 		return unsafeCounterAggregate{id: a.id, history: history}
 	}
 	return a

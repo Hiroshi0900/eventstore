@@ -170,7 +170,13 @@ func invalidLoadedAggregateTypeReason(typ reflect.Type, path string) string {
 	case reflect.Map:
 		return fmt.Sprintf("%s uses map type %s", path, typ)
 	case reflect.Slice:
-		return fmt.Sprintf("%s uses slice type %s", path, typ)
+		// Allow slices whose element type is itself copy-safe (e.g. []string, []uint8,
+		// []MyValueType). Reject slices whose elements contain reference types
+		// (e.g. []*T, []map[K]V, [][]T) since those would be unsafe to copy.
+		if reason := invalidLoadedAggregateTypeReason(typ.Elem(), path+"[]"); reason != "" {
+			return fmt.Sprintf("%s uses slice type %s", path, typ)
+		}
+		return ""
 	case reflect.Func:
 		return fmt.Sprintf("%s uses func type %s", path, typ)
 	case reflect.Chan:
