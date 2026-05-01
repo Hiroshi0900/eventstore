@@ -133,7 +133,7 @@ func TestNewWithTables_Construct(t *testing.T) {
 	}
 }
 
-func TestLoadStreamAfter_UsesPrimaryTableConsistentRead(t *testing.T) {
+func TestGetEventsSince_UsesGSI(t *testing.T) {
 	client := &capturingClient{}
 	store := v2dynamo.New[ddbStubAggregate, ddbStubCommand, ddbStubEvent](
 		client,
@@ -142,35 +142,21 @@ func TestLoadStreamAfter_UsesPrimaryTableConsistentRead(t *testing.T) {
 		ddbStubEvSer{},
 	)
 
-	_, err := store.LoadStreamAfter(context.Background(), ddbTestAggID{value: "1"}, 0)
+	_, err := store.GetEventsSince(context.Background(), ddbTestAggID{value: "1"}, 0)
 	if err != nil {
-		t.Fatalf("LoadStreamAfter: %v", err)
+		t.Fatalf("GetEventsSince: %v", err)
 	}
 	if client.lastQuery == nil {
 		t.Fatal("expected Query call")
 	}
-	if client.lastQuery.IndexName != nil {
-		t.Fatalf("IndexName = %q, want nil", aws.ToString(client.lastQuery.IndexName))
+	if got := aws.ToString(client.lastQuery.IndexName); got != "journal-aid-index" {
+		t.Fatalf("IndexName = %q, want %q", got, "journal-aid-index")
 	}
-	if client.lastQuery.ConsistentRead == nil || !aws.ToBool(client.lastQuery.ConsistentRead) {
-		t.Fatal("ConsistentRead = false, want true")
+	if aws.ToBool(client.lastQuery.ConsistentRead) {
+		t.Fatal("ConsistentRead = true, want false (GSI does not support strong consistency)")
 	}
-	if got := aws.ToString(client.lastQuery.KeyConditionExpression); got != "#pk = :pk AND #sk > :sk" {
-		t.Fatalf("KeyConditionExpression = %q, want primary-table lower-bound query", got)
-	}
-	if got := aws.ToString(client.lastQuery.FilterExpression); got != "#aid = :aid" {
-		t.Fatalf("FilterExpression = %q, want exact aggregate filter", got)
-	}
-	from, ok := client.lastQuery.ExpressionAttributeValues[":sk"]
-	if !ok {
-		t.Fatal("expected :sk attribute value")
-	}
-	fromS, ok := from.(*awsdynamotypes.AttributeValueMemberS)
-	if !ok {
-		t.Fatalf(":sk type = %T, want string", from)
-	}
-	if fromS.Value != "T-1-00000000000000000000" {
-		t.Fatalf(":sk = %q, want %q", fromS.Value, "T-1-00000000000000000000")
+	if got := aws.ToString(client.lastQuery.KeyConditionExpression); got != "#aid = :aid AND #seq_nr > :seqNr" {
+		t.Fatalf("KeyConditionExpression = %q, want GSI key condition", got)
 	}
 	aid, ok := client.lastQuery.ExpressionAttributeValues[":aid"]
 	if !ok {
@@ -183,16 +169,27 @@ func TestLoadStreamAfter_UsesPrimaryTableConsistentRead(t *testing.T) {
 	if aidS.Value != "T-1" {
 		t.Fatalf(":aid = %q, want %q", aidS.Value, "T-1")
 	}
+	seqNrVal, ok := client.lastQuery.ExpressionAttributeValues[":seqNr"]
+	if !ok {
+		t.Fatal("expected :seqNr attribute value")
+	}
+	seqNrN, ok := seqNrVal.(*awsdynamotypes.AttributeValueMemberN)
+	if !ok {
+		t.Fatalf(":seqNr type = %T, want number", seqNrVal)
+	}
+	if seqNrN.Value != "0" {
+		t.Fatalf(":seqNr = %q, want %q", seqNrN.Value, "0")
+	}
 }
 
-func TestLoadStreamAfter_UsesSeqNrAsLowerBound(t *testing.T) {
+func TestGetEventsSince_UsesSeqNrAsLowerBound(t *testing.T) {
 	tests := []struct {
-		name     string
-		seqNr    uint64
-		wantSk   string
+		name        string
+		seqNr       uint64
+		wantSeqNrN  string
 	}{
-		{name: "seq0", seqNr: 0, wantSk: "T-1-00000000000000000000"},
-		{name: "seq1", seqNr: 1, wantSk: "T-1-00000000000000000001"},
+		{name: "seq0", seqNr: 0, wantSeqNrN: "0"},
+		{name: "seq5", seqNr: 5, wantSeqNrN: "5"},
 	}
 
 	for _, tc := range tests {
@@ -205,32 +202,32 @@ func TestLoadStreamAfter_UsesSeqNrAsLowerBound(t *testing.T) {
 				ddbStubEvSer{},
 			)
 
-			_, err := store.LoadStreamAfter(context.Background(), ddbTestAggID{value: "1"}, tc.seqNr)
+			_, err := store.GetEventsSince(context.Background(), ddbTestAggID{value: "1"}, tc.seqNr)
 			if err != nil {
-				t.Fatalf("LoadStreamAfter: %v", err)
+				t.Fatalf("GetEventsSince: %v", err)
 			}
-			from, ok := client.lastQuery.ExpressionAttributeValues[":sk"]
+			seqNrVal, ok := client.lastQuery.ExpressionAttributeValues[":seqNr"]
 			if !ok {
-				t.Fatal("expected :sk attribute value")
+				t.Fatal("expected :seqNr attribute value")
 			}
-			fromS, ok := from.(*awsdynamotypes.AttributeValueMemberS)
+			seqNrN, ok := seqNrVal.(*awsdynamotypes.AttributeValueMemberN)
 			if !ok {
-				t.Fatalf(":sk type = %T, want string", from)
+				t.Fatalf(":seqNr type = %T, want number", seqNrVal)
 			}
-			if fromS.Value != tc.wantSk {
-				t.Fatalf(":sk = %q, want %q", fromS.Value, tc.wantSk)
+			if seqNrN.Value != tc.wantSeqNrN {
+				t.Fatalf(":seqNr = %q, want %q", seqNrN.Value, tc.wantSeqNrN)
 			}
 		})
 	}
 }
 
-func TestLoadStreamAfter_PaginatesPrimaryTableQuery(t *testing.T) {
+func TestGetEventsSince_PaginatesQuery(t *testing.T) {
 	client := &paginatedClient{
 		queryPages: []*awsdynamo.QueryOutput{
 			{
 				LastEvaluatedKey: map[string]awsdynamotypes.AttributeValue{
-					"pkey": &awsdynamotypes.AttributeValueMemberS{Value: "T-0"},
-					"skey": &awsdynamotypes.AttributeValueMemberS{Value: "T-other-00000000000000000099"},
+					"aid":    &awsdynamotypes.AttributeValueMemberS{Value: "T-1"},
+					"seq_nr": &awsdynamotypes.AttributeValueMemberN{Value: "1"},
 				},
 			},
 			{
@@ -254,9 +251,9 @@ func TestLoadStreamAfter_PaginatesPrimaryTableQuery(t *testing.T) {
 		ddbStubEvSer{},
 	)
 
-	events, err := store.LoadStreamAfter(context.Background(), ddbTestAggID{value: "1"}, 1)
+	events, err := store.GetEventsSince(context.Background(), ddbTestAggID{value: "1"}, 1)
 	if err != nil {
-		t.Fatalf("LoadStreamAfter: %v", err)
+		t.Fatalf("GetEventsSince: %v", err)
 	}
 	if len(client.queryInputs) != 2 {
 		t.Fatalf("Query calls = %d, want 2", len(client.queryInputs))

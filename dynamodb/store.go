@@ -164,29 +164,25 @@ func (s *store[A, C, E]) GetLatestSnapshot(ctx context.Context, id es.AggregateI
 	}, true, nil
 }
 
-// LoadStreamAfter returns events with SeqNr > seqNr using a strongly consistent primary-table query.
-func (s *store[A, C, E]) LoadStreamAfter(ctx context.Context, id es.AggregateID, seqNr uint64) ([]es.StoredEvent[E], error) {
+// GetEventsSince returns events with SeqNr > seqNr using the journal GSI (eventually consistent).
+func (s *store[A, C, E]) GetEventsSince(ctx context.Context, id es.AggregateID, seqNr uint64) ([]es.StoredEvent[E], error) {
 	if seqNr == ^uint64(0) {
 		return nil, nil
 	}
 
-	// #sk > :sk を使うので、下限は "直前の番号" ではなく seqNr 自身に合わせる。
 	keys := s.keyResolver.ResolveEventKeys(id, seqNr)
 	query := &dynamodb.QueryInput{
-		TableName: aws.String(s.config.JournalTableName),
-		KeyConditionExpression: aws.String("#pk = :pk AND #sk > :sk"),
-		FilterExpression:       aws.String("#aid = :aid"),
+		TableName:              aws.String(s.config.JournalTableName),
+		IndexName:              aws.String(s.config.JournalGSIName),
+		KeyConditionExpression: aws.String("#aid = :aid AND #seq_nr > :seqNr"),
 		ExpressionAttributeNames: map[string]string{
-			"#pk":  colPKey,
-			"#sk":  colSKey,
-			"#aid": colAid,
+			"#aid":    colAid,
+			"#seq_nr": colSeqNr,
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk":  &types.AttributeValueMemberS{Value: keys.PartitionKey},
-			":sk":  &types.AttributeValueMemberS{Value: keys.SortKey},
-			":aid": &types.AttributeValueMemberS{Value: keys.AggregateIDKey},
+			":aid":   &types.AttributeValueMemberS{Value: keys.AggregateIDKey},
+			":seqNr": &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", seqNr)},
 		},
-		ConsistentRead:   aws.Bool(true),
 		ScanIndexForward: aws.Bool(true),
 	}
 	stored := make([]es.StoredEvent[E], 0)

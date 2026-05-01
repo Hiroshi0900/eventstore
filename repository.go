@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// LoadedAggregate は command 側で再利用可能な aggregate と opaque な永続化文脈を持つ。
+// LoadedAggregate は aggregate の現在状態と次の Save に必要な永続化文脈を保持する。
 type LoadedAggregate[A Aggregate[C, E], C Command, E Event] struct {
 	aggregate A
 	seqNr     uint64
@@ -20,25 +20,22 @@ func (l LoadedAggregate[A, C, E]) Aggregate() A {
 	return l.aggregate
 }
 
-// Repository は集約 A の高レベル Load / Save API。
+// Repository は集約 A の高レベル API。
 //
 // 利用側は domain ごとに `Repository[Visit, VisitCommand, VisitEvent]` のように instantiate する。
 // 実装は library 内部の defaultRepository[A,C,E] が担う (NewRepository 経由で取得)。
 type Repository[A Aggregate[C, E], C Command, E Event] interface {
-	// Load は集約をロードする。snapshot があれば起点に、なければ blank 集約から
+	// NewAggregate は新規集約用の blank LoadedAggregate を返す。DB アクセスは行わない。
+	// 最初の Save 時に重複作成を検出して ErrDuplicateAggregate を返す。
+	NewAggregate(ctx context.Context, aggID AggregateID) (LoadedAggregate[A, C, E], error)
+
+	// Load は既存集約をロードする。snapshot があれば起点に、なければ blank 集約から
 	// イベントを replay。snapshot もイベントもなければ ErrAggregateNotFound。
-	Load(ctx context.Context, aggID AggregateID) (A, error)
+	Load(ctx context.Context, aggID AggregateID) (LoadedAggregate[A, C, E], error)
 
-	// Save は aggID に対応する集約をロード (なければ blank) し、cmd を ApplyCommand
-	// で適用してイベントを生成、ApplyEvent で次状態に遷移後、永続化して新状態を返す。
+	// Save は LoadedAggregate に command を適用して次の LoadedAggregate を返す。
 	// SnapshotInterval に達した seqNr では snapshot も同時に書く。
-	Save(ctx context.Context, aggID AggregateID, cmd C) (A, error)
-
-	// LoadForCommand は command 側の連続 Save 向けに aggregate と永続化文脈を返す。
-	LoadForCommand(ctx context.Context, aggID AggregateID) (LoadedAggregate[A, C, E], error)
-
-	// SaveLoaded は事前にロード済みの aggregate に command を適用して次の loaded 状態を返す。
-	SaveLoaded(ctx context.Context, loaded LoadedAggregate[A, C, E], cmd C) (LoadedAggregate[A, C, E], error)
+	Save(ctx context.Context, loaded LoadedAggregate[A, C, E], cmd C) (LoadedAggregate[A, C, E], error)
 }
 
 // defaultRepository は Repository interface の library 内部実装 (factory-sealed)。
@@ -53,7 +50,7 @@ type defaultRepository[A Aggregate[C, E], C Command, E Event] struct {
 
 // NewRepository は Repository[A, C, E] を生成する。
 //
-// createBlank は集約が未存在の状態 (Save の初回呼び出し) で使う初期 aggregate を返す関数。
+// createBlank は NewAggregate / Load の初回呼び出し時に使う初期 aggregate を返す関数。
 // 利用側で typed AggregateID と pure struct を組み合わせて定義する。
 //
 // (de)serialize の責務は store 側にある (dynamodb 等のコンストラクタで Serializer を受け取る)。
@@ -90,7 +87,7 @@ func (r *defaultRepository[A, C, E]) loadInternal(
 		version = 0
 	}
 
-	events, err := r.store.LoadStreamAfter(ctx, id, seqNr)
+	events, err := r.store.GetEventsSince(ctx, id, seqNr)
 	if err != nil {
 		return agg, 0, 0, false, err
 	}
@@ -113,25 +110,16 @@ func (r *defaultRepository[A, C, E]) loadInternal(
 	return agg, seqNr, version, false, nil
 }
 
-// Load は集約をロードする。集約未存在の場合は ErrAggregateNotFound を返す。
-func (r *defaultRepository[A, C, E]) Load(ctx context.Context, aggID AggregateID) (A, error) {
-	agg, _, _, notFound, err := r.loadInternal(ctx, aggID)
-	if err != nil {
-		var zero A
-		return zero, err
-	}
-	if notFound {
-		var zero A
-		return zero, NewAggregateNotFoundError(aggID.TypeName(), aggID.Value())
-	}
-	return agg, nil
-}
-
-// LoadForCommand は集約と次の SaveLoaded に必要な永続化文脈をロードする。
-func (r *defaultRepository[A, C, E]) LoadForCommand(
-	ctx context.Context,
+// NewAggregate は新規集約用の blank LoadedAggregate を返す。DB アクセスは行わない。
+func (r *defaultRepository[A, C, E]) NewAggregate(
+	_ context.Context,
 	aggID AggregateID,
 ) (LoadedAggregate[A, C, E], error) {
+	return r.newLoadedAggregate("NewAggregate", r.createBlank(aggID), 0, 0)
+}
+
+// Load は既存集約をロードする。集約未存在の場合は ErrAggregateNotFound を返す。
+func (r *defaultRepository[A, C, E]) Load(ctx context.Context, aggID AggregateID) (LoadedAggregate[A, C, E], error) {
 	agg, seqNr, version, notFound, err := r.loadInternal(ctx, aggID)
 	if err != nil {
 		var zero LoadedAggregate[A, C, E]
@@ -141,12 +129,12 @@ func (r *defaultRepository[A, C, E]) LoadForCommand(
 		var zero LoadedAggregate[A, C, E]
 		return zero, NewAggregateNotFoundError(aggID.TypeName(), aggID.Value())
 	}
-	return r.newLoadedAggregate("LoadForCommand", agg, seqNr, version)
+	return r.newLoadedAggregate("Load", agg, seqNr, version)
 }
 
 func (r *defaultRepository[A, C, E]) invalidLoadedAggregateError() error {
 	return fmt.Errorf(
-		"%w: SaveLoaded requires a loaded aggregate handle created by this repository",
+		"%w: Save requires a loaded aggregate handle created by this repository",
 		ErrInvalidAggregate,
 	)
 }
@@ -332,53 +320,8 @@ func (r *defaultRepository[A, C, E]) persistKnownAggregate(
 	}, nil
 }
 
-func (r *defaultRepository[A, C, E]) saveKnownAggregate(
-	ctx context.Context,
-	agg A,
-	currentSeqNr uint64,
-	currentVersion uint64,
-	cmd C,
-) (LoadedAggregate[A, C, E], error) {
-	next, err := r.persistKnownAggregate(
-		ctx,
-		agg,
-		currentSeqNr,
-		currentVersion,
-		cmd,
-		func(next A) error {
-			return r.validateLoadedAggregate("SaveLoaded", next)
-		},
-	)
-	if err != nil {
-		var zero LoadedAggregate[A, C, E]
-		return zero, err
-	}
-	return r.newLoadedAggregate("SaveLoaded", next.aggregate, next.seqNr, next.version)
-}
-
-// Save は load → ApplyCommand → ApplyEvent → 永続化 を一括で行う。
-// 集約未存在でも blank で開始するため、creation 系コマンドの初回適用にも使える。
+// Save は LoadedAggregate に command を適用し、次の LoadedAggregate を返す。
 func (r *defaultRepository[A, C, E]) Save(
-	ctx context.Context,
-	aggID AggregateID,
-	cmd C,
-) (A, error) {
-	var zero A
-
-	agg, currentSeqNr, currentVersion, _, err := r.loadInternal(ctx, aggID)
-	if err != nil {
-		return zero, err
-	}
-
-	next, err := r.persistKnownAggregate(ctx, agg, currentSeqNr, currentVersion, cmd, nil)
-	if err != nil {
-		return zero, err
-	}
-	return next.aggregate, nil
-}
-
-// SaveLoaded はロード済み aggregate に command を適用し、次の loaded 状態を返す。
-func (r *defaultRepository[A, C, E]) SaveLoaded(
 	ctx context.Context,
 	loaded LoadedAggregate[A, C, E],
 	cmd C,
@@ -387,5 +330,20 @@ func (r *defaultRepository[A, C, E]) SaveLoaded(
 		var zero LoadedAggregate[A, C, E]
 		return zero, r.invalidLoadedAggregateError()
 	}
-	return r.saveKnownAggregate(ctx, loaded.aggregate, loaded.seqNr, loaded.version, cmd)
+
+	next, err := r.persistKnownAggregate(
+		ctx,
+		loaded.aggregate,
+		loaded.seqNr,
+		loaded.version,
+		cmd,
+		func(next A) error {
+			return r.validateLoadedAggregate("Save", next)
+		},
+	)
+	if err != nil {
+		var zero LoadedAggregate[A, C, E]
+		return zero, err
+	}
+	return r.newLoadedAggregate("Save", next.aggregate, next.seqNr, next.version)
 }
